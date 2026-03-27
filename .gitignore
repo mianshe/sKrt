@@ -26,3 +26,6 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+.git_backup_*/
+data/uploads/
+*.zip
