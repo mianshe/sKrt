@@ -71,3 +71,38 @@
 
 3. **生产级**（$30/月）：
    - Cloudflare R2 + Together AI + Railway + Supabase Pro
+
+---
+
+## 本项目新增落地项（易支付 + 邮件随机码 + RunPod）
+
+### 1) 易支付（微信/支付宝）
+- 必填环境变量：
+  - `PAY_PROVIDER=easypay`
+  - `PAY_NOTIFY_URL=https://<你的域名>/api/gpu/ocr/pay/notify`
+  - `EASYPAY_API_BASE`
+  - `EASYPAY_PID`
+  - `EASYPAY_KEY`
+- 行为：
+  - 前端仍调用原接口 `/gpu/ocr/pay/order/create`、`/gpu/ocr/pay/order/{order_no}`
+  - 支付回调命中 `/gpu/ocr/pay/notify` 后自动给 `GPU` 余额加页，幂等防重复入账
+
+### 2) 隐藏入口随机码邮件
+- 必填环境变量：
+  - `CODE_EMAIL_TO`（接收随机码邮箱）
+  - `SMTP_HOST` `SMTP_PORT` `SMTP_USERNAME` `SMTP_PASSWORD` `SMTP_FROM` `SMTP_USE_TLS`
+- 行为：
+  - 上传页标题副标题连点触发隐藏窗口时，后端发送随机码邮件
+  - 随机码可用于：特殊用户解锁、GPU 兑换加页（一次性、过期失效）
+
+### 3) RunPod 下沉 OCR+解析+向量化
+- 必填环境变量：
+  - `RUNPOD_ENABLED=1`
+  - `RUNPOD_INGEST_ENDPOINT`
+  - `RUNPOD_API_KEY`
+  - `RUNPOD_CALLBACK_URL=https://<你的域名>/api/ingestion/runpod/callback`
+  - `RUNPOD_CALLBACK_SECRET`
+- 行为：
+  - 新上传任务默认提交到 RunPod
+  - RunPod 完成后调用回调接口更新任务状态并触发关系重建
+  - 回调需带签名，防止伪造请求

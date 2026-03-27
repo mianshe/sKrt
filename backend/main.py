@@ -48,9 +48,12 @@ from backend.services.rag_engine import RAGEngine
 from backend.services.pipeline import DeepPipelineService
 from backend.services.pipeline import postgres_store as pg_store
 from backend.services.security_context import IdentityContext, JwtValidator, to_identity_context
+from backend.services.email_sender import send_plain_email
 from backend.services import knowledge_store
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
+from backend.services.payments.easypay_provider import EasyPayProvider
+from backend.services.runpod_client import runpod_enabled, submit_ingestion_job
 from backend.services.upload_load_control import (
     enforce_upload_create_allowed,
     get_upload_queue_metrics,
@@ -170,6 +173,15 @@ class PayOrderCreateRequest(BaseModel):
 
 class PayOrderRefundRequest(BaseModel):
     key: Optional[str] = None
+
+
+class RunpodIngestionCallbackRequest(BaseModel):
+    task_id: int = Field(ge=1)
+    tenant_id: str = "public"
+    status: str = Field(pattern="^(running|completed|failed)$")
+    error_message: Optional[str] = None
+    runpod_job_id: Optional[str] = None
+    signature: str = Field(min_length=8)
 
 
 class RequestIdentity(TypedDict, total=False):
@@ -1026,11 +1038,56 @@ async def _cleanup_scheduler() -> None:
             logger.exception("cleanup scheduler failed")
 
 
+def _init_runtime_tables() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_random_codes (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                target_email TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                used_at TEXT DEFAULT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_random_codes_lookup ON email_random_codes(tenant_id, client_id, purpose, created_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runpod_jobs (
+                id TEXT PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                tenant_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                runpod_job_id TEXT NOT NULL DEFAULT '',
+                request_payload TEXT NOT NULL DEFAULT '',
+                response_payload TEXT NOT NULL DEFAULT '',
+                error_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runpod_jobs_task ON runpod_jobs(task_id, created_at)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _cleanup_task
     _enforce_production_security_baseline()
     _init_db()
+    _init_runtime_tables()
     upload_ingestion_service.init_schema()
     try:
         deep_pipeline_service.init_schema()
@@ -1174,6 +1231,10 @@ def _gpu_redeem_secret() -> str:
     return (os.getenv("GPU_OCR_REDEEM_SECRET") or "").strip()
 
 
+def _pay_provider_name() -> str:
+    return (os.getenv("PAY_PROVIDER") or "easypay").strip().lower()
+
+
 PAY_PAGE_PACKS: Dict[str, Dict[str, Any]] = {
     "A": {"pages": 500, "amount_cny": 9.9},
     "B": {"pages": 2000, "amount_cny": 29.9},
@@ -1181,20 +1242,95 @@ PAY_PAGE_PACKS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _payjs_api_base() -> str:
-    return (os.getenv("PAYJS_API_BASE") or "https://payjs.cn/api").strip().rstrip("/")
+def _random_code_email_target() -> str:
+    return (os.getenv("CODE_EMAIL_TO") or "").strip()
 
 
-def _payjs_mchid() -> str:
-    return (os.getenv("PAYJS_MCHID") or "").strip()
+def _hash_random_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
-def _payjs_key() -> str:
-    return (os.getenv("PAYJS_KEY") or "").strip()
+def _gen_random_code() -> str:
+    return f"{secrets.randbelow(1000000):06d}"
 
 
-def _payjs_refund_enabled() -> bool:
-    return (os.getenv("PAYJS_REFUND_ENABLED") or "1").strip().lower() in {"1", "true", "yes", "on"}
+def _random_code_ttl_sec() -> int:
+    try:
+        return max(60, int((os.getenv("CODE_EMAIL_TTL_SEC") or "600").strip() or "600"))
+    except ValueError:
+        return 600
+
+
+def _verify_and_consume_random_code(tenant_id: str, client_id: str, purpose: str, code: str) -> bool:
+    hashed = _hash_random_code((code or "").strip())
+    conn = _conn()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM email_random_codes
+            WHERE tenant_id=? AND client_id=? AND purpose=? AND code_hash=? AND used=0 AND expires_at>?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (tenant_id, client_id, purpose, hashed, now_iso),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE email_random_codes SET used=1, used_at=CURRENT_TIMESTAMP WHERE id=?", (str(row["id"]),))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _create_and_send_random_code(tenant_id: str, client_id: str, purpose: str) -> Dict[str, Any]:
+    to_email = _random_code_email_target()
+    if not to_email:
+        raise HTTPException(status_code=503, detail="未配置 CODE_EMAIL_TO")
+    code = _gen_random_code()
+    ttl = _random_code_ttl_sec()
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
+    conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT created_at FROM email_random_codes
+            WHERE tenant_id=? AND client_id=? AND purpose=?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (tenant_id, client_id, purpose),
+        ).fetchone()
+        if row and row.get("created_at"):
+            try:
+                created_at = str(row["created_at"]).replace("Z", "+00:00")
+                if " " in created_at and "T" not in created_at:
+                    created_at = created_at.replace(" ", "T")
+                dt = datetime.fromisoformat(created_at)
+                if (datetime.now(timezone.utc) - dt).total_seconds() < 45:
+                    raise HTTPException(status_code=429, detail="发送过于频繁，请稍后重试")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        code_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO email_random_codes(id, tenant_id, client_id, purpose, code_hash, target_email, expires_at, used)
+            VALUES(?,?,?,?,?,?,?,0)
+            """,
+            (code_id, tenant_id, client_id, purpose, _hash_random_code(code), to_email, expires),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    subject = f"sKrt 随机码（{purpose}）"
+    body = f"你的随机码：{code}\n有效期：{ttl // 60} 分钟\n用途：{purpose}\n如非本人操作请忽略。"
+    send_plain_email(subject=subject, body=body, to_email=to_email)
+    return {"ok": True, "sent": True, "expires_in_sec": ttl, "to": to_email}
+
+
+def _pay_refund_enabled() -> bool:
+    return (os.getenv("PAY_REFUND_ENABLED") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _amount_to_fen(amount_cny: float) -> int:
@@ -1233,6 +1369,13 @@ def _new_order_no() -> str:
     return f"XM{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
 
 
+def _get_payment_provider() -> EasyPayProvider:
+    provider = _pay_provider_name()
+    if provider == "easypay":
+        return EasyPayProvider()
+    raise HTTPException(status_code=503, detail=f"不支持的支付通道: {provider}")
+
+
 def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: str) -> Dict[str, Any]:
     pack = PAY_PAGE_PACKS.get(pack_key)
     if not pack:
@@ -1247,9 +1390,9 @@ def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: st
         conn.execute(
             """
             INSERT INTO pay_orders(order_no, tenant_id, client_id, pack_key, pages, amount_cny, status, provider, channel)
-            VALUES(?,?,?,?,?,?, 'pending', 'payjs', ?)
+            VALUES(?,?,?,?,?,?, 'pending', ?, ?)
             """,
-            (order_no, tenant_id, client_id, pack_key, pages, amount_cny, channel),
+            (order_no, tenant_id, client_id, pack_key, pages, amount_cny, _pay_provider_name(), channel),
         )
         conn.commit()
         return {"order_no": order_no, "pages": pages, "amount_cny": amount_cny, "channel": channel}
@@ -1272,16 +1415,16 @@ def _log_pay_callback(order_no: str, payload: Dict[str, Any], *, sign_ok: bool, 
         conn.execute(
             """
             INSERT INTO pay_callbacks(provider, event_type, order_no, payload_text, sign_ok, handled, result_text)
-            VALUES('payjs', 'notify', ?, ?, ?, ?, ?)
+            VALUES(?, 'notify', ?, ?, ?, ?, ?)
             """,
-            (order_no, json.dumps(payload, ensure_ascii=False), int(sign_ok), int(handled), str(result_text)),
+            (_pay_provider_name(), order_no, json.dumps(payload, ensure_ascii=False), int(sign_ok), int(handled), str(result_text)),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", payjs_order_id: str = "") -> Dict[str, Any]:
+def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", provider_order_id: str = "") -> Dict[str, Any]:
     conn = _conn()
     try:
         row = conn.execute("SELECT * FROM pay_orders WHERE order_no=?", (order_no,)).fetchone()
@@ -1318,7 +1461,7 @@ def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", payjs_or
                 updated_at=CURRENT_TIMESTAMP
             WHERE order_no=?
             """,
-            (pages, transaction_id, payjs_order_id, order_no),
+            (pages, transaction_id, provider_order_id, order_no),
         )
         conn.commit()
         row2 = conn.execute("SELECT * FROM pay_orders WHERE order_no=?", (order_no,)).fetchone()
@@ -1615,11 +1758,8 @@ app.add_middleware(
 @app.post("/auth/special-ocr/unlock")
 async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...)) -> JSONResponse:
     raw_key = str(body.get("key") or "").strip()
-    unlock_key = (os.getenv("SPECIAL_OCR_UNLOCK_KEY") or "").strip()
-    if not unlock_key:
-        raise HTTPException(status_code=503, detail="未配置 SPECIAL_OCR_UNLOCK_KEY")
-    if raw_key != unlock_key:
-        raise HTTPException(status_code=403, detail="密钥错误")
+    if not raw_key:
+        raise HTTPException(status_code=400, detail="缺少随机码")
     secret = (os.getenv("SPECIAL_OCR_SECRET") or "").strip()
     if not secret:
         raise HTTPException(status_code=503, detail="未配置 SPECIAL_OCR_SECRET")
@@ -1629,6 +1769,9 @@ async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...))
         ttl = 30 * 86400
     identity = _get_request_identity(request)
     tenant_id = str(identity.get("tenant_id", "public"))
+    client_id = _client_id_from_request(request)
+    if not _verify_and_consume_random_code(tenant_id, client_id, "special_unlock", raw_key):
+        raise HTTPException(status_code=403, detail="随机码错误或已过期")
     token = _make_special_cookie(secret, tenant_id, ttl_sec=ttl)
     resp = JSONResponse({"ok": True})
     resp.set_cookie(
@@ -1641,6 +1784,20 @@ async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...))
         path="/",
     )
     return resp
+
+
+@app.post("/auth/special-ocr/send-code")
+async def send_special_unlock_code(request: Request) -> Dict[str, Any]:
+    identity = _get_request_identity(request)
+    tenant_id = str(identity.get("tenant_id", "public"))
+    client_id = _client_id_from_request(request)
+    try:
+        return _create_and_send_random_code(tenant_id, client_id, "special_unlock")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("send special unlock code failed")
+        raise HTTPException(status_code=502, detail=f"发送失败: {exc}")
 
 
 @app.get("/gpu/ocr/quota")
@@ -1686,28 +1843,38 @@ async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
 
 @app.post("/gpu/ocr/redeem")
 async def redeem_gpu_ocr_pages(request: Request, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    secret = _gpu_redeem_secret()
-    if not secret:
-        raise HTTPException(status_code=503, detail="未配置 GPU_OCR_REDEEM_SECRET")
     raw_code = str(body.get("code") or "").strip()
-    if not _verify_redeem_code(raw_code):
-        raise HTTPException(status_code=403, detail="随机码错误或已过期")
+    if not raw_code:
+        raise HTTPException(status_code=400, detail="缺少随机码")
     identity = _get_request_identity(request)
     tenant_id = str(identity.get("tenant_id", "public"))
     client_id = _client_id_from_request(request)
+    if not _verify_and_consume_random_code(tenant_id, client_id, "gpu_redeem", raw_code):
+        raise HTTPException(status_code=403, detail="随机码错误或已过期")
     new_balance = _add_gpu_paid_pages(tenant_id, client_id, 500, reason="redeem_500_pages")
     return {"ok": True, "delta_pages": 500, "paid_balance": int(max(0, new_balance))}
 
 
+@app.post("/gpu/ocr/redeem/send-code")
+async def send_gpu_redeem_code(request: Request) -> Dict[str, Any]:
+    identity = _get_request_identity(request)
+    tenant_id = str(identity.get("tenant_id", "public"))
+    client_id = _client_id_from_request(request)
+    try:
+        return _create_and_send_random_code(tenant_id, client_id, "gpu_redeem")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("send gpu redeem code failed")
+        raise HTTPException(status_code=502, detail=f"发送失败: {exc}")
+
+
 @app.post("/gpu/ocr/pay/order/create")
 async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) -> Dict[str, Any]:
-    mchid = _payjs_mchid()
-    key = _payjs_key()
-    if not mchid or not key:
-        raise HTTPException(status_code=503, detail="未配置 PAYJS_MCHID/PAYJS_KEY")
-    notify_url = (os.getenv("PAYJS_NOTIFY_URL") or "").strip()
+    provider = _get_payment_provider()
+    notify_url = (os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip()
     if not notify_url:
-        raise HTTPException(status_code=503, detail="未配置 PAYJS_NOTIFY_URL")
+        raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
     identity = _get_request_identity(request)
     tenant_id = str(identity.get("tenant_id", "public"))
     client_id = _client_id_from_request(request)
@@ -1717,26 +1884,18 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     amount_cny = float(created["amount_cny"])
     channel = str(created["channel"])
     total_fee = _amount_to_fen(amount_cny)
-    payjs_type = 1 if channel == "wechat_native" else 2
-    form: Dict[str, Any] = {
-        "mchid": mchid,
-        "out_trade_no": order_no,
-        "total_fee": total_fee,
-        "body": f"sKrt 页包{body.pack_key} {pages}页",
-        "notify_url": notify_url,
-        "type": payjs_type,
-    }
-    form["sign"] = _payjs_sign(form, key)
     try:
-        rsp = _payjs_post_form("native", form)
+        created_rsp = provider.create_order(
+            order_no=order_no,
+            amount_fen=total_fee,
+            channel=channel,
+            subject=f"sKrt 页包{body.pack_key} {pages}页",
+            notify_url=notify_url,
+        )
     except Exception as exc:
-        logger.exception("payjs create order failed")
-        raise HTTPException(status_code=502, detail=f"PayJS 下单失败: {exc}")
-    status_val = int(rsp.get("status") or rsp.get("return_code") or 0)
-    if status_val != 1:
-        msg = str(rsp.get("msg") or rsp.get("return_msg") or "PayJS 下单失败")
-        raise HTTPException(status_code=502, detail=msg)
-    payjs_order_id = str(rsp.get("payjs_order_id") or rsp.get("prepay_id") or "")
+        logger.exception("create payment order failed provider=%s", _pay_provider_name())
+        raise HTTPException(status_code=502, detail=f"支付下单失败: {exc}")
+    payjs_order_id = str(created_rsp.provider_order_id or "")
     conn = _conn()
     try:
         conn.execute(
@@ -1746,7 +1905,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         conn.commit()
     finally:
         conn.close()
-    code_url = str(rsp.get("code_url") or rsp.get("qrcode") or "")
+    code_url = str(created_rsp.code_url or "")
     qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}" if code_url else ""
     return {
         "ok": True,
@@ -1788,9 +1947,7 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
 
 @app.post("/gpu/ocr/pay/notify")
 async def notify_gpu_pay_order(request: Request) -> Dict[str, Any]:
-    key = _payjs_key()
-    if not key:
-        raise HTTPException(status_code=503, detail="未配置 PAYJS_KEY")
+    provider = _get_payment_provider()
     payload: Dict[str, Any] = {}
     try:
         form = await request.form()
@@ -1804,21 +1961,21 @@ async def notify_gpu_pay_order(request: Request) -> Dict[str, Any]:
                 payload = {str(k): str(v) for k, v in raw.items()}
         except Exception:
             payload = {}
-    order_no = str(payload.get("out_trade_no") or "")
-    sign = str(payload.get("sign") or "").upper()
-    sign_ok = bool(order_no and sign and hmac.compare_digest(_payjs_sign(payload, key), sign))
-    if not sign_ok:
+    try:
+        notify_result = provider.verify_notify(payload)
+    except Exception:
+        order_no = str(payload.get("out_trade_no") or "")
         _log_pay_callback(order_no, payload, sign_ok=False, handled=False, result_text="bad_sign")
         raise HTTPException(status_code=403, detail="invalid_sign")
-    status_val = str(payload.get("status") or payload.get("return_code") or "")
-    paid_ok = status_val in {"1", "SUCCESS", "success"}
-    if not paid_ok:
+    order_no = notify_result.order_no
+    if not notify_result.paid:
+        status_val = str(payload.get("trade_status") or payload.get("status") or "")
         _log_pay_callback(order_no, payload, sign_ok=True, handled=False, result_text=f"ignore_status:{status_val}")
         return {"ok": True, "ignored": True}
     order = _mark_order_paid_if_needed(
         order_no=order_no,
-        transaction_id=str(payload.get("transaction_id") or payload.get("payjs_transaction_id") or ""),
-        payjs_order_id=str(payload.get("payjs_order_id") or ""),
+        transaction_id=notify_result.transaction_id,
+        provider_order_id=notify_result.provider_order_id,
     )
     _log_pay_callback(order_no, payload, sign_ok=True, handled=True, result_text="credited")
     return {"ok": True, "order_no": order_no, "status": str(order.get("status") or "paid")}
@@ -1826,9 +1983,9 @@ async def notify_gpu_pay_order(request: Request) -> Dict[str, Any]:
 
 @app.post("/gpu/ocr/pay/order/{order_no}/refund")
 async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRefundRequest = Body(default=PayOrderRefundRequest())) -> Dict[str, Any]:
-    if not _payjs_refund_enabled():
+    if not _pay_refund_enabled():
         raise HTTPException(status_code=403, detail="退款功能未开启")
-    admin_key = (os.getenv("PAYJS_REFUND_ADMIN_KEY") or "").strip()
+    admin_key = (os.getenv("PAY_REFUND_ADMIN_KEY") or "").strip()
     if admin_key and str(body.key or "").strip() != admin_key:
         raise HTTPException(status_code=403, detail="退款密钥错误")
     row = _get_pay_order(order_no)
@@ -1840,21 +1997,12 @@ async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRe
     order = dict(row)
     if str(order.get("tenant_id")) != tenant_id or str(order.get("client_id")) != client_id:
         raise HTTPException(status_code=403, detail="订单不属于当前用户")
-    mchid = _payjs_mchid()
-    key = _payjs_key()
-    if not mchid or not key:
-        raise HTTPException(status_code=503, detail="未配置 PAYJS_MCHID/PAYJS_KEY")
+    provider = _get_payment_provider()
     payjs_order_id = str(order.get("payjs_order_id") or "")
-    refund_form: Dict[str, Any] = {"mchid": mchid}
-    if payjs_order_id:
-        refund_form["payjs_order_id"] = payjs_order_id
-    else:
-        refund_form["out_trade_no"] = order_no
-    refund_form["sign"] = _payjs_sign(refund_form, key)
     try:
-        _payjs_post_form("refund", refund_form)
+        provider.refund(order_no=order_no, provider_order_id=payjs_order_id)
     except Exception:
-        logger.exception("payjs refund api failed, continue with local settlement")
+        logger.exception("payment refund api failed, continue with local settlement")
     new_order = _refund_order_pages(order_no)
     return {
         "ok": True,
@@ -1863,6 +2011,43 @@ async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRe
         "refund_status": str(new_order.get("refund_status") or ""),
         "reverted_pages": int(new_order.get("reverted_pages") or 0),
     }
+
+
+@app.post("/ingestion/runpod/callback")
+async def runpod_ingestion_callback(body: RunpodIngestionCallbackRequest) -> Dict[str, Any]:
+    if not _verify_runpod_callback_signature(body.task_id, body.tenant_id, body.status, body.signature):
+        raise HTTPException(status_code=403, detail="invalid_signature")
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE runpod_jobs SET status=?, updated_at=CURRENT_TIMESTAMP, runpod_job_id=COALESCE(NULLIF(?,''),runpod_job_id), error_text=COALESCE(NULLIF(?,''), error_text) WHERE task_id=?",
+            (body.status, str(body.runpod_job_id or ""), str(body.error_message or ""), body.task_id),
+        )
+        if body.status == "failed":
+            conn.execute(
+                "UPDATE upload_tasks SET status='failed', phase='failed', error_message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (str(body.error_message or "runpod_failed"), body.task_id),
+            )
+        elif body.status == "completed":
+            # RunPod 已完成 OCR+解析+向量化并写库，仅更新任务状态并补建关系图。
+            conn.execute(
+                "UPDATE upload_tasks SET status='completed', phase='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (body.task_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE upload_tasks SET status='running', phase='running', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (body.task_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    if body.status == "completed":
+        try:
+            await _rebuild_kg_relations(tenant_id=body.tenant_id)
+        except Exception:
+            logger.exception("runpod callback rebuild relations failed task_id=%s", body.task_id)
+    return {"ok": True}
 
 
 @app.post("/admin/gpu/ocr/quota/reset")
@@ -1998,6 +2183,45 @@ def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _spawn_ingestion_worker(task_id: int, tenant_id: str) -> None:
+    if runpod_enabled():
+        try:
+            callback_url = (os.getenv("RUNPOD_CALLBACK_URL") or "").strip()
+            callback_secret = (os.getenv("RUNPOD_CALLBACK_SECRET") or "").strip()
+            if not callback_url or not callback_secret:
+                raise RuntimeError("未配置 RUNPOD_CALLBACK_URL/RUNPOD_CALLBACK_SECRET")
+            payload = {
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "callback_url": callback_url,
+                "callback_signature_hint": callback_secret[:6],
+            }
+            rsp = submit_ingestion_job(payload)
+            conn = _conn()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO runpod_jobs(id, task_id, tenant_id, status, runpod_job_id, request_payload, response_payload)
+                    VALUES(?, ?, ?, 'queued', ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        task_id,
+                        tenant_id,
+                        str(rsp.get("id") or rsp.get("job_id") or ""),
+                        json.dumps(payload, ensure_ascii=False),
+                        json.dumps(rsp, ensure_ascii=False),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE upload_tasks SET status='running', phase='queued', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (task_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        except Exception:
+            logger.exception("RunPod 入队失败，回退进程内 worker task_id=%s", task_id)
     try:
         from backend.services.ingestion_rq import enqueue_ingestion, ingestion_use_rq
 
@@ -2036,6 +2260,15 @@ async def _run_ingestion_worker(task_id: int, tenant_id: str) -> None:
         logger.exception("ingestion worker failed task_id=%s", task_id)
     finally:
         _ingestion_workers.pop(task_id, None)
+
+
+def _verify_runpod_callback_signature(task_id: int, tenant_id: str, status: str, signature: str) -> bool:
+    secret = (os.getenv("RUNPOD_CALLBACK_SECRET") or "").strip()
+    if not secret:
+        return False
+    msg = f"{task_id}:{tenant_id}:{status}"
+    expected = _hmac_sign(secret, msg)
+    return hmac.compare_digest(expected, signature)
 
 
 def _safe_filename(value: str) -> str:
