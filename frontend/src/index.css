@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg-grad-a: #fff5fb;
+  --bg-grad-b: #f3f8ff;
+  --bg-grad-c: #f2fff9;
+  --card-bg: rgba(255, 255, 255, 0.86);
+  --card-border: rgba(255, 255, 255, 0.8);
+  --text-main: #1f2937;
+  --text-soft: #64748b;
+  --brand-pink: #ff4fa3;
+  --brand-purple: #7c5cff;
+  --brand-orange: #ff8a4c;
+  --brand-mint: #00c3a5;
+}
+
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Nunito", "Segoe UI", sans-serif;
+  color: var(--text-main);
+  background:
+    radial-gradient(1200px 420px at -10% -20%, rgba(255, 79, 163, 0.16), transparent 56%),
+    radial-gradient(900px 360px at 110% 0%, rgba(124, 92, 255, 0.14), transparent 58%),
+    linear-gradient(160deg, var(--bg-grad-a) 0%, var(--bg-grad-b) 48%, var(--bg-grad-c) 100%);
+  min-height: 100vh;
+}
+
+h1,
+h2,
+h3 {
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Nunito", sans-serif;
+  letter-spacing: 0.015em;
+}
+
+h1 {
+  font-weight: 900;
+  line-height: 1.28;
+}
+
+h2 {
+  font-weight: 800;
+  line-height: 1.32;
+}
+
+h3 {
+  font-weight: 800;
+  line-height: 1.36;
+}
+
+.card {
+  @apply rounded-3xl shadow-[0_12px_28px_-18px_rgba(124,92,255,0.45)] ring-1;
+  background: var(--card-bg);
+  border-color: var(--card-border);
+  backdrop-filter: blur(10px);
+}
+
+p,
+li,
+label,
+summary {
+  line-height: 1.6;
+}
+
+.btn-primary {
+  @apply rounded-2xl px-4 py-2 text-sm font-semibold text-white transition-all duration-200;
+  background: linear-gradient(135deg, var(--brand-pink), var(--brand-purple));
+  box-shadow: 0 10px 20px -12px rgba(124, 92, 255, 0.7);
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px -12px rgba(124, 92, 255, 0.7);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+.btn-primary:disabled {
+  @apply cursor-not-allowed opacity-60;
+}
+
+.btn-danger {
+  @apply rounded-2xl px-4 py-2 text-sm font-semibold text-white transition-all duration-200;
+  background: linear-gradient(135deg, #ff5a87, #ff7a45);
+  box-shadow: 0 10px 20px -12px rgba(255, 90, 135, 0.68);
+}
+
+.btn-danger:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px -12px rgba(255, 90, 135, 0.72);
+}
+
+.btn-danger:disabled {
+  @apply cursor-not-allowed opacity-60;
+}
+
+.input {
+  @apply w-full rounded-2xl border px-3 py-2.5 text-sm leading-6 outline-none transition-all duration-200;
+  border-color: rgba(124, 92, 255, 0.2);
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.input:focus {
+  border-color: rgba(255, 79, 163, 0.6);
+  box-shadow: 0 0 0 4px rgba(255, 79, 163, 0.14);
+}
+
+.accent-chip {
+  @apply rounded-full px-2 py-0.5 text-[11px] font-semibold;
+  background: rgba(255, 79, 163, 0.12);
+  color: #be185d;
+}

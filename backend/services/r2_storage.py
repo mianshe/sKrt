@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class R2StorageConfig:
+    endpoint: str
+    bucket: str
+    access_key_id: str
+    secret_access_key: str
+    region: str = "auto"
+
+    @staticmethod
+    def from_env() -> Optional["R2StorageConfig"]:
+        endpoint = (os.getenv("R2_ENDPOINT") or "").strip().rstrip("/")
+        bucket = (os.getenv("R2_BUCKET") or "").strip()
+        access_key_id = (os.getenv("R2_ACCESS_KEY_ID") or "").strip()
+        secret_access_key = (os.getenv("R2_SECRET_ACCESS_KEY") or "").strip()
+        region = (os.getenv("R2_REGION") or "auto").strip() or "auto"
+        if not endpoint or not bucket or not access_key_id or not secret_access_key:
+            return None
+        return R2StorageConfig(
+            endpoint=endpoint,
+            bucket=bucket,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            region=region,
+        )
+
+
+def r2_uri(bucket: str, key: str) -> str:
+    return f"r2://{bucket}/{key.lstrip('/')}"
+
+
+def parse_r2_uri(uri: str) -> Optional[Tuple[str, str]]:
+    s = (uri or "").strip()
+    if not s.startswith("r2://"):
+        return None
+    rest = s[len("r2://") :]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    if not bucket or not key:
+        return None
+    return bucket, key
+
+
+def _client(cfg: R2StorageConfig):
+    import boto3  # lazy import
+    from botocore.config import Config as BotoConfig
+
+    return boto3.client(
+        "s3",
+        endpoint_url=cfg.endpoint,
+        aws_access_key_id=cfg.access_key_id,
+        aws_secret_access_key=cfg.secret_access_key,
+        region_name=cfg.region,
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
+def upload_file(cfg: R2StorageConfig, *, key: str, file_path: Path, content_type: str = "application/octet-stream") -> str:
+    c = _client(cfg)
+    object_key = key.lstrip("/")
+    c.upload_file(
+        Filename=str(file_path),
+        Bucket=cfg.bucket,
+        Key=object_key,
+        ExtraArgs={"ContentType": content_type},
+    )
+    return r2_uri(cfg.bucket, object_key)
+
+
+def download_to_file(cfg: R2StorageConfig, *, bucket: str, key: str, dest_path: Path) -> None:
+    c = _client(cfg)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    c.download_file(Bucket=bucket, Key=key.lstrip("/"), Filename=str(dest_path))
+
+
+def head_object(cfg: R2StorageConfig, *, key: str) -> Dict[str, Any]:
+    """HEAD 对象元数据（预签名 PUT 完成后校验大小）。"""
+    c = _client(cfg)
+    object_key = key.lstrip("/")
+    resp = c.head_object(Bucket=cfg.bucket, Key=object_key)
+    return {
+        "content_length": int(resp.get("ContentLength") or 0),
+        "content_type": str(resp.get("ContentType") or ""),
+    }
+
+
+def generate_presigned_put_url(
+    cfg: R2StorageConfig,
+    *,
+    key: str,
+    content_type: str = "application/octet-stream",
+    expires_in: int = 3600,
+) -> str:
+    """客户端直传 PUT 的预签名 URL（S3/R2 兼容）。"""
+    c = _client(cfg)
+    object_key = key.lstrip("/")
+    return c.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": cfg.bucket,
+            "Key": object_key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=int(expires_in),
+    )
+

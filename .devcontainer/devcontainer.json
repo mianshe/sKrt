@@ -1,0 +1,40 @@
+{
+  "name": "资料解析 PWA",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "esbenp.prettier-vscode",
+        "bradlc.vscode-tailwindcss",
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  },
+  "forwardPorts": [5173, 8000],
+  "portsAttributes": {
+    "8000": { "label": "FastAPI 后端", "onAutoForward": "notify" },
+    "5173": { "label": "Vite 前端", "onAutoForward": "openBrowser" }
+  },
+  "postCreateCommand": "python -m pip install --upgrade pip && pip install -r requirements.txt && npm --prefix frontend install",
+  "remoteEnv": {
+    "TENANT_IP_AS_DEFAULT": "1",
+    "APP_ENV": "dev",
+    "AUTH_JWT_ENABLED": "0",
+    "PADDLEOCR_USE_GPU": "auto",
+    "CHAT_MEMORY_TTL_SECONDS": "3600",
+    "CHAT_MEMORY_RECENT_LIMIT": "6"
+  },
+  "remoteUser": "vscode"
+}
+

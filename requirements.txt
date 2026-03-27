@@ -1,0 +1,54 @@
+# Web
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+httpx
+
+# DB
+psycopg2-binary
+
+# Queue (optional: INGESTION_USE_RQ + REDIS_URL)。RQ 2.x 在部分 Windows 环境导入失败，限制为 1.x。
+redis
+rq>=1.16,<2
+
+# Object storage (Cloudflare R2 / S3 compatible)
+boto3
+
+# Auth
+PyJWT
+cryptography
+
+# Document parsing (required)
+PyPDF2
+pdfplumber
+python-docx
+python-pptx
+
+# PDF render -> images (for OCR)
+pypdfium2
+pdf2image
+Pillow
+numpy
+
+# OCR (optional, install at least one for scanned PDFs/images)
+#
+# Option A: PaddleOCR (recommended for Chinese)
+#   CPU:
+#     paddlepaddle
+#     paddleocr
+#   GPU (CUDA):
+#     paddlepaddle-gpu
+#     paddleocr
+#
+# Option B: Tesseract (requires system binary)
+#   pip install pytesseract
+#   System deps:
+#     Linux: sudo apt install tesseract-ocr tesseract-ocr-chi-sim
+#     macOS: brew install tesseract tesseract-lang
+#     Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#
+# Option C: Baidu OCR API (cloud, no extra pip packages)
+
+# Test
+pytest

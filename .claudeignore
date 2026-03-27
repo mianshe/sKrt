@@ -1,0 +1,7 @@
+# 补充忽略（与 .gitignore 配合；具体行为以当前 Claude Code 版本为准）
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+data/
+__pycache__/
+**/.pytest_cache/
