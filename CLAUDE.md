@@ -87,6 +87,9 @@ HF_TOKEN=              # HuggingFace Inference API
 DATABASE_URL=          # PostgreSQL，留空则深度报告 API 返回 503
 APP_ENV=dev            # prod 时强制要求 JWT + PostgreSQL
 HYBRID_LOCAL_FIRST=0   # 1 = 优先本地 transformers（需安装 torch）
+BAIDU_OCR_API_KEY=     # 百度 OCR：与 BAIDU_OCR_SECRET_KEY 成对必填（见 .env.example）
+BAIDU_OCR_SECRET_KEY=
+OCR_API_BASE=          # 外部 HTTP OCR（POST …/ocr/pdf）；旧名 GPU_OCR_ENDPOINT 仍兼容；与百度无关
 ```
 
 ## 注意事项

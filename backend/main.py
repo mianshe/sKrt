@@ -1669,10 +1669,14 @@ def _baidu_ocr_env_configured() -> bool:
     return bool(os.getenv("BAIDU_OCR_API_KEY", "").strip() and os.getenv("BAIDU_OCR_SECRET_KEY", "").strip())
 
 
+def _ocr_http_api_base_configured() -> bool:
+    return bool((os.getenv("OCR_API_BASE") or os.getenv("GPU_OCR_ENDPOINT") or "").strip())
+
+
 def _external_ocr_billing_enabled() -> bool:
     if _baidu_ocr_env_configured():
         return True
-    return bool((os.getenv("GPU_OCR_ENDPOINT") or "").strip())
+    return _ocr_http_api_base_configured()
 
 
 def _external_ocr_scan_quota_result(

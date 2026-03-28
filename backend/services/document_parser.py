@@ -238,8 +238,8 @@ class DocumentParser:
             engines = ["tesseract"]
         elif ocr_engine == "baidu":
             engines = ["baidu"]
-        elif ocr_engine in {"runpod", "gpu"}:
-            engines = ["runpod"]
+        elif ocr_engine in {"runpod", "gpu", "remote", "ocr_api", "api"}:
+            engines = ["remote"]
         else:
             # auto：已配置百度时默认「联网 OCR 优先」，失败再 Paddle/Tesseract。
             # PDF_OCR_REMOTE_FIRST=0 则恢复本地优先、百度仅作兜底（PDF_OCR_BAIDU_FALLBACK=1）。
@@ -259,8 +259,8 @@ class DocumentParser:
                 txt, err = self._ocr_pdf_pages_paddle(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
             elif engine == "tesseract":
                 txt, err = self._ocr_pdf_pages_tesseract(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
-            elif engine == "runpod":
-                txt, err = self._ocr_pdf_pages_runpod(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+            elif engine == "remote":
+                txt, err = self._ocr_pdf_pages_http_api(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
             else:
                 txt, err = self._ocr_pdf_pages_baidu(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
             if txt:
@@ -269,19 +269,20 @@ class DocumentParser:
 
         return "", "; ".join(engine_errors)
 
-    def _ocr_pdf_pages_runpod(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
+    def _ocr_pdf_pages_http_api(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
         """
-        Remote GPU OCR via external service (e.g. RunPod).
-        Expects env:
-          - GPU_OCR_ENDPOINT (e.g. https://xxx.runpod.net)
-          - GPU_OCR_API_KEY  (optional)
-        API: POST {GPU_OCR_ENDPOINT}/ocr/pdf with multipart `file`, returns JSON { ok, text, error? }.
+        外部 HTTP OCR（例如远端 PaddleOCR 服务）。优先读 OCR_API_*，仍兼容 GPU_OCR_*。
+          - OCR_API_BASE：根 URL，无尾斜杠（旧：GPU_OCR_ENDPOINT）
+          - OCR_API_KEY：可选，请求头 X-API-Key（旧：GPU_OCR_API_KEY）
+          - OCR_API_TIMEOUT_SEC（旧：GPU_OCR_TIMEOUT_SEC）
+        POST {OCR_API_BASE}/ocr/pdf，multipart file，JSON { ok, text, error? }。
         """
-        endpoint = (os.getenv("GPU_OCR_ENDPOINT", "") or "").strip().rstrip("/")
+        endpoint = (os.getenv("OCR_API_BASE", "") or os.getenv("GPU_OCR_ENDPOINT", "") or "").strip().rstrip("/")
         if not endpoint:
-            return "", "gpu-ocr-endpoint-not-configured"
-        api_key = (os.getenv("GPU_OCR_API_KEY", "") or "").strip()
-        timeout_sec = self._safe_int(os.getenv("GPU_OCR_TIMEOUT_SEC", "900"), 900, min_value=30, max_value=7200)
+            return "", "ocr-api-base-not-configured"
+        api_key = (os.getenv("OCR_API_KEY", "") or os.getenv("GPU_OCR_API_KEY", "") or "").strip()
+        timeout_raw = (os.getenv("OCR_API_TIMEOUT_SEC", "") or os.getenv("GPU_OCR_TIMEOUT_SEC", "") or "900").strip() or "900"
+        timeout_sec = self._safe_int(timeout_raw, 900, min_value=30, max_value=7200)
         url = f"{endpoint}/ocr/pdf"
         headers: Dict[str, str] = {}
         if api_key:
@@ -298,9 +299,9 @@ class DocumentParser:
             err = ""
             if isinstance(payload, dict):
                 err = str(payload.get("error") or payload.get("detail") or "")
-            return "", err or "gpu-ocr-empty"
+            return "", err or "ocr-api-empty"
         except Exception as exc:
-            return "", f"gpu-ocr-failed:{exc}"
+            return "", f"ocr-api-failed:{exc}"
 
     def _pdf_page_count(self, file_path: str) -> int:
         try:
