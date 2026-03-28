@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# 在云主机项目根执行，用于确认「Git 已更新 + 前端已构建」与关键改动是否在磁盘上。
-# 用法：bash scripts/verify-frontend-deploy.sh
+# 确认「Git 已更新 + 前端已构建」与关键改动是否在磁盘上。
+# 用法（推荐，任意当前目录均可）：
+#   bash /opt/sKrt/scripts/verify-frontend-deploy.sh
+# 或在仓库根目录：
+#   bash scripts/verify-frontend-deploy.sh
+# 注意：不要在 frontend/ 目录下执行 bash scripts/...（该目录下没有 scripts 子目录）。
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+THIS_FILE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$THIS_FILE")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
+echo "(仓库根目录: $ROOT)"
 
 echo "== Git 最新提交 =="
 git log -1 --oneline || true
