@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict, Tuple
 from urllib.parse import urlencode, quote_plus
 from urllib.request import Request as UrlRequest, urlopen
 
@@ -54,6 +54,13 @@ from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
 from backend.services.payments.easypay_provider import EasyPayProvider
 from backend.services.runpod_client import runpod_enabled, submit_ingestion_job
+from backend.services.gpu_autostart_cloud import (
+    gpu_autostart_enabled,
+    start_gpu_instances,
+    stop_gpu_instances,
+)
+from backend.services.gpu_idle_autostop import schedule_gpu_idle_stop
+
 from backend.services.upload_load_control import (
     enforce_upload_create_allowed,
     get_upload_queue_metrics,
@@ -138,6 +145,7 @@ class ChunkCompleteRequest(BaseModel):
     document_type: str = "academic"
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
+    external_ocr_confirmed: bool = False
 
 
 class UploadPresignInitRequest(BaseModel):
@@ -150,6 +158,7 @@ class UploadPresignInitRequest(BaseModel):
 class UploadPresignCompleteRequest(BaseModel):
     object_key: str = Field(min_length=1, max_length=1024)
     use_gpu_ocr: bool = False
+    external_ocr_confirmed: bool = False
 
 
 class ChunkUploadMeta(TypedDict):
@@ -164,6 +173,11 @@ class ChunkUploadMeta(TypedDict):
     received_chunks: int
     temp_dir: str
     tenant_id: str
+    awaiting_external_ocr_confirm: NotRequired[bool]
+    pending_final_path: NotRequired[str]
+    pending_storage_basename: NotRequired[str]
+    pending_target_filename: NotRequired[str]
+    file_path_override: NotRequired[str]
 
 
 class PayOrderCreateRequest(BaseModel):
@@ -1648,12 +1662,64 @@ def _pdf_scan_decision(file_path: Path) -> Dict[str, Any]:
         return {"need_gpu": True, "page_count": max(1, int(page_count)), "extracted_chars": int(extracted_chars)}
 
 
+_EXTERNAL_OCR_SIZE_THRESHOLD_BYTES = 10 * 1024 * 1024
+
+
+def _baidu_ocr_env_configured() -> bool:
+    return bool(os.getenv("BAIDU_OCR_API_KEY", "").strip() and os.getenv("BAIDU_OCR_SECRET_KEY", "").strip())
+
+
+def _external_ocr_billing_enabled() -> bool:
+    if _baidu_ocr_env_configured():
+        return True
+    return bool((os.getenv("GPU_OCR_ENDPOINT") or "").strip())
+
+
+def _external_ocr_scan_quota_result(
+    *,
+    final_path: Path,
+    target_filename: str,
+    actual_size: int,
+    use_gpu_ocr_req: bool,
+    external_ocr_confirmed: bool,
+    request: Request,
+    tenant_id: str,
+    upload_id: Optional[str] = None,
+) -> Tuple[bool, Optional[JSONResponse]]:
+    """
+    扫描版 PDF 且启用外部 OCR 计费时扣减额度；>10MB 且未确认则返回 409。
+    返回 (upload_tasks.use_gpu_ocr 标记, 若非空则直接作为 HTTP 响应返回)。
+    """
+    is_pdf = Path(target_filename).suffix.lower() == ".pdf"
+    if not is_pdf or not use_gpu_ocr_req:
+        return False, None
+    if not _external_ocr_billing_enabled():
+        return False, None
+    decision = _pdf_scan_decision(final_path)
+    need_scan = bool(decision.get("need_gpu"))
+    if not need_scan:
+        return False, None
+    auto_large = actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
+    if auto_large and not external_ocr_confirmed:
+        payload: Dict[str, Any] = {
+            "code": "external_ocr_confirm_required",
+            "message": "此为扫描件，因处理器受限，超过10MB的需要调用外部OCR，是否继续",
+            "page_count": int(decision.get("page_count") or 1),
+        }
+        if upload_id:
+            payload["upload_id"] = upload_id
+        return False, JSONResponse(status_code=409, content=payload)
+    pages = int(decision.get("page_count") or 1)
+    _consume_gpu_pages_with_paid_balance_or_raise(request, tenant_id, pages)
+    return True, None
+
+
 def _consume_global_gpu_monthly_or_raise(request: Request) -> None:
     if _is_special_user(request):
         return
     limit = _gpu_monthly_limit()
     if limit <= 0:
-        raise HTTPException(status_code=403, detail="GPU OCR 未开放")
+        raise HTTPException(status_code=403, detail="外部 OCR 未开放")
     month_key = _month_key_beijing()
     conn = _conn()
     try:
@@ -1663,7 +1729,7 @@ def _consume_global_gpu_monthly_or_raise(request: Request) -> None:
         ).fetchone()
         used = int(row["used"]) if row else 0
         if used >= limit:
-            raise HTTPException(status_code=429, detail="本月全站 GPU 额度已用完（测试版）")
+            raise HTTPException(status_code=429, detail="本月全站外部 OCR 额度已用完（测试版）")
         if row:
             conn.execute(
                 "UPDATE gpu_ocr_global_monthly_usage SET used = used + 1, updated_at = CURRENT_TIMESTAMP WHERE month_key=?",
@@ -1685,7 +1751,7 @@ def _consume_gpu_page_quota_or_raise(request: Request, tenant_id: str, page_coun
     pages = max(1, int(page_count or 0))
     daily_limit = _gpu_daily_page_limit()
     if daily_limit <= 0:
-        raise HTTPException(status_code=403, detail="GPU OCR 未开放")
+        raise HTTPException(status_code=403, detail="外部 OCR 未开放")
     client_id = _client_id_from_request(request)
     day = _day_key_beijing()
     conn = _conn()
@@ -1696,7 +1762,7 @@ def _consume_gpu_page_quota_or_raise(request: Request, tenant_id: str, page_coun
         ).fetchone()
         used = int(row["pages_used"]) if row else 0
         if used + pages > daily_limit:
-            raise HTTPException(status_code=429, detail="已超出剩余gpu额度")
+            raise HTTPException(status_code=429, detail="已超出剩余外部 OCR 额度")
         if row:
             conn.execute(
                 "UPDATE gpu_ocr_daily_pages SET pages_used = pages_used + ?, updated_at = CURRENT_TIMESTAMP "
@@ -1719,7 +1785,7 @@ def _consume_global_gpu_monthly_pages_or_raise(request: Request, page_count: int
     pages = max(1, int(page_count or 0))
     limit = _gpu_monthly_global_page_limit()
     if limit <= 0:
-        raise HTTPException(status_code=403, detail="GPU OCR 未开放")
+        raise HTTPException(status_code=403, detail="外部 OCR 未开放")
     month_key = _month_key_beijing()
     conn = _conn()
     try:
@@ -1729,7 +1795,7 @@ def _consume_global_gpu_monthly_pages_or_raise(request: Request, page_count: int
         ).fetchone()
         used = int(row["pages_used"]) if row else 0
         if used + pages > limit:
-            raise HTTPException(status_code=429, detail="已超出剩余gpu额度")
+            raise HTTPException(status_code=429, detail="已超出剩余外部 OCR 额度")
         if row:
             conn.execute(
                 "UPDATE gpu_ocr_global_monthly_pages SET pages_used = pages_used + ?, updated_at = CURRENT_TIMESTAMP "
@@ -1839,6 +1905,34 @@ async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
         "paid_balance": int(max(0, paid_balance)),
         "special": bool(_is_special_user(request)),
     }
+
+
+@app.post("/gpu/autostart/start")
+async def gpu_autostart_start_route(request: Request) -> Dict[str, Any]:
+    identity = _get_request_identity(request)
+    _require_permission(identity, "tenant.upload.write")
+    if not gpu_autostart_enabled():
+        raise HTTPException(status_code=503, detail="GPU 自动启停未启用或未配置")
+    try:
+        result = await asyncio.to_thread(start_gpu_instances)
+        return {"ok": True, **result}
+    except Exception as exc:
+        logger.exception("gpu autostart start failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/gpu/autostart/stop")
+async def gpu_autostart_stop_route(request: Request) -> Dict[str, Any]:
+    identity = _get_request_identity(request)
+    _require_permission(identity, "tenant.upload.write")
+    if not gpu_autostart_enabled():
+        raise HTTPException(status_code=503, detail="GPU 自动启停未启用或未配置")
+    try:
+        result = await asyncio.to_thread(stop_gpu_instances)
+        return {"ok": True, **result}
+    except Exception as exc:
+        logger.exception("gpu autostart stop failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/gpu/ocr/redeem")
@@ -2047,6 +2141,8 @@ async def runpod_ingestion_callback(body: RunpodIngestionCallbackRequest) -> Dic
             await _rebuild_kg_relations(tenant_id=body.tenant_id)
         except Exception:
             logger.exception("runpod callback rebuild relations failed task_id=%s", body.task_id)
+    if body.status in {"completed", "failed"}:
+        schedule_gpu_idle_stop(assume_gpu=True)
     return {"ok": True}
 
 
@@ -2260,6 +2356,7 @@ async def _run_ingestion_worker(task_id: int, tenant_id: str) -> None:
         logger.exception("ingestion worker failed task_id=%s", task_id)
     finally:
         _ingestion_workers.pop(task_id, None)
+        schedule_gpu_idle_stop(task_id=task_id)
 
 
 def _verify_runpod_callback_signature(task_id: int, tenant_id: str, status: str, signature: str) -> bool:
@@ -2511,7 +2608,7 @@ async def put_chunk(upload_id: str, chunk_index: int, request: Request, chunk: U
 @app.post("/upload/chunks/{upload_id}/complete")
 async def complete_chunk_upload(
     upload_id: str, request: Request, req: Optional[ChunkCompleteRequest] = Body(default=None)
-) -> Dict[str, Any]:
+) -> Any:
     meta = _chunk_uploads.get(upload_id)
     if not meta:
         raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
@@ -2525,48 +2622,80 @@ async def complete_chunk_upload(
     purpose = (req.purpose if req else meta["purpose"]) if req else meta["purpose"]
     discipline = (req.discipline if req else meta["discipline"]) if req else meta["discipline"]
     document_type = (req.document_type if req else meta["document_type"]) if req else meta["document_type"]
+    external_ocr_confirmed = bool(req.external_ocr_confirmed) if req else False
+
     temp_dir = Path(meta["temp_dir"])
     total_chunks = int(meta["total_chunks"])
-    missing = [idx for idx in range(total_chunks) if not _chunk_path(upload_id, idx).exists()]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"分片缺失: {missing[:6]}")
+    resuming = bool(meta.get("awaiting_external_ocr_confirm")) and bool(meta.get("pending_final_path"))
 
-    target_filename = _safe_filename(meta["filename"])
-    storage_name = _unique_upload_basename(meta["filename"])
-    final_path = UPLOAD_DIR / storage_name
-    with open(final_path, "wb") as out:
-        for idx in range(total_chunks):
-            part_file = _chunk_path(upload_id, idx)
-            with open(part_file, "rb") as pf:
-                while True:
-                    block = pf.read(1024 * 1024)
-                    if not block:
-                        break
-                    out.write(block)
+    if resuming:
+        if not external_ocr_confirmed:
+            raise HTTPException(status_code=400, detail="请在确认调用外部 OCR 后继续")
+        final_path = Path(str(meta["pending_final_path"]))
+        if not final_path.exists():
+            _chunk_uploads.pop(upload_id, None)
+            raise HTTPException(status_code=410, detail="待确认文件已过期，请重新上传")
+        storage_name = str(meta["pending_storage_basename"])
+        target_filename = str(meta["pending_target_filename"])
+        actual_size = final_path.stat().st_size
+        use_gpu_ocr = bool(actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES)
+    else:
+        missing = [idx for idx in range(total_chunks) if not _chunk_path(upload_id, idx).exists()]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"分片缺失: {missing[:6]}")
 
-    actual_size = final_path.stat().st_size if final_path.exists() else 0
-    expected_size = int(meta["total_size"])
-    if expected_size > 0 and actual_size != expected_size:
-        raise HTTPException(status_code=400, detail=f"文件大小校验失败 expected={expected_size} actual={actual_size}")
+        target_filename = _safe_filename(meta["filename"])
+        storage_name = _unique_upload_basename(meta["filename"])
+        final_path = UPLOAD_DIR / storage_name
+        with open(final_path, "wb") as out:
+            for idx in range(total_chunks):
+                part_file = _chunk_path(upload_id, idx)
+                with open(part_file, "rb") as pf:
+                    while True:
+                        block = pf.read(1024 * 1024)
+                        if not block:
+                            break
+                        out.write(block)
 
-    use_gpu_ocr = bool((req.use_gpu_ocr if req and req.use_gpu_ocr is not None else meta.get("use_gpu_ocr")) or False)
-    if actual_size > 15 * 1024 * 1024:
-        use_gpu_ocr = True
+        actual_size = final_path.stat().st_size if final_path.exists() else 0
+        expected_size = int(meta["total_size"])
+        if expected_size > 0 and actual_size != expected_size:
+            raise HTTPException(status_code=400, detail=f"文件大小校验失败 expected={expected_size} actual={actual_size}")
+
+        use_gpu_ocr = bool((req.use_gpu_ocr if req and req.use_gpu_ocr is not None else meta.get("use_gpu_ocr")) or False)
+        if actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES:
+            use_gpu_ocr = True
 
     merged_sha256 = _calc_sha256(final_path) if final_path.exists() else ""
 
-    gpu_endpoint = (os.getenv("GPU_OCR_ENDPOINT") or "").strip()
-    auto_gpu = bool(actual_size > 15 * 1024 * 1024)
-    will_try_gpu = bool(use_gpu_ocr or auto_gpu)
-    if will_try_gpu and gpu_endpoint:
-        decision = _pdf_scan_decision(final_path)
-        will_use_gpu = bool(decision.get("need_gpu"))
-        if will_use_gpu:
-            pages = int(decision.get("page_count") or 1)
-            _consume_gpu_pages_with_paid_balance_or_raise(request, tenant_id, pages)
-            use_gpu_ocr = True
-        else:
-            use_gpu_ocr = False
+    use_task_gpu, ocr_resp = _external_ocr_scan_quota_result(
+        final_path=final_path,
+        target_filename=target_filename,
+        actual_size=actual_size,
+        use_gpu_ocr_req=use_gpu_ocr,
+        external_ocr_confirmed=external_ocr_confirmed,
+        request=request,
+        tenant_id=tenant_id,
+        upload_id=upload_id,
+    )
+    if ocr_resp is not None:
+        if not resuming:
+            meta["awaiting_external_ocr_confirm"] = True
+            meta["pending_final_path"] = str(final_path)
+            meta["pending_storage_basename"] = storage_name
+            meta["pending_target_filename"] = target_filename
+            for idx in range(total_chunks):
+                try:
+                    _chunk_path(upload_id, idx).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                temp_dir.rmdir()
+            except Exception:
+                pass
+        return ocr_resp
+
+    use_gpu_ocr = use_task_gpu
 
     # 先持久化到对象存储（优先 R2），并把 upload_tasks.file_path 指向远端 URI（保证后续解析不依赖本地磁盘）
     r2_cfg = R2StorageConfig.from_env()
@@ -2729,7 +2858,8 @@ async def create_upload_tasks(
     discipline: str = "general",
     document_type: Optional[str] = None,
     use_gpu_ocr: bool = False,
-) -> Dict[str, Any]:
+    external_ocr_confirmed: bool = False,
+) -> Any:
     _ensure_capacity_for_write()
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.upload.write")
@@ -2770,6 +2900,7 @@ async def create_upload_tasks(
     sb_cfg = SupabaseStorageConfig.from_env()
     sb_prefix = (os.getenv("SUPABASE_STORAGE_PREFIX") or "").strip().strip("/")
     sb_delete_local = _env_bool("SUPABASE_DELETE_LOCAL_AFTER_UPLOAD", False)
+    req_use_gpu_ocr = bool(use_gpu_ocr)
     for f in files:
         if not f.filename:
             continue
@@ -2781,19 +2912,25 @@ async def create_upload_tasks(
         target = UPLOAD_DIR / storage
         await _save_upload_file_stream(f, target)
 
-        # 若请求/自动需要 GPU OCR：在真正创建任务前做额度校验（特殊用户豁免）
-        gpu_endpoint = (os.getenv("GPU_OCR_ENDPOINT") or "").strip()
-        auto_gpu = bool(target.exists() and target.stat().st_size > 15 * 1024 * 1024)
-        will_try_gpu = bool(use_gpu_ocr or auto_gpu)
-        will_use_gpu = False
-        if will_try_gpu and gpu_endpoint:
-            decision = _pdf_scan_decision(target)
-            will_use_gpu = bool(decision.get("need_gpu"))
-            if will_use_gpu:
-                pages = int(decision.get("page_count") or 1)
-                _consume_gpu_pages_with_paid_balance_or_raise(request, tenant_id, pages)
-        # 只有判定为扫描版且额度扣减成功时才标记走 GPU
-        use_gpu_ocr = bool(will_use_gpu)
+        sz = target.stat().st_size if target.exists() else 0
+        auto_large = bool(sz > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES)
+        try_ocr = bool(req_use_gpu_ocr or auto_large)
+        task_use_gpu, ocr_resp = _external_ocr_scan_quota_result(
+            final_path=target,
+            target_filename=f.filename,
+            actual_size=sz,
+            use_gpu_ocr_req=try_ocr,
+            external_ocr_confirmed=external_ocr_confirmed,
+            request=request,
+            tenant_id=tenant_id,
+            upload_id=None,
+        )
+        if ocr_resp is not None:
+            try:
+                target.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return ocr_resp
 
         dtype = document_type or _guess_doc_type(f.filename)
         task = upload_ingestion_service.create_task(
@@ -2803,7 +2940,7 @@ async def create_upload_tasks(
             storage_basename=storage,
             tenant_id=tenant_id,
         )
-        upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(use_gpu_ocr))
+        upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
         # 优先：R2（S3 兼容）持久化，并把 upload_tasks.file_path 指向 r2://bucket/key
         if r2_cfg:
             object_key = f"{r2_prefix}/{tenant_id}/{storage}".strip("/")
@@ -2857,9 +2994,16 @@ async def create_upload_task_single_file(
     file: UploadFile = File(..., description="单个 PDF / DOCX / TXT / MD"),
     discipline: str = "general",
     document_type: Optional[str] = None,
-) -> Dict[str, Any]:
+    external_ocr_confirmed: bool = False,
+) -> Any:
     """与 POST /upload/tasks 相同，仅上传一个文件；在 /docs 里应出现标准 file 控件。若看不到：重启后端并强制刷新 /docs（Ctrl+F5）。"""
-    return await create_upload_tasks(request=request, files=[file], discipline=discipline, document_type=document_type)
+    return await create_upload_tasks(
+        request=request,
+        files=[file],
+        discipline=discipline,
+        document_type=document_type,
+        external_ocr_confirmed=external_ocr_confirmed,
+    )
 
 
 @app.post("/upload/tasks/presign-init", tags=["upload"])
@@ -2986,11 +3130,13 @@ async def upload_tasks_presign_complete(
         except Exception:
             pass
 
-    gpu_endpoint = (os.getenv("GPU_OCR_ENDPOINT") or "").strip()
     use_gpu = bool(body.use_gpu_ocr)
-    if sz > 15 * 1024 * 1024:
+    if sz > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES:
         use_gpu = True
-    if use_gpu and gpu_endpoint:
+    task_fn = str(task.get("filename") or "")
+    is_pdf = Path(task_fn).suffix.lower() == ".pdf"
+    spawn_worker = True
+    if use_gpu and _external_ocr_billing_enabled() and is_pdf:
         parsed_uri = parse_r2_uri(uri)
         if parsed_uri:
             bucket, key = parsed_uri
@@ -2999,13 +3145,21 @@ async def upload_tasks_presign_complete(
             dest = cache_dir / f"presign_gpu_{task_id}_{Path(key).name}"
             try:
                 r2_download_to_file(r2_cfg, bucket=bucket, key=key, dest_path=dest)
-                decision = _pdf_scan_decision(dest)
-                if bool(decision.get("need_gpu")):
-                    pages = int(decision.get("page_count") or 1)
-                    _consume_gpu_pages_with_paid_balance_or_raise(request, tenant_id, pages)
-                    upload_ingestion_service.update_task_use_gpu_ocr(task_id, True)
-                else:
+                task_use, ocr_resp = _external_ocr_scan_quota_result(
+                    final_path=dest,
+                    target_filename=task_fn,
+                    actual_size=sz,
+                    use_gpu_ocr_req=True,
+                    external_ocr_confirmed=bool(body.external_ocr_confirmed),
+                    request=request,
+                    tenant_id=tenant_id,
+                    upload_id=None,
+                )
+                if ocr_resp is not None:
                     upload_ingestion_service.update_task_use_gpu_ocr(task_id, False)
+                    spawn_worker = False
+                    return ocr_resp
+                upload_ingestion_service.update_task_use_gpu_ocr(task_id, bool(task_use))
             finally:
                 try:
                     dest.unlink(missing_ok=True)
@@ -3016,7 +3170,8 @@ async def upload_tasks_presign_complete(
     else:
         upload_ingestion_service.update_task_use_gpu_ocr(task_id, False)
 
-    _spawn_ingestion_worker(task_id, tenant_id)
+    if spawn_worker:
+        _spawn_ingestion_worker(task_id, tenant_id)
     return {"ok": True, "task_id": task_id, "file_size_bytes": sz, "file_uri": uri}
 
 

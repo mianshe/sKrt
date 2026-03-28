@@ -1,0 +1,5 @@
+# Optional: only for scripts/gpu_autostart/*.py (not required by main backend)
+tencentcloud-sdk-python>=3.0.0,<4
+alibabacloud-ecs20140526>=7.0.0,<9
+alibabacloud-tea-openapi>=0.3.0,<1
+python-dotenv>=1.0.0

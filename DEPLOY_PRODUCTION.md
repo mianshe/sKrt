@@ -106,3 +106,13 @@
   - 新上传任务默认提交到 RunPod
   - RunPod 完成后调用回调接口更新任务状态并触发关系重建
   - 回调需带签名，防止伪造请求
+
+### 4) GPU 云主机自动开机脚本（腾讯云 / 阿里云）
+
+适用于：**自建 GPU Worker**、无法人工随时开机、又未使用 RunPod 时，由香港 CPU 机通过 API 远程开机。
+
+- 脚本目录：[scripts/gpu_autostart/](scripts/gpu_autostart/README.md)（内含安装步骤、`--dry-run`、IAM 最小权限说明）。
+- 环境变量示例见根目录 [.env.example](.env.example) 中 `GPU_AUTOSTART_*`。
+- **注意**：开机后 GPU 机上的系统与 HTTP Worker 仍需 **冷启动时间**；若要用户无感，需在应用侧做 **队列 + 重试 / 健康检查**（本仓库当前仅提供独立脚本，不包含与入库队列的自动耦合）。
+- **上传页**：`GPU_AUTOSTART_ENABLED=1` 时，GPU 确认弹窗出现会调 `POST /gpu/autostart/start`，取消会调 `POST /gpu/autostart/stop`；IAM 需含 **StopInstances**。
+- **空闲关机**：`use_gpu_ocr` 入库任务或 RunPod 回调进入终态后，经 `GPU_AUTOSTOP_IDLE_SECONDS`（默认 120s，最小 30s）防抖，若全局无未完成 GPU 任务则自动调云 API 关机。

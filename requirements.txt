@@ -52,3 +52,8 @@ numpy
 
 # Test
 pytest
+
+# GPU 云主机 API 启停（可选：GPU_AUTOSTART_ENABLED=1 时上传弹窗会调 start/stop）
+tencentcloud-sdk-python>=3.0.0,<4
+alibabacloud-ecs20140526>=7.0.0,<9
+alibabacloud-tea-openapi>=0.3.0,<1

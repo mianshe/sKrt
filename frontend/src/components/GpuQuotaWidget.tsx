@@ -51,7 +51,7 @@ export default function GpuQuotaWidget() {
 
   const pricingText = useMemo(() => {
     return GPU_OCR_PAGE_PACKS.map(
-      (p) => `${p.name}：${p.pages}页，¥${p.priceCny}（约 ¥${p.pricePerPageCny.toFixed(4)}/页）`
+      (p) => `${p.name}：${p.pages}次，¥${p.priceCny}（约 ¥${p.pricePerPageCny.toFixed(4)}/次）`
     ).join("；");
   }, []);
   const selectedPack = useMemo(
@@ -176,7 +176,7 @@ export default function GpuQuotaWidget() {
         return;
       }
       setRedeemStatus("success");
-      setRedeemMessage(`已到账 ${GPU_OCR_REDEEM_PAGES} 页`);
+      setRedeemMessage(`已到账 ${GPU_OCR_REDEEM_PAGES} 次`);
       await refreshQuota();
     } catch {
       setRedeemStatus("error");
@@ -254,7 +254,7 @@ export default function GpuQuotaWidget() {
           stopped = true;
           window.clearInterval(timer);
           setPayStatus("paid");
-          setPayMessage(`已到账 ${selectedPack.pages} 页`);
+          setPayMessage(`已到账 ${selectedPack.pages} 次`);
           await refreshQuota();
         } else if (status === "refunded" || status === "failed") {
           stopped = true;
@@ -298,20 +298,20 @@ export default function GpuQuotaWidget() {
             setOrderNo("");
             setOrderQrImage("");
           }}
-          title="购买页包"
+          title="购买外部 OCR 次数包"
         >
-          购买页包
+          购买次数包
         </button>
         <button
           type="button"
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-slate-600 ring-1 ring-slate-200 transition hover:bg-slate-50"
           onClick={onQuotaTap}
-          title="连续点击 6 次可兑换页数"
+          title="连续点击 6 次可兑换次数"
         >
-          GPU 本月：{gpuQuota.used}/{gpuQuota.limit}
+          外部 OCR 本月：{gpuQuota.used}/{gpuQuota.limit}
         </button>
         {typeof gpuQuota.paid_balance === "number" && (
-          <span className="ml-1 text-[11px] text-slate-400">余额：{gpuQuota.paid_balance}页</span>
+          <span className="ml-1 text-[11px] text-slate-400">余额：{gpuQuota.paid_balance}次</span>
         )}
         {installMessage && <span className="ml-1 text-[11px] text-slate-400">{installMessage}</span>}
       </div>
@@ -336,8 +336,8 @@ export default function GpuQuotaWidget() {
       {redeemOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
           <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">兑换加页</p>
-            <p className="mt-1 text-xs text-slate-500">点击发送随机码后，去邮箱获取并输入，可领取加页。</p>
+            <p className="text-sm font-semibold text-slate-800">兑换次数</p>
+            <p className="mt-1 text-xs text-slate-500">点击发送随机码后，去邮箱获取并输入，可领取外部 OCR 次数。</p>
             <input
               className="input mt-3"
               value={redeemCode}
@@ -377,7 +377,7 @@ export default function GpuQuotaWidget() {
       {payOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
           <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">购买页包（微信/支付宝）</p>
+            <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包（微信/支付宝）</p>
             <p className="mt-1 text-xs text-slate-500">支付完成后会自动到账并刷新余额。</p>
             <div className="mt-3 flex gap-2">
               <button
@@ -420,7 +420,7 @@ export default function GpuQuotaWidget() {
                 >
                   <div className="font-semibold">{pack.name}</div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
-                    {pack.pages}页 · ¥{pack.priceCny}
+                    {pack.pages}次 · ¥{pack.priceCny}
                   </div>
                 </button>
               ))}

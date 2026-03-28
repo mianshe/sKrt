@@ -26,6 +26,26 @@ function withTenantHeaders(base?: Record<string, string>): Record<string, string
   return { ...(base || {}), "X-Tenant-Id": tenantId(), ...(clientId ? { "X-Client-Id": clientId } : {}) };
 }
 
+/** 与后端 _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES 一致：超过此大小的 PDF 可能触发外部 OCR 确认 */
+export const EXTERNAL_OCR_SIZE_THRESHOLD_BYTES = 10 * 1024 * 1024;
+
+/** 分片合并后服务端要求确认外部 OCR（HTTP 409）时抛出，供上传页二次调用 complete */
+export class ExternalOcrConfirmRequiredError extends Error {
+  readonly name = "ExternalOcrConfirmRequiredError";
+  constructor(
+    public readonly pageCount: number,
+    public readonly uploadId: string,
+    public readonly resumeContext: {
+      discipline: string;
+      documentType: string;
+      useGpuOcr: boolean;
+      onUploadPercent?: (n: number) => void;
+    }
+  ) {
+    super("external_ocr_confirm_required");
+  }
+}
+
 /** 单块大小（与后端流式读缓冲匹配，不宜过大） */
 const CHUNK_BYTES = 4 * 1024 * 1024;
 /** 大于等于此字节数走分片上传，避免单次 POST 过大导致超时或后端崩溃 */
@@ -195,7 +215,8 @@ async function createSingleFileTask(
   file: File,
   discipline: string,
   documentType: string,
-  useGpuOcr: boolean
+  useGpuOcr: boolean,
+  externalOcrConfirmed: boolean
 ): Promise<UploadTaskItem> {
   const form = new FormData();
   form.append("files", file);
@@ -203,11 +224,26 @@ async function createSingleFileTask(
   url.searchParams.set("discipline", discipline);
   url.searchParams.set("document_type", documentType);
   url.searchParams.set("use_gpu_ocr", useGpuOcr ? "1" : "0");
+  url.searchParams.set("external_ocr_confirmed", externalOcrConfirmed ? "1" : "0");
   let resp: Response;
   try {
     resp = await fetch(url, { method: "POST", body: form, headers: withTenantHeaders() });
   } catch {
     throw new Error(`无法连接后端（${API_BASE}/upload/tasks）。${backendHint()}`);
+  }
+  if (resp.status === 409) {
+    let j: { code?: string; message?: string; page_count?: number } = {};
+    try {
+      j = (await resp.json()) as typeof j;
+    } catch {
+      /* ignore */
+    }
+    if (j.code === "external_ocr_confirm_required") {
+      throw new Error(
+        j.message ||
+          "此为扫描件，因处理器受限，超过10MB的需要调用外部OCR，是否继续（请确认后重试上传）"
+      );
+    }
   }
   if (!resp.ok) {
     const details = await resp.text();
@@ -221,11 +257,52 @@ async function createSingleFileTask(
   return await getTaskById(Number(id));
 }
 
+async function postChunkComplete(
+  uploadId: string,
+  discipline: string,
+  documentType: string,
+  useGpuOcr: boolean,
+  externalOcrConfirmed: boolean
+): Promise<Response> {
+  return fetch(`${API_BASE}/upload/chunks/${uploadId}/complete`, {
+    method: "POST",
+    headers: withTenantHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      discipline,
+      document_type: documentType,
+      purpose: "docs",
+      use_gpu_ocr: useGpuOcr,
+      external_ocr_confirmed: externalOcrConfirmed,
+    }),
+  });
+}
+
+/** 用户已确认后，对同一 upload_id 仅再次调用 complete（无需重传分片） */
+export async function resumeChunkUploadAfterExternalOcrConfirm(
+  uploadId: string,
+  discipline: string,
+  documentType: string,
+  useGpuOcr: boolean
+): Promise<UploadTaskItem> {
+  const completeResp = await postChunkComplete(uploadId, discipline, documentType, useGpuOcr, true);
+  if (!completeResp.ok) {
+    const t = await completeResp.text();
+    throw new Error(t || "分片合并失败");
+  }
+  const done = (await completeResp.json()) as { tasks?: Array<{ id?: number; task_id?: number }> };
+  const taskId = pickTaskId(done.tasks?.[0]);
+  if (taskId == null) {
+    throw new Error("分片完成后未返回任务ID");
+  }
+  return await getTaskById(Number(taskId));
+}
+
 async function createSingleFileChunkTask(
   file: File,
   discipline: string,
   documentType: string,
   useGpuOcr: boolean,
+  externalOcrConfirmed: boolean,
   onUploadPercent?: (n: number) => void
 ): Promise<UploadTaskItem> {
   const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
@@ -281,18 +358,25 @@ async function createSingleFileChunkTask(
 
   let completeResp: Response;
   try {
-    completeResp = await fetch(`${API_BASE}/upload/chunks/${upload_id}/complete`, {
-      method: "POST",
-      headers: withTenantHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        discipline,
-        document_type: documentType,
-        purpose: "docs",
-        use_gpu_ocr: useGpuOcr,
-      }),
-    });
+    completeResp = await postChunkComplete(upload_id, discipline, documentType, useGpuOcr, externalOcrConfirmed);
   } catch {
     throw new Error(`无法连接后端（${API_BASE}/upload/chunks/.../complete）。${backendHint()}`);
+  }
+  if (completeResp.status === 409) {
+    let j: { code?: string; page_count?: number; upload_id?: string } = {};
+    try {
+      j = (await completeResp.json()) as typeof j;
+    } catch {
+      /* ignore */
+    }
+    if (j.code === "external_ocr_confirm_required") {
+      throw new ExternalOcrConfirmRequiredError(j.page_count ?? 0, j.upload_id || upload_id, {
+        discipline,
+        documentType,
+        useGpuOcr,
+        onUploadPercent,
+      });
+    }
   }
   if (!completeResp.ok) {
     const t = await completeResp.text();
@@ -418,22 +502,30 @@ export function useDocuments() {
       discipline: string,
       documentType: string,
       onUploadProgress?: (percent: number) => void,
-      options?: { use_gpu_ocr?: boolean }
+      options?: { use_gpu_ocr?: boolean; external_ocr_confirmed?: boolean }
     ): Promise<UploadTaskItem[]> => {
       if (!files.length) return [];
-      const normalizedDiscipline = (discipline.trim().toLowerCase() || "all");
+      const normalizedDiscipline = discipline.trim().toLowerCase() || "all";
       const useGpuOcr = Boolean(options?.use_gpu_ocr);
+      const externalOcrConfirmed = Boolean(options?.external_ocr_confirmed);
       const all: UploadTaskItem[] = [];
       let completed = 0;
       for (const file of files) {
         const task =
           file.size >= CHUNK_UPLOAD_THRESHOLD
-            ? await createSingleFileChunkTask(file, normalizedDiscipline, documentType, useGpuOcr, (p) => {
-                const base = Math.round((completed / files.length) * 100);
-                const local = Math.round(p / files.length);
-                onUploadProgress?.(Math.min(99, base + local));
-              })
-            : await createSingleFileTask(file, normalizedDiscipline, documentType, useGpuOcr);
+            ? await createSingleFileChunkTask(
+                file,
+                normalizedDiscipline,
+                documentType,
+                useGpuOcr,
+                externalOcrConfirmed,
+                (p) => {
+                  const base = Math.round((completed / files.length) * 100);
+                  const local = Math.round(p / files.length);
+                  onUploadProgress?.(Math.min(99, base + local));
+                }
+              )
+            : await createSingleFileTask(file, normalizedDiscipline, documentType, useGpuOcr, externalOcrConfirmed);
         completed += 1;
         onUploadProgress?.(Math.round((completed / files.length) * 100));
         all.push(task);
@@ -501,5 +593,6 @@ export function useDocuments() {
     onCreateUploadTasks: createUploadTasks,
     deleteDocument,
     uploadExamByChunks,
+    resumeChunkUploadAfterExternalOcrConfirm,
   };
 }

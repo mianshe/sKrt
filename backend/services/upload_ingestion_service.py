@@ -24,26 +24,6 @@ from backend.services.supabase_storage import SupabaseStorageConfig, download_to
 from backend.services.r2_storage import R2StorageConfig, download_to_file as r2_download_to_file, parse_r2_uri
 from backend.services.upload_load_control import log_ingestion_event
 
-_gpu_ocr_sem: Optional[asyncio.Semaphore] = None
-
-
-def _ingest_gpu_concurrency_limit() -> int:
-    try:
-        return max(0, int((os.getenv("INGEST_MAX_CONCURRENT_GPU_OCR") or "0").strip() or "0"))
-    except ValueError:
-        return 0
-
-
-def _get_gpu_ocr_semaphore() -> Optional[asyncio.Semaphore]:
-    global _gpu_ocr_sem
-    n = _ingest_gpu_concurrency_limit()
-    if n <= 0:
-        return None
-    if _gpu_ocr_sem is None:
-        _gpu_ocr_sem = asyncio.Semaphore(n)
-    return _gpu_ocr_sem
-
-
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except Exception:  # pragma: no cover - import fallback path
@@ -767,18 +747,13 @@ class UploadIngestionService:
             self.parser.set_ocr_cache(task_id)
             local_fp = await self._resolve_local_file_for_task(task_id, task)
             fs = int(task.get("file_size_bytes") or 0)
-            requested_gpu = int(task.get("use_gpu_ocr") or 0) == 1
-            _ = fs  # file_size_bytes kept for stats/debug; GPU OCR 由上游“扫描版判定+额度”决定
-            ocr_override = "runpod" if requested_gpu else None
+            _ = fs  # file_size_bytes kept for stats/debug; 外部 OCR 额度由上游扫描判定与扣减
+            # use_gpu_ocr 仅表示「计费/扫描 heavy 路径」，解析走 auto（百度/本地），不再强制 RunPod
+            ocr_override = None
             parse_fn = functools.partial(
                 self.parser.parse, local_fp, task["document_type"], ocr_engine_override=ocr_override
             )
-            sem = _get_gpu_ocr_semaphore()
-            if sem and ocr_override == "runpod":
-                async with sem:
-                    parsed = await asyncio.get_running_loop().run_in_executor(None, parse_fn)
-            else:
-                parsed = await asyncio.get_running_loop().run_in_executor(None, parse_fn)
+            parsed = await asyncio.get_running_loop().run_in_executor(None, parse_fn)
 
             self._update_task_page_count_from_parsed(task_id, parsed)
 
