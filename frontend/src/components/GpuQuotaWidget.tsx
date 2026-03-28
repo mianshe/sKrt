@@ -28,7 +28,9 @@ function quotaHeaders() {
 }
 
 export default function GpuQuotaWidget() {
-  const [gpuQuota, setGpuQuota] = useState<GpuQuota | null>(null);
+  /** 额度接口失败时仍展示安装/购买/兑换，避免整栏空白 */
+  const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
+  const [quotaLoadError, setQuotaLoadError] = useState(false);
   const [redeemOpen, setRedeemOpen] = useState(false);
   const [redeemCode, setRedeemCode] = useState("");
   const [redeemStatus, setRedeemStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
@@ -74,14 +76,18 @@ export default function GpuQuotaWidget() {
   const refreshQuota = async () => {
     try {
       const res = await fetch(`${API_BASE}/gpu/ocr/quota`, { headers: quotaHeaders(), credentials: "include" });
-      if (!res.ok) return;
+      if (!res.ok) {
+        setQuotaLoadError(true);
+        return;
+      }
+      setQuotaLoadError(false);
       const data = await res.json();
       const used = typeof data?.used === "number" ? data.used : 0;
       const limit = typeof data?.limit === "number" ? data.limit : 20;
       const paid_balance = typeof data?.paid_balance === "number" ? data.paid_balance : undefined;
       setGpuQuota({ used, limit, paid_balance });
     } catch {
-      // ignore
+      setQuotaLoadError(true);
     }
   };
 
@@ -272,8 +278,6 @@ export default function GpuQuotaWidget() {
     };
   }, [orderNo, payStatus, selectedPack.pages]);
 
-  if (!gpuQuota) return null;
-
   return (
     <>
       <div className="flex flex-wrap items-center justify-end gap-1.5 text-right text-[11px] text-slate-500">
@@ -309,6 +313,7 @@ export default function GpuQuotaWidget() {
           title="连续点击 6 次可兑换次数"
         >
           外部 OCR 本月：{gpuQuota.used}/{gpuQuota.limit}
+          {quotaLoadError ? <span className="text-amber-600">（未加载）</span> : null}
         </button>
         {typeof gpuQuota.paid_balance === "number" && (
           <span className="ml-1 text-[11px] text-slate-400">余额：{gpuQuota.paid_balance}次</span>

@@ -5,7 +5,7 @@ import NoticeDrawer from "./components/NoticeDrawer";
 import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
-import { useDocuments } from "./hooks/useDocuments";
+import { useDocuments, withTenantHeaders } from "./hooks/useDocuments";
 
 export type AppTab = "upload" | "knowledge" | "chat";
 
@@ -60,6 +60,7 @@ function App() {
           try {
             const res = await fetch(`${API_BASE}/auth/special-ocr/send-code`, {
               method: "POST",
+              headers: withTenantHeaders(),
               credentials: "include",
             });
             if (!res.ok) {
@@ -82,7 +83,7 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/auth/special-ocr/unlock`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: withTenantHeaders({ "Content-Type": "application/json" }),
         credentials: "include",
         body: JSON.stringify({ key: unlockKey }),
       });

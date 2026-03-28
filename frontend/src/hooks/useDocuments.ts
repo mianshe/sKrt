@@ -12,7 +12,7 @@ function tenantId(): string {
   }
 }
 
-function withTenantHeaders(base?: Record<string, string>): Record<string, string> {
+export function withTenantHeaders(base?: Record<string, string>): Record<string, string> {
   let clientId = "";
   try {
     clientId = localStorage.getItem(CLIENT_KEY) || "";
