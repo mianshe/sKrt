@@ -119,6 +119,47 @@
 
 ---
 
+## 前端 API 与「Failed to fetch」排查
+
+### 浏览器侧（发码、兑换、支付下单等）
+
+1. 打开 DevTools → **Network**，复现失败后选中 **`send-code`**、`redeem/send-code`、`pay/order/create` 等请求。
+2. 查看 **Request URL**：若页面是 `https://…` 而请求仍指向 `http://localhost:8000`、内网地址或与页面**协议/域名**不一致，常见结果为 **Failed to fetch**（不可达或**混合内容**被拦截）。
+3. 查看 **Console** 是否出现 **CORS**、**mixed content** 相关报错。
+
+### 生产推荐：`VITE_API_BASE=/api` 与反代
+
+- 执行 `npm run build` **之前**设置：`VITE_API_BASE=/api`，使浏览器请求与当前站点同源。
+- Nginx 将 `/api/` 代理到 uvicorn，并去掉 `/api` 前缀（后端路由为 `/auth/...`、`/gpu/...` 等，无前缀）：
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+### `CORS_ALLOW_ORIGINS`（跨域 API 时）
+
+发码等请求使用 `credentials: "include"` 时，规范不允许 `Access-Control-Allow-Origin: *`。若前端与 API **不同源**，在后端设置精确来源，例如：
+
+`CORS_ALLOW_ORIGINS=https://你的前端域名`
+
+多个来源用英文逗号分隔，**不要**尾斜杠。使用上文同源 `/api` 时通常不必改 CORS。
+
+### 「Failed to fetch」与邮件 / SMTP 失败的区别
+
+| 现象 | 含义 |
+|------|------|
+| 界面为「无法连接后端…」或英文 **Failed to fetch** | 浏览器**未收到有效 HTTP 响应**，优先查 **VITE_API_BASE**、HTTPS/HTTP、反代、CORS。 |
+| HTTP **502**，响应中含「发送失败」、SMTP 等 | 请求已到后端，**发邮件**等环节失败，查 `SMTP_*`、`CODE_EMAIL_TO` 及出站 **25/587/465** 是否被云厂商拦截。 |
+
+---
+
 ## 前端发布后「页面没变化」排查
 
 1. **服务器**：`git pull` 后必须在 `frontend/` 执行 `npm run build`（Nginx `root` 指向 `dist` 时只 pull 不会更新静态文件）。

@@ -6,6 +6,7 @@ import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
 import { useDocuments, withTenantHeaders } from "./hooks/useDocuments";
+import { formatApiFetchError } from "./lib/fetchErrors";
 
 export type AppTab = "upload" | "knowledge" | "chat";
 
@@ -69,7 +70,7 @@ function App() {
             }
             setUnlockMsg("随机码已发送到邮箱，请输入后确认");
           } catch (e) {
-            setUnlockMsg(e instanceof Error ? e.message : "随机码发送失败");
+            setUnlockMsg(formatApiFetchError(e, "随机码发送失败"));
           }
         })();
         return 0;
@@ -94,7 +95,7 @@ function App() {
       setUnlockMsg("解锁成功，特殊用户已开启");
       setUnlockKey("");
     } catch (e) {
-      setUnlockMsg(e instanceof Error ? e.message : "解锁失败");
+      setUnlockMsg(formatApiFetchError(e, "解锁失败"));
     }
   };
 

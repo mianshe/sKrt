@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { GPU_OCR_PAGE_PACKS, GPU_OCR_REDEEM_PAGES } from "../config/gpuOcrPricing";
+import { formatApiFetchError } from "../lib/fetchErrors";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
@@ -208,9 +209,9 @@ export default function GpuQuotaWidget() {
       }
       setRedeemStatus("success");
       setRedeemMessage("随机码已发送到邮箱");
-    } catch {
+    } catch (e) {
       setRedeemStatus("error");
-      setRedeemMessage("网络错误，请稍后重试");
+      setRedeemMessage(formatApiFetchError(e, "网络错误，请稍后重试"));
     }
   };
 
@@ -237,9 +238,9 @@ export default function GpuQuotaWidget() {
       setOrderQrImage(typeof data?.qr_image_url === "string" ? data.qr_image_url : "");
       setPayStatus("pending");
       setPayMessage(payChannel === "alipay_qr" ? "请使用支付宝扫码完成支付" : "请使用微信扫码完成支付");
-    } catch {
+    } catch (e) {
       setPayStatus("error");
-      setPayMessage("网络错误，请稍后重试");
+      setPayMessage(formatApiFetchError(e, "网络错误，请稍后重试"));
     }
   };
 
