@@ -37,7 +37,10 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
+        // 不把 index.html 打进 precache，避免旧 SW 长期返回旧壳导致一直加载旧 hash 的 JS
+        globPatterns: ["**/*.{js,css,ico,png,svg,woff2}"],
+        navigateFallback: "/index.html",
+        navigateFallbackDenylist: [/^\/api\//],
       },
       devOptions: {
         enabled: false,

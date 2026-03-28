@@ -116,3 +116,19 @@
 - **注意**：开机后 GPU 机上的系统与 HTTP Worker 仍需 **冷启动时间**；若要用户无感，需在应用侧做 **队列 + 重试 / 健康检查**（本仓库当前仅提供独立脚本，不包含与入库队列的自动耦合）。
 - **上传页**：`GPU_AUTOSTART_ENABLED=1` 时，GPU 确认弹窗出现会调 `POST /gpu/autostart/start`，取消会调 `POST /gpu/autostart/stop`；IAM 需含 **StopInstances**。
 - **空闲关机**：`use_gpu_ocr` 入库任务或 RunPod 回调进入终态后，经 `GPU_AUTOSTOP_IDLE_SECONDS`（默认 120s，最小 30s）防抖，若全局无未完成 GPU 任务则自动调云 API 关机。
+
+---
+
+## 前端发布后「页面没变化」排查
+
+1. **服务器**：`git pull` 后必须在 `frontend/` 执行 `npm run build`（Nginx `root` 指向 `dist` 时只 pull 不会更新静态文件）。
+2. **一键自检**（在项目根目录）：
+   ```bash
+   bash scripts/verify-frontend-deploy.sh
+   ```
+   确认 `quotaLoadError` 存在、`dist/index.html` 中 `index-*.js` 文件名与 Network 里一致。
+3. **浏览器 / PWA**：
+   - DevTools → Network 勾选 **Disable cache**，硬刷新。
+   - **Application** → **Service Workers** → **Unregister**；**Storage** → **清除站点数据**（或无痕窗口再试）。
+   - 对比 Network 里加载的 `/assets/index-xxxx.js` 与服务器 `dist/index.html` 是否同一文件名；不一致即为旧 SW/缓存。
+4. **构建侧**：已调整 `vite.config.ts` 中 Workbox **不再 precache `*.html`**，新部署后更易拿到新入口（仍建议发版后清一次 SW 以淘汰旧清单）。
