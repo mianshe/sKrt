@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 import { formatApiFetchError } from "../lib/fetchErrors";
 import { getAccessToken } from "../hooks/useDocuments";
@@ -39,6 +39,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
   const [quotaLoadError, setQuotaLoadError] = useState(false);
   const [redeemOpen, setRedeemOpen] = useState(false);
+  const redeemOpenRef = useRef(false);
+  const redeemReqIdRef = useRef(0);
   const [redeemCode, setRedeemCode] = useState("");
   const [redeemStatus, setRedeemStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [redeemMessage, setRedeemMessage] = useState("");
@@ -47,10 +49,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
   const [deferredPrompt, setDeferredPrompt] = useState<DeferredInstallPrompt | null>(null);
   const [installHintOpen, setInstallHintOpen] = useState(false);
+  const [installHintText, setInstallHintText] = useState("");
   const [installMessage, setInstallMessage] = useState("");
   const [isInstalled, setIsInstalled] = useState(false);
 
   const [payOpen, setPayOpen] = useState(false);
+  const payOpenRef = useRef(false);
+  const payReqIdRef = useRef(0);
   const [payStatus, setPayStatus] = useState<"idle" | "creating" | "pending" | "paid" | "error">("idle");
   const [payMessage, setPayMessage] = useState("");
   const [selectedPackKey, setSelectedPackKey] = useState<"A" | "B" | "C">("A");
@@ -68,6 +73,19 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     const isIos = /iphone|ipad|ipod/.test(ua);
     const isSafari = /safari/.test(ua) && !/crios|fxios|edgios/.test(ua);
     return isIos && isSafari;
+  }, []);
+  const installEnv = useMemo(() => {
+    const ua = window.navigator.userAgent.toLowerCase();
+    const isAndroid = /android/.test(ua);
+    const isEdge = /edg\//.test(ua) || /edga\//.test(ua) || /edgios\//.test(ua);
+    const isChrome = /chrome\//.test(ua) && !isEdge;
+    const isQuark = /quark/.test(ua);
+    const isMiuiBrowser = /miuibrowser|mibrowser|xiaomi/.test(ua);
+    const isWechat = /micromessenger/.test(ua);
+    const isQq = /\sqq\//.test(ua) || /mqqbrowser/.test(ua);
+    const isAndroidChromeLike = isAndroid && (isChrome || isEdge) && !isWechat && !isQq && !isQuark && !isMiuiBrowser;
+    const isUnsupportedInstallBrowser = isAndroid && (isQuark || isMiuiBrowser || isWechat || isQq);
+    return { isAndroid, isEdge, isChrome, isQuark, isMiuiBrowser, isWechat, isQq, isAndroidChromeLike, isUnsupportedInstallBrowser };
   }, []);
   const recommendedPayChannel = useMemo<"wechat_native" | "alipay_qr">(() => {
     const ua = window.navigator.userAgent.toLowerCase();
@@ -102,6 +120,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
     void refreshQuota();
   }, [authSession]);
+
+  useEffect(() => {
+    redeemOpenRef.current = redeemOpen;
+  }, [redeemOpen]);
+
+  useEffect(() => {
+    payOpenRef.current = payOpen;
+  }, [payOpen]);
 
   useEffect(() => {
     const standalone = window.matchMedia("(display-mode: standalone)").matches;
@@ -139,10 +165,22 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       return;
     }
     if (isIosSafari) {
+      setInstallHintText("iOS Safari：点击底部“分享”按钮，然后选择“添加到主屏幕”。");
       setInstallHintOpen(true);
       return;
     }
-    setInstallMessage("当前环境暂不支持安装，请使用 Chrome/Edge 打开");
+    if (installEnv.isAndroidChromeLike) {
+      setInstallHintText("Android：点击右上角菜单（⋮/…）→「安装应用」或「添加到主屏幕」。若仍无该选项，请确认已使用 HTTPS 且允许通知/存储权限。");
+      setInstallHintOpen(true);
+      return;
+    }
+    if (installEnv.isUnsupportedInstallBrowser) {
+      setInstallHintText("当前浏览器通常不支持安装到桌面。请复制链接到 Chrome/Edge 打开后再安装。");
+      setInstallHintOpen(true);
+      return;
+    }
+    setInstallHintText("当前环境暂不支持安装，请使用 Chrome/Edge（HTTPS）打开。");
+    setInstallHintOpen(true);
   };
 
   const onQuotaTap = () => {
@@ -174,6 +212,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setRedeemMessage("请填写邮件中的验证码");
       return;
     }
+    const reqId = ++redeemReqIdRef.current;
     setRedeemStatus("loading");
     setRedeemMessage("");
     try {
@@ -184,6 +223,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         body: JSON.stringify({ code }),
       });
       const data = await res.json().catch(() => ({}));
+      if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
       if (!res.ok) {
         const detail = typeof data?.detail === "string" ? data.detail : "随机码错误或已过期";
         setRedeemStatus("error");
@@ -194,12 +234,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setRedeemMessage("主控补额已生效");
       await refreshQuota();
     } catch {
+      if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
       setRedeemStatus("error");
       setRedeemMessage("网络错误，请稍后重试");
     }
   };
 
   const sendRedeemCode = async () => {
+    const reqId = ++redeemReqIdRef.current;
     setRedeemMessage("正在发送随机码…");
     setRedeemStatus("loading");
     try {
@@ -209,6 +251,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         credentials: "include",
       });
       const data = await res.json().catch(() => ({}));
+      if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
       if (!res.ok) {
         const detail = typeof data?.detail === "string" ? data.detail : "发送失败";
         setRedeemStatus("error");
@@ -218,12 +261,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setRedeemStatus("success");
       setRedeemMessage("随机码已发送至主控邮箱（CODE_EMAIL_TO），请查收并填写下方");
     } catch (e) {
+      if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
       setRedeemStatus("error");
       setRedeemMessage(formatApiFetchError(e, "发送失败"));
     }
   };
 
   const createPayOrder = async () => {
+    const reqId = ++payReqIdRef.current;
     setPayStatus("creating");
     setPayMessage("");
     setOrderNo("");
@@ -236,6 +281,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         body: JSON.stringify({ pack_key: selectedPack.key, channel: payChannel }),
       });
       const data = await res.json().catch(() => ({}));
+      if (!payOpenRef.current || reqId != payReqIdRef.current) return;
       if (!res.ok) {
         const detail = typeof data?.detail === "string" ? data.detail : "创建订单失败";
         setPayStatus("error");
@@ -247,6 +293,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setPayStatus("pending");
       setPayMessage(payChannel === "alipay_qr" ? "请使用支付宝扫码完成支付" : "请使用微信扫码完成支付");
     } catch (e) {
+      if (!payOpenRef.current || reqId != payReqIdRef.current) return;
       setPayStatus("error");
       setPayMessage(formatApiFetchError(e, "网络错误，请稍后重试"));
     }
@@ -264,6 +311,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         });
         if (!res.ok) return;
         const data = await res.json();
+        if (!payOpenRef.current) return;
         const status = typeof data?.status === "string" ? data.status : "";
         if (status === "paid") {
           stopped = true;
@@ -338,7 +386,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         <div className={modalBackdropClass}>
           <div className={modalPanelClass}>
             <p className="text-sm font-semibold text-slate-800">添加到主屏幕</p>
-            <p className="mt-1 text-xs text-slate-500">iOS Safari：点击底部“分享”按钮，然后选择“添加到主屏幕”。</p>
+            <p className="mt-1 text-xs text-slate-500">{installHintText || "请在浏览器菜单中选择“添加到主屏幕/安装应用”。"}</p>
             <div className="mt-3 flex justify-end">
               <button
                 className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
@@ -364,7 +412,6 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
               value={redeemCode}
               placeholder="邮件中的随机码"
               onChange={(e) => setRedeemCode(e.target.value)}
-              disabled={redeemStatus === "loading"}
               autoComplete="one-time-code"
             />
             {redeemMessage && (
@@ -384,7 +431,6 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
                   setRedeemMessage("");
                   setRedeemStatus("idle");
                 }}
-                disabled={redeemStatus === "loading"}
               >
                 关闭
               </button>
@@ -466,7 +512,6 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
               <button
                 className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
                 onClick={() => setPayOpen(false)}
-                disabled={payStatus === "creating"}
               >
                 关闭
               </button>

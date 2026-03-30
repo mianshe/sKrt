@@ -19,6 +19,7 @@ function App() {
     useDocuments();
 
   const [noticeOpen, setNoticeOpen] = useState(false);
+  const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   /** 默认 true：避免 /health 失败时整站不显示登录/注册；拉取成功后再以服务端为准 */
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
@@ -118,12 +119,81 @@ function App() {
               何芯求职专用测试项目
             </p>
           </div>
+          <div className="mt-0.5 md:hidden">
+            <button
+              type="button"
+              className="rounded-xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-white"
+              onClick={() => setMobileToolsOpen(true)}
+            >
+              菜单
+            </button>
+          </div>
           <div className="mt-0.5 hidden max-w-[380px] flex-col items-end gap-2 md:flex">
-            {authLocalEnabled && <AuthPanel onAuthed={() => { void refreshDocuments(); setAuthSession((n) => n + 1); }} />}
+            {authLocalEnabled && (
+              <AuthPanel
+                onAuthed={() => {
+                  void refreshDocuments();
+                  setAuthSession((n) => n + 1);
+                }}
+              />
+            )}
             <GpuQuotaWidget authSession={authSession} />
           </div>
         </div>
       </header>
+
+      {mobileToolsOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 px-4 pt-16" onClick={() => setMobileToolsOpen(false)}>
+          <div
+            className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold text-slate-800">快捷菜单</p>
+              <button
+                type="button"
+                className="rounded-lg px-2 py-1 text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                onClick={() => setMobileToolsOpen(false)}
+                aria-label="关闭"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-3 space-y-3">
+              {authLocalEnabled && (
+                <AuthPanel
+                  onAuthed={() => {
+                    void refreshDocuments();
+                    setAuthSession((n) => n + 1);
+                    setMobileToolsOpen(false);
+                  }}
+                />
+              )}
+              <GpuQuotaWidget authSession={authSession} />
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-2xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+                  onClick={() => {
+                    setNoticeOpen(true);
+                    setMobileToolsOpen(false);
+                  }}
+                >
+                  公告
+                </button>
+                <button
+                  type="button"
+                  className="rounded-2xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+                  onClick={() => setMobileToolsOpen(false)}
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {unlockOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
@@ -184,23 +254,6 @@ function App() {
           noticeOpen ? "md:pr-[360px]" : ""
         }`}
       >
-        <div className="mb-2 md:hidden">
-          {authLocalEnabled && (
-            <div className="mb-2">
-              <AuthPanel onAuthed={() => { void refreshDocuments(); setAuthSession((n) => n + 1); }} />
-            </div>
-          )}
-          <GpuQuotaWidget authSession={authSession} />
-          <div className="mt-2 flex justify-end">
-            <button
-              type="button"
-              className="rounded-2xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-              onClick={() => setNoticeOpen(true)}
-            >
-              公告
-            </button>
-          </div>
-        </div>
         <div className={tab === "upload" ? "block" : "hidden"}>
           <UploadTab
             documents={documents}
