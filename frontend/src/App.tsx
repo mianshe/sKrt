@@ -129,12 +129,14 @@ function App() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
           <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
             <p className="text-sm font-semibold text-slate-800">特殊用户解锁</p>
-            <p className="mt-1 text-xs text-slate-500">连点副标题触发本窗口后，已向你的注册邮箱自动发送验证码；填写后即可解锁特殊用户（外部 OCR 等）。</p>
+            <p className="mt-1 text-xs text-slate-500">
+              连点副标题触发本窗口后，已向服务端配置的<strong>主控邮箱</strong>（<code>CODE_EMAIL_TO</code>）发送随机码；填写后即可解锁特殊用户（外部 OCR 等）。
+            </p>
             <input
               className="input mt-3 w-full"
               value={unlockKey}
               onChange={(e) => setUnlockKey(e.target.value)}
-              placeholder="邮件中的验证码"
+              placeholder="邮件中的随机码"
             />
             {unlockMsg && <p className="mt-2 text-xs text-slate-600">{unlockMsg}</p>}
             <div className="mt-3 flex gap-2">

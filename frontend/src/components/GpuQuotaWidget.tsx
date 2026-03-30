@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { GPU_OCR_PAGE_PACKS, GPU_OCR_REDEEM_PAGES, GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
+import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 import { formatApiFetchError } from "../lib/fetchErrors";
 import { getAccessToken } from "../hooks/useDocuments";
 
@@ -58,13 +58,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [orderNo, setOrderNo] = useState("");
   const [orderQrImage, setOrderQrImage] = useState("");
 
-  const pricingText = useMemo(() => {
-    return GPU_OCR_PAGE_PACKS.map(
-      (p) => `${p.name}：${p.calls}次，¥${p.priceCny}（约 ¥${p.pricePerCallCny.toFixed(4)}/次）`
-    ).join("；");
-  }, []);
   const selectedPack = useMemo(
-    () => GPU_OCR_PAGE_PACKS.find((x) => x.key === selectedPackKey) ?? GPU_OCR_PAGE_PACKS[0],
+    () => GPU_OCR_CALL_PACKS.find((x) => x.key === selectedPackKey) ?? GPU_OCR_CALL_PACKS[0],
     [selectedPackKey]
   );
 
@@ -163,7 +158,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setTapStartMs(null);
       setTapCount(0);
       setRedeemStatus("idle");
-      setRedeemMessage("正在发送验证码到邮箱…");
+      setRedeemMessage("正在发送随机码…");
       setRedeemCode("");
       setRedeemOpen(true);
       void sendRedeemCode();
@@ -190,13 +185,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const detail = typeof data?.detail === "string" ? data.detail : "验证码错误或已过期";
+        const detail = typeof data?.detail === "string" ? data.detail : "随机码错误或已过期";
         setRedeemStatus("error");
         setRedeemMessage(detail);
         return;
       }
       setRedeemStatus("success");
-      setRedeemMessage(`已到账 ${GPU_OCR_REDEEM_PAGES} 次`);
+      setRedeemMessage("主控补额已生效");
       await refreshQuota();
     } catch {
       setRedeemStatus("error");
@@ -205,7 +200,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   };
 
   const sendRedeemCode = async () => {
-    setRedeemMessage("正在发送验证码到邮箱…");
+    setRedeemMessage("正在发送随机码…");
     setRedeemStatus("loading");
     try {
       const res = await fetch(`${API_BASE}/gpu/ocr/redeem/send-code`, {
@@ -221,7 +216,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         return;
       }
       setRedeemStatus("success");
-      setRedeemMessage("验证码已发送至邮箱，请查收并填写下方");
+      setRedeemMessage("随机码已发送至主控邮箱（CODE_EMAIL_TO），请查收并填写下方");
     } catch (e) {
       setRedeemStatus("error");
       setRedeemMessage(formatApiFetchError(e, "发送失败"));
@@ -359,20 +354,19 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       {redeemOpen && (
         <div className={modalBackdropClass}>
           <div className={modalPanelClass}>
-            <p className="text-sm font-semibold text-slate-800">兑换赠送次数</p>
+            <p className="text-sm font-semibold text-slate-800">主控补额（隐藏入口）</p>
             <p className="mt-1 text-xs text-slate-500">
-              打开本窗口时已向你的<strong>注册邮箱</strong>自动发送验证码；若未收到请查垃圾邮件。填写后点确认即可领取{" "}
-              <strong>{GPU_OCR_REDEEM_PAGES} 次</strong>外部 OCR 额度。
+              打开本窗口时已向服务端配置的<strong>主控邮箱</strong>（<code>CODE_EMAIL_TO</code>）发送随机码；若未收到请查垃圾邮件。
+              填写后点确认即可对当前会话执行补额。
             </p>
             <input
               className="input mt-3 w-full"
               value={redeemCode}
-              placeholder="邮件中的验证码"
+              placeholder="邮件中的随机码"
               onChange={(e) => setRedeemCode(e.target.value)}
               disabled={redeemStatus === "loading"}
               autoComplete="one-time-code"
             />
-            <p className="mt-2 text-[11px] text-slate-500">{pricingText}</p>
             {redeemMessage && (
               <p className={`mt-2 text-xs ${redeemStatus === "success" ? "text-emerald-600" : redeemStatus === "error" ? "text-rose-600" : "text-slate-600"}`}>
                 {redeemMessage}
@@ -380,7 +374,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
             )}
             <div className="mt-3 flex flex-wrap gap-2">
               <button className="btn-primary" onClick={submitRedeem} disabled={!redeemCode.trim() || redeemStatus === "loading"}>
-                {redeemStatus === "loading" && redeemCode.trim() ? "提交中…" : "确认兑换"}
+                {redeemStatus === "loading" && redeemCode.trim() ? "提交中…" : "确认"}
               </button>
               <button
                 className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
@@ -443,7 +437,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
               </span>
             </div>
             <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-              {GPU_OCR_PAGE_PACKS.map((pack) => (
+              {GPU_OCR_CALL_PACKS.map((pack) => (
                 <button
                   key={pack.key}
                   className={`rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
