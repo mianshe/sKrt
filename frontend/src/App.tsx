@@ -1,17 +1,18 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
+import AuthPanel from "./components/AuthPanel";
 import BottomNav from "./components/BottomNav";
 import GpuQuotaWidget from "./components/GpuQuotaWidget";
+import ModalShell from "./components/ModalShell";
 import NoticeDrawer from "./components/NoticeDrawer";
+import { API_BASE } from "./config/apiBase";
+import { setAccessToken, useAccessToken, verifyLocalAuthSession } from "./lib/auth";
+import { formatApiFetchError } from "./lib/fetchErrors";
 import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
 import { useDocuments, withTenantHeaders } from "./hooks/useDocuments";
-import AuthPanel from "./components/AuthPanel";
-import { formatApiFetchError } from "./lib/fetchErrors";
 
 export type AppTab = "upload" | "knowledge" | "chat";
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
 function App() {
   const [tab, setTab] = useState<AppTab>("upload");
@@ -20,9 +21,9 @@ function App() {
 
   const [noticeOpen, setNoticeOpen] = useState(false);
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
-  /** 默认 true：避免 /health 失败时整站不显示登录/注册；拉取成功后再以服务端为准 */
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
+  const accessToken = useAccessToken();
 
   const [capacityWarn, setCapacityWarn] = useState<"soft" | "hard" | null>(null);
   const [tapCount, setTapCount] = useState(0);
@@ -33,21 +34,24 @@ function App() {
   useEffect(() => {
     const check = async () => {
       try {
-        const res = await fetch(`${API_BASE}/health`);
-        if (!res.ok) return;
-        const data = await res.json();
+        const response = await fetch(`${API_BASE}/health`);
+        if (!response.ok) return;
+        const data = await response.json();
+
         if (typeof data?.auth_local_jwt_enabled === "boolean") {
           setAuthLocalEnabled(data.auth_local_jwt_enabled);
         }
+
         const cap = data?.capacity;
         if (cap?.hard_exceeded) setCapacityWarn("hard");
         else if (cap?.soft_exceeded) setCapacityWarn("soft");
         else setCapacityWarn(null);
       } catch {
-        // 忽略网络错误
+        // ignore network errors
       }
     };
-    check();
+
+    void check();
     const id = setInterval(check, 60_000);
     return () => clearInterval(id);
   }, []);
@@ -58,52 +62,84 @@ function App() {
     return () => clearTimeout(id);
   }, [tapCount]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const syncAuthState = async () => {
+      if (!accessToken) {
+        if (!cancelled) {
+          setAuthSession((n) => n + 1);
+          void refreshDocuments();
+        }
+        return;
+      }
+
+      const verified = await verifyLocalAuthSession(accessToken);
+      if (cancelled) return;
+
+      if (!verified) {
+        setAccessToken(null);
+        return;
+      }
+
+      setAuthSession((n) => n + 1);
+      void refreshDocuments();
+    };
+
+    void syncAuthState();
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, refreshDocuments]);
+
   const handleSubtitleTap = () => {
     if (tab !== "upload") return;
-    setTapCount((n) => {
-      const next = n + 1;
-      if (next >= 6) {
-        setUnlockOpen(true);
-        setUnlockMsg("正在发送验证码到邮箱…");
-        void (async () => {
-          try {
-            const res = await fetch(`${API_BASE}/auth/special-ocr/send-code`, {
-              method: "POST",
-              headers: withTenantHeaders(),
-              credentials: "include",
-            });
-            if (!res.ok) {
-              const t = await res.text();
-              throw new Error(t || "发送失败");
-            }
-            setUnlockMsg("验证码已发送至邮箱，请查收并填写下方");
-          } catch (e) {
-            setUnlockMsg(formatApiFetchError(e, "发送失败"));
+
+    setTapCount((count) => {
+      const next = count + 1;
+      if (next < 6) return next;
+
+      setUnlockOpen(true);
+      setUnlockMsg("正在发送验证码到主控邮箱...");
+      void (async () => {
+        try {
+          const response = await fetch(`${API_BASE}/auth/special-ocr/send-code`, {
+            method: "POST",
+            headers: withTenantHeaders(),
+            credentials: "include",
+          });
+          if (!response.ok) {
+            const text = await response.text();
+            throw new Error(text || "发送失败");
           }
-        })();
-        return 0;
-      }
-      return next;
+          setUnlockMsg("验证码已发送，请查收邮箱后填写。");
+        } catch (error) {
+          setUnlockMsg(formatApiFetchError(error, "发送失败"));
+        }
+      })();
+
+      return 0;
     });
   };
 
   const submitUnlock = async () => {
     setUnlockMsg("");
     try {
-      const res = await fetch(`${API_BASE}/auth/special-ocr/unlock`, {
+      const response = await fetch(`${API_BASE}/auth/special-ocr/unlock`, {
         method: "POST",
         headers: withTenantHeaders({ "Content-Type": "application/json" }),
         credentials: "include",
         body: JSON.stringify({ key: unlockKey }),
       });
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(t || "解锁失败");
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "解锁失败");
       }
-      setUnlockMsg("解锁成功，特殊用户已开启");
+
+      setUnlockMsg("解锁成功，特殊用户权限已开启。");
       setUnlockKey("");
-    } catch (e) {
-      setUnlockMsg(formatApiFetchError(e, "解锁失败"));
+    } catch (error) {
+      setUnlockMsg(formatApiFetchError(error, "解锁失败"));
     }
   };
 
@@ -116,9 +152,10 @@ function App() {
               资料解析
             </h1>
             <p className="mt-0.5 text-sm font-medium text-slate-500" onClick={handleSubtitleTap} role="button" tabIndex={0}>
-              何芯求职专用测试项目
+              何芷求职专用测试项目
             </p>
           </div>
+
           <div className="mt-0.5 md:hidden">
             <button
               type="button"
@@ -128,12 +165,12 @@ function App() {
               菜单
             </button>
           </div>
+
           <div className="mt-0.5 hidden max-w-[380px] flex-col items-end gap-2 md:flex">
             {authLocalEnabled && (
               <AuthPanel
                 onAuthed={() => {
-                  void refreshDocuments();
-                  setAuthSession((n) => n + 1);
+                  setMobileToolsOpen(false);
                 }}
               />
             )}
@@ -146,7 +183,7 @@ function App() {
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 px-4 pt-16" onClick={() => setMobileToolsOpen(false)}>
           <div
             className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
-            onClick={(e) => e.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between gap-2">
               <p className="text-sm font-semibold text-slate-800">快捷菜单</p>
@@ -156,7 +193,7 @@ function App() {
                 onClick={() => setMobileToolsOpen(false)}
                 aria-label="关闭"
               >
-                ✕
+                ×
               </button>
             </div>
 
@@ -164,8 +201,6 @@ function App() {
               {authLocalEnabled && (
                 <AuthPanel
                   onAuthed={() => {
-                    void refreshDocuments();
-                    setAuthSession((n) => n + 1);
                     setMobileToolsOpen(false);
                   }}
                 />
@@ -195,47 +230,44 @@ function App() {
         </div>
       )}
 
-      {unlockOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-          <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">特殊用户解锁</p>
-            <p className="mt-1 text-xs text-slate-500">
-              连点副标题触发本窗口后，已向服务端配置的<strong>主控邮箱</strong>（<code>CODE_EMAIL_TO</code>）发送随机码；填写后即可解锁特殊用户（外部 OCR 等）。
-            </p>
-            <input
-              className="input mt-3 w-full"
-              value={unlockKey}
-              onChange={(e) => setUnlockKey(e.target.value)}
-              placeholder="邮件中的随机码"
-            />
-            {unlockMsg && <p className="mt-2 text-xs text-slate-600">{unlockMsg}</p>}
-            <div className="mt-3 flex gap-2">
-              <button className="btn-primary" onClick={submitUnlock} disabled={!unlockKey.trim()}>
-                确认
-              </button>
-              <button
-                className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={() => {
-                  setUnlockOpen(false);
-                  setUnlockKey("");
-                  setUnlockMsg("");
-                }}
-              >
-                关闭
-              </button>
-            </div>
-          </div>
+      <ModalShell open={unlockOpen} onClose={() => setUnlockOpen(false)} panelClassName="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+        <p className="text-sm font-semibold text-slate-800">特殊用户解锁</p>
+        <p className="mt-1 text-xs text-slate-500">
+          连点副标题触发后，系统会向主控邮箱发送验证码。填写后即可启用特殊权限，例如外部 OCR 特权。
+        </p>
+        <input
+          className="input mt-3 w-full"
+          value={unlockKey}
+          onChange={(e) => setUnlockKey(e.target.value)}
+          placeholder="请输入邮件中的验证码"
+        />
+        {unlockMsg && <p className="mt-2 text-xs text-slate-600">{unlockMsg}</p>}
+        <div className="mt-3 flex gap-2">
+          <button className="btn-primary" onClick={submitUnlock} disabled={!unlockKey.trim()}>
+            确认
+          </button>
+          <button
+            className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+            onClick={() => {
+              setUnlockOpen(false);
+              setUnlockKey("");
+              setUnlockMsg("");
+            }}
+          >
+            关闭
+          </button>
         </div>
-      )}
+      </ModalShell>
 
       {capacityWarn === "hard" && (
         <div className="sticky top-[57px] z-10 bg-red-600 px-4 py-2 text-center text-sm font-semibold text-white shadow">
-          服务器存储空间不足，已暂停写入。请联系管理员清理或扩容后继续使用。
+          服务器存储空间不足，已暂停写入。请清理或扩容后继续使用。
         </div>
       )}
+
       {capacityWarn === "soft" && (
         <div className="sticky top-[57px] z-10 bg-amber-500 px-4 py-2 text-center text-sm font-semibold text-white shadow">
-          服务器存储空间即将用尽，请及时清理不需要的文档。
+          服务器存储空间即将用尽，请尽快清理不需要的文档。
         </div>
       )}
 
@@ -249,11 +281,7 @@ function App() {
         公告
       </button>
 
-      <main
-        className={`mx-auto w-full max-w-5xl px-3 pb-24 pt-4 transition-[padding] duration-200 ${
-          noticeOpen ? "md:pr-[360px]" : ""
-        }`}
-      >
+      <main className={`mx-auto w-full max-w-5xl px-3 pb-24 pt-4 transition-[padding] duration-200 ${noticeOpen ? "md:pr-[360px]" : ""}`}>
         <div className={tab === "upload" ? "block" : "hidden"}>
           <UploadTab
             documents={documents}
@@ -267,9 +295,11 @@ function App() {
             authSession={authSession}
           />
         </div>
+
         <div className={tab === "knowledge" ? "block" : "hidden"}>
           <KnowledgeTab />
         </div>
+
         <div className={tab === "chat" ? "block" : "hidden"}>
           <ChatTab onUploadExamByChunks={uploadExamByChunks} />
         </div>

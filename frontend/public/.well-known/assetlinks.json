@@ -1,0 +1,13 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.skrt.app",
+      "sha256_cert_fingerprints": [
+        "E9:D3:CB:BA:44:DB:E1:C0:72:91:F9:5A:01:3D:8C:F5:36:17:E6:99:21:6B:DB:74:26:BB:4D:36:14:85:A2:3A"
+      ]
+    }
+  }
+]
+

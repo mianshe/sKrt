@@ -1,43 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
+import { API_BASE } from "../config/apiBase";
+import { useAccessToken } from "../lib/auth";
 import { formatApiFetchError } from "../lib/fetchErrors";
-import { getAccessToken } from "../hooks/useDocuments";
-
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+import { withTenantHeaders } from "../hooks/useDocuments";
+import ModalShell from "./ModalShell";
 
 type DeferredInstallPrompt = Event & {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
 };
 
-type GpuQuota = { used: number; limit: number; paid_balance?: number; special?: boolean };
+type GpuQuota = {
+  used: number;
+  limit: number;
+  paid_balance?: number;
+  special?: boolean;
+};
 
-const modalBackdropClass = "fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4";
-const modalPanelClass = "w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200";
-
-function quotaHeaders() {
-  try {
-    let cid = localStorage.getItem("xm_client_id") || "";
-    if (!cid) {
-      cid = crypto.randomUUID();
-      localStorage.setItem("xm_client_id", cid);
-    }
-    const tid = localStorage.getItem("xm_tenant_id") || "public";
-    return {
-      "X-Client-Id": cid,
-      "X-Tenant-Id": tid,
-    };
-  } catch {
-    return {};
-  }
-}
-
-type GpuQuotaWidgetProps = { authSession?: number };
+type GpuQuotaWidgetProps = {
+  authSession?: number;
+};
 
 export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
-  /** 额度接口失败时仍展示安装/购买/兑换，避免整栏空白 */
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
   const [quotaLoadError, setQuotaLoadError] = useState(false);
+
   const [redeemOpen, setRedeemOpen] = useState(false);
   const redeemOpenRef = useRef(false);
   const redeemReqIdRef = useRef(0);
@@ -63,8 +51,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [orderNo, setOrderNo] = useState("");
   const [orderQrImage, setOrderQrImage] = useState("");
 
+  const accessToken = useAccessToken();
+  const loggedIn = Boolean(accessToken);
+
   const selectedPack = useMemo(
-    () => GPU_OCR_CALL_PACKS.find((x) => x.key === selectedPackKey) ?? GPU_OCR_CALL_PACKS[0],
+    () => GPU_OCR_CALL_PACKS.find((item) => item.key === selectedPackKey) ?? GPU_OCR_CALL_PACKS[0],
     [selectedPackKey]
   );
 
@@ -74,52 +65,62 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     const isSafari = /safari/.test(ua) && !/crios|fxios|edgios/.test(ua);
     return isIos && isSafari;
   }, []);
+
   const installEnv = useMemo(() => {
     const ua = window.navigator.userAgent.toLowerCase();
     const isAndroid = /android/.test(ua);
     const isEdge = /edg\//.test(ua) || /edga\//.test(ua) || /edgios\//.test(ua);
     const isChrome = /chrome\//.test(ua) && !isEdge;
+    const isDesktopChromium = !isAndroid && (isChrome || isEdge);
     const isQuark = /quark/.test(ua);
     const isMiuiBrowser = /miuibrowser|mibrowser|xiaomi/.test(ua);
     const isWechat = /micromessenger/.test(ua);
     const isQq = /\sqq\//.test(ua) || /mqqbrowser/.test(ua);
     const isAndroidChromeLike = isAndroid && (isChrome || isEdge) && !isWechat && !isQq && !isQuark && !isMiuiBrowser;
     const isUnsupportedInstallBrowser = isAndroid && (isQuark || isMiuiBrowser || isWechat || isQq);
-    return { isAndroid, isEdge, isChrome, isQuark, isMiuiBrowser, isWechat, isQq, isAndroidChromeLike, isUnsupportedInstallBrowser };
+    return {
+      isAndroidChromeLike,
+      isDesktopChromium,
+      isUnsupportedInstallBrowser,
+    };
   }, []);
+
   const recommendedPayChannel = useMemo<"wechat_native" | "alipay_qr">(() => {
     const ua = window.navigator.userAgent.toLowerCase();
-    if (/alipayclient/.test(ua)) return "alipay_qr";
-    return "wechat_native";
+    return /alipayclient/.test(ua) ? "alipay_qr" : "wechat_native";
   }, []);
 
   const refreshQuota = async () => {
     try {
-      const res = await fetch(`${API_BASE}/gpu/ocr/quota`, { headers: quotaHeaders(), credentials: "include" });
-      if (!res.ok) {
+      const response = await fetch(`${API_BASE}/gpu/ocr/quota`, {
+        headers: withTenantHeaders(),
+        credentials: "include",
+      });
+      if (!response.ok) {
         setQuotaLoadError(true);
         return;
       }
+
       setQuotaLoadError(false);
-      const data = await res.json();
+      const data = await response.json();
       const used = typeof data?.used === "number" ? data.used : 0;
       const limit = typeof data?.limit === "number" ? data.limit : 20;
-      const paid_balance = typeof data?.paid_balance === "number" ? data.paid_balance : undefined;
+      const paidBalance = typeof data?.paid_balance === "number" ? data.paid_balance : undefined;
       const special = data?.special === true;
-      setGpuQuota({ used, limit, paid_balance, special });
+      setGpuQuota({ used, limit, paid_balance: paidBalance, special });
     } catch {
       setQuotaLoadError(true);
     }
   };
 
   useEffect(() => {
-    if (!getAccessToken()) {
+    if (!loggedIn) {
       setGpuQuota({ used: 0, limit: 0, paid_balance: 0, special: false });
       setQuotaLoadError(false);
       return;
     }
     void refreshQuota();
-  }, [authSession]);
+  }, [authSession, loggedIn]);
 
   useEffect(() => {
     redeemOpenRef.current = redeemOpen;
@@ -143,6 +144,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setDeferredPrompt(null);
       setInstallMessage("已安装到桌面");
     };
+
     window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
     window.addEventListener("appinstalled", onInstalled);
     return () => {
@@ -153,33 +155,45 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
   const onInstallClick = async () => {
     setInstallMessage("");
+
     if (isInstalled) {
       setInstallMessage("应用已安装");
       return;
     }
+
     if (deferredPrompt) {
       await deferredPrompt.prompt();
       const choice = await deferredPrompt.userChoice;
-      setInstallMessage(choice.outcome === "accepted" ? "安装请求已提交" : "你已取消安装");
+      setInstallMessage(choice.outcome === "accepted" ? "已发起安装" : "已取消安装");
       setDeferredPrompt(null);
       return;
     }
+
     if (isIosSafari) {
-      setInstallHintText("iOS Safari：点击底部“分享”按钮，然后选择“添加到主屏幕”。");
+      setInstallHintText("iPhone 或 iPad 上请点 Safari 底部“分享”，再选择“添加到主屏幕”。");
       setInstallHintOpen(true);
       return;
     }
+
     if (installEnv.isAndroidChromeLike) {
-      setInstallHintText("Android：点击右上角菜单（⋮/…）→「安装应用」或「添加到主屏幕」。若仍无该选项，请确认已使用 HTTPS 且允许通知/存储权限。");
+      setInstallHintText("Android 上请点浏览器右上角菜单，选择“安装应用”或“添加到主屏幕”。");
       setInstallHintOpen(true);
       return;
     }
+
     if (installEnv.isUnsupportedInstallBrowser) {
-      setInstallHintText("当前浏览器通常不支持安装到桌面。请复制链接到 Chrome/Edge 打开后再安装。");
+      setInstallHintText("当前安卓浏览器通常不支持安装，请改用 Chrome 或 Edge 打开后再安装。");
       setInstallHintOpen(true);
       return;
     }
-    setInstallHintText("当前环境暂不支持安装，请使用 Chrome/Edge（HTTPS）打开。");
+
+    if (installEnv.isDesktopChromium) {
+      setInstallHintText("桌面 Chrome 或 Edge 上请点击地址栏右侧安装图标，或从浏览器菜单中选择“安装 sKrt”。");
+      setInstallHintOpen(true);
+      return;
+    }
+
+    setInstallHintText("当前环境暂不支持一键安装，请使用 HTTPS 下的 Chrome、Edge 或 Safari 再试。");
     setInstallHintOpen(true);
   };
 
@@ -191,17 +205,19 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setTapCount(1);
       return;
     }
+
     const next = tapCount + 1;
     if (next >= 6) {
       setTapStartMs(null);
       setTapCount(0);
       setRedeemStatus("idle");
-      setRedeemMessage("正在发送随机码…");
+      setRedeemMessage("正在发送验证码...");
       setRedeemCode("");
       setRedeemOpen(true);
       void sendRedeemCode();
       return;
     }
+
     setTapCount(next);
   };
 
@@ -212,26 +228,29 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setRedeemMessage("请填写邮件中的验证码");
       return;
     }
+
     const reqId = ++redeemReqIdRef.current;
     setRedeemStatus("loading");
     setRedeemMessage("");
     try {
-      const res = await fetch(`${API_BASE}/gpu/ocr/redeem`, {
+      const response = await fetch(`${API_BASE}/gpu/ocr/redeem`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...quotaHeaders() },
+        headers: withTenantHeaders({ "Content-Type": "application/json" }),
         credentials: "include",
         body: JSON.stringify({ code }),
       });
-      const data = await res.json().catch(() => ({}));
+      const data = await response.json().catch(() => ({}));
       if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
-      if (!res.ok) {
-        const detail = typeof data?.detail === "string" ? data.detail : "随机码错误或已过期";
+
+      if (!response.ok) {
+        const detail = typeof data?.detail === "string" ? data.detail : "验证码错误或已过期";
         setRedeemStatus("error");
         setRedeemMessage(detail);
         return;
       }
+
       setRedeemStatus("success");
-      setRedeemMessage("主控补额已生效");
+      setRedeemMessage("补充额度已生效");
       await refreshQuota();
     } catch {
       if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
@@ -242,28 +261,31 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
   const sendRedeemCode = async () => {
     const reqId = ++redeemReqIdRef.current;
-    setRedeemMessage("正在发送随机码…");
+    setRedeemMessage("正在发送验证码...");
     setRedeemStatus("loading");
+
     try {
-      const res = await fetch(`${API_BASE}/gpu/ocr/redeem/send-code`, {
+      const response = await fetch(`${API_BASE}/gpu/ocr/redeem/send-code`, {
         method: "POST",
-        headers: { ...quotaHeaders() },
+        headers: withTenantHeaders(),
         credentials: "include",
       });
-      const data = await res.json().catch(() => ({}));
+      const data = await response.json().catch(() => ({}));
       if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
-      if (!res.ok) {
+
+      if (!response.ok) {
         const detail = typeof data?.detail === "string" ? data.detail : "发送失败";
         setRedeemStatus("error");
         setRedeemMessage(detail);
         return;
       }
+
       setRedeemStatus("success");
-      setRedeemMessage("随机码已发送至主控邮箱（CODE_EMAIL_TO），请查收并填写下方");
-    } catch (e) {
+      setRedeemMessage("验证码已发送到主控邮箱，请查收后填写。");
+    } catch (error) {
       if (!redeemOpenRef.current || reqId !== redeemReqIdRef.current) return;
       setRedeemStatus("error");
-      setRedeemMessage(formatApiFetchError(e, "发送失败"));
+      setRedeemMessage(formatApiFetchError(error, "发送失败"));
     }
   };
 
@@ -273,45 +295,51 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setPayMessage("");
     setOrderNo("");
     setOrderQrImage("");
+
     try {
-      const res = await fetch(`${API_BASE}/gpu/ocr/pay/order/create`, {
+      const response = await fetch(`${API_BASE}/gpu/ocr/pay/order/create`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...quotaHeaders() },
+        headers: withTenantHeaders({ "Content-Type": "application/json" }),
         credentials: "include",
         body: JSON.stringify({ pack_key: selectedPack.key, channel: payChannel }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!payOpenRef.current || reqId != payReqIdRef.current) return;
-      if (!res.ok) {
+      const data = await response.json().catch(() => ({}));
+      if (!payOpenRef.current || reqId !== payReqIdRef.current) return;
+
+      if (!response.ok) {
         const detail = typeof data?.detail === "string" ? data.detail : "创建订单失败";
         setPayStatus("error");
         setPayMessage(detail);
         return;
       }
+
       setOrderNo(typeof data?.order_no === "string" ? data.order_no : "");
       setOrderQrImage(typeof data?.qr_image_url === "string" ? data.qr_image_url : "");
       setPayStatus("pending");
       setPayMessage(payChannel === "alipay_qr" ? "请使用支付宝扫码完成支付" : "请使用微信扫码完成支付");
-    } catch (e) {
-      if (!payOpenRef.current || reqId != payReqIdRef.current) return;
+    } catch (error) {
+      if (!payOpenRef.current || reqId !== payReqIdRef.current) return;
       setPayStatus("error");
-      setPayMessage(formatApiFetchError(e, "网络错误，请稍后重试"));
+      setPayMessage(formatApiFetchError(error, "网络错误，请稍后重试"));
     }
   };
 
   useEffect(() => {
     if (!orderNo || payStatus !== "pending") return;
+
     let stopped = false;
     const timer = window.setInterval(async () => {
       if (stopped) return;
       try {
-        const res = await fetch(`${API_BASE}/gpu/ocr/pay/order/${orderNo}`, {
-          headers: quotaHeaders(),
+        const response = await fetch(`${API_BASE}/gpu/ocr/pay/order/${orderNo}`, {
+          headers: withTenantHeaders(),
           credentials: "include",
         });
-        if (!res.ok) return;
-        const data = await res.json();
+        if (!response.ok) return;
+
+        const data = await response.json();
         if (!payOpenRef.current) return;
+
         const status = typeof data?.status === "string" ? data.status : "";
         if (status === "paid") {
           stopped = true;
@@ -329,6 +357,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         // ignore polling errors
       }
     }, 2000);
+
     return () => {
       stopped = true;
       window.clearInterval(timer);
@@ -347,6 +376,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
             安装到桌面
           </button>
         )}
+
         <button
           type="button"
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-emerald-600 ring-1 ring-emerald-200 transition hover:bg-emerald-50"
@@ -361,171 +391,159 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         >
           购买次数包
         </button>
+
         <button
           type="button"
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-slate-600 ring-1 ring-slate-200 transition hover:bg-slate-50"
           onClick={onQuotaTap}
         >
-          {(() => {
-            const loggedIn = Boolean(getAccessToken());
-            if (!loggedIn) return <>外部 OCR 剩余：0 次（访客）</>;
-            if (gpuQuota.special) return <>外部 OCR：不限</>;
-            const n = typeof gpuQuota.paid_balance === "number" ? gpuQuota.paid_balance : null;
-            return (
-              <>
-                外部 OCR 剩余：{n !== null ? n : "—"}次
-                {quotaLoadError ? <span className="text-amber-600">（未加载）</span> : null}
-              </>
-            );
-          })()}
+          {!loggedIn ? (
+            <>外部 OCR 剩余：游客模式</>
+          ) : gpuQuota.special ? (
+            <>外部 OCR：不限</>
+          ) : (
+            <>
+              外部 OCR 剩余：{typeof gpuQuota.paid_balance === "number" ? gpuQuota.paid_balance : "..."} 次
+              {quotaLoadError ? <span className="text-amber-600">（未加载）</span> : null}
+            </>
+          )}
         </button>
+
         {installMessage && <span className="ml-1 text-[11px] text-slate-400">{installMessage}</span>}
       </div>
 
-      {installHintOpen && (
-        <div className={modalBackdropClass}>
-          <div className={modalPanelClass}>
-            <p className="text-sm font-semibold text-slate-800">添加到主屏幕</p>
-            <p className="mt-1 text-xs text-slate-500">{installHintText || "请在浏览器菜单中选择“添加到主屏幕/安装应用”。"}</p>
-            <div className="mt-3 flex justify-end">
-              <button
-                className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={() => setInstallHintOpen(false)}
-              >
-                知道了
-              </button>
-            </div>
-          </div>
+      <ModalShell open={installHintOpen} onClose={() => setInstallHintOpen(false)} panelClassName="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+        <p className="text-sm font-semibold text-slate-800">安装到桌面</p>
+        <p className="mt-1 text-xs text-slate-500">{installHintText || "请在浏览器菜单中选择安装或添加到主屏幕。"}</p>
+        <div className="mt-3 flex justify-end">
+          <button
+            className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+            onClick={() => setInstallHintOpen(false)}
+          >
+            知道了
+          </button>
         </div>
-      )}
+      </ModalShell>
 
-      {redeemOpen && (
-        <div className={modalBackdropClass}>
-          <div className={modalPanelClass}>
-            <p className="text-sm font-semibold text-slate-800">主控补额（隐藏入口）</p>
-            <p className="mt-1 text-xs text-slate-500">
-              打开本窗口时已向服务端配置的<strong>主控邮箱</strong>（<code>CODE_EMAIL_TO</code>）发送随机码；若未收到请查垃圾邮件。
-              填写后点确认即可对当前会话执行补额。
-            </p>
-            <input
-              className="input mt-3 w-full"
-              value={redeemCode}
-              placeholder="邮件中的随机码"
-              onChange={(e) => setRedeemCode(e.target.value)}
-              autoComplete="one-time-code"
-            />
-            {redeemMessage && (
-              <p className={`mt-2 text-xs ${redeemStatus === "success" ? "text-emerald-600" : redeemStatus === "error" ? "text-rose-600" : "text-slate-600"}`}>
-                {redeemMessage}
-              </p>
-            )}
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button className="btn-primary" onClick={submitRedeem} disabled={!redeemCode.trim() || redeemStatus === "loading"}>
-                {redeemStatus === "loading" && redeemCode.trim() ? "提交中…" : "确认"}
-              </button>
-              <button
-                className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={() => {
-                  setRedeemOpen(false);
-                  setRedeemCode("");
-                  setRedeemMessage("");
-                  setRedeemStatus("idle");
-                }}
-              >
-                关闭
-              </button>
-            </div>
-          </div>
+      <ModalShell open={redeemOpen} onClose={() => setRedeemOpen(false)} panelClassName="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+        <p className="text-sm font-semibold text-slate-800">主控补额</p>
+        <p className="mt-1 text-xs text-slate-500">
+          打开这个窗口时，系统会向配置的主控邮箱发送一次验证码。收到后填写即可给当前账号补充外部 OCR 额度。
+        </p>
+        <input
+          className="input mt-3 w-full"
+          value={redeemCode}
+          placeholder="请输入邮件中的验证码"
+          onChange={(e) => setRedeemCode(e.target.value)}
+          autoComplete="one-time-code"
+        />
+        {redeemMessage && (
+          <p
+            className={`mt-2 text-xs ${
+              redeemStatus === "success" ? "text-emerald-600" : redeemStatus === "error" ? "text-rose-600" : "text-slate-600"
+            }`}
+          >
+            {redeemMessage}
+          </p>
+        )}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button className="btn-primary" onClick={submitRedeem} disabled={!redeemCode.trim() || redeemStatus === "loading"}>
+            {redeemStatus === "loading" && redeemCode.trim() ? "提交中..." : "确认"}
+          </button>
+          <button
+            className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+            onClick={() => {
+              setRedeemOpen(false);
+              setRedeemCode("");
+              setRedeemMessage("");
+              setRedeemStatus("idle");
+            }}
+          >
+            关闭
+          </button>
         </div>
-      )}
+      </ModalShell>
 
-      {payOpen && (
-        <div className={modalBackdropClass}>
-          <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包（微信 / 支付宝）</p>
-            <p className="mt-1 text-xs text-slate-500">
-              外部 OCR 按<strong>接口成功调用次数</strong>扣减余额；以下为预付次数包（含税价以支付页为准）。
-            </p>
-            <ul className="mt-2 space-y-1 rounded-xl bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600 ring-1 ring-slate-100">
-              {GPU_OCR_CALL_PACKS.map((p) => (
-                <li key={p.key}>
-                  <span className="font-medium text-slate-700">{p.name}</span>：共 <strong>{p.calls}</strong> 次，总价{" "}
-                  <strong>¥{p.priceCny}</strong>，单次约合 <strong>¥{p.pricePerCallCny.toFixed(4)}</strong>
-                </li>
-              ))}
-            </ul>
-            <p className="mt-2 text-xs text-slate-500">支付完成后会自动到账并刷新上方「余额」。</p>
-            <div className="mt-3 flex gap-2">
-              <button
-                className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
-                  payChannel === "wechat_native"
-                    ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
-                    : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
-                }`}
-                onClick={() => setPayChannel("wechat_native")}
-                disabled={payStatus === "creating" || payStatus === "pending"}
-              >
-                微信
-              </button>
-              <button
-                className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
-                  payChannel === "alipay_qr"
-                    ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
-                    : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
-                }`}
-                onClick={() => setPayChannel("alipay_qr")}
-                disabled={payStatus === "creating" || payStatus === "pending"}
-              >
-                支付宝
-              </button>
-              <span className="self-center text-[11px] text-slate-400">
-                已自动推荐：{recommendedPayChannel === "alipay_qr" ? "支付宝" : "微信"}
-              </span>
-            </div>
-            <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-              {GPU_OCR_CALL_PACKS.map((pack) => (
-                <button
-                  key={pack.key}
-                  className={`rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
-                    selectedPackKey === pack.key
-                      ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
-                      : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
-                  }`}
-                  onClick={() => setSelectedPackKey(pack.key)}
-                  disabled={payStatus === "creating" || payStatus === "pending"}
-                >
-                  <div className="font-semibold">{pack.name}</div>
-                  <div className="mt-0.5 text-[11px] text-slate-500">
-                    {pack.calls}次 · ¥{pack.priceCny}
-                  </div>
-                </button>
-              ))}
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-2">
-              <button
-                className="btn-primary"
-                onClick={createPayOrder}
-                disabled={payStatus === "creating" || payStatus === "pending"}
-              >
-                {payStatus === "creating" ? "创建中..." : payStatus === "pending" ? "等待支付..." : "生成二维码"}
-              </button>
-              <button
-                className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={() => setPayOpen(false)}
-              >
-                关闭
-              </button>
-            </div>
-            {payMessage && <p className="mt-2 text-xs text-slate-600">{payMessage}</p>}
-            {orderQrImage && (
-              <div className="mt-3 flex items-center justify-center">
-                <img src={orderQrImage} alt="支付二维码" className="h-56 w-56 rounded-xl ring-1 ring-slate-200" />
+      <ModalShell open={payOpen} onClose={() => setPayOpen(false)} panelClassName="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+        <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包</p>
+        <p className="mt-1 text-xs text-slate-500">支付完成后会自动到账并刷新上方剩余额度。</p>
+
+        <ul className="mt-2 space-y-1 rounded-xl bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600 ring-1 ring-slate-100">
+          {GPU_OCR_CALL_PACKS.map((pack) => (
+            <li key={pack.key}>
+              <span className="font-medium text-slate-700">{pack.name}</span>：共 <strong>{pack.calls}</strong> 次，总价 <strong>￥{pack.priceCny}</strong>，
+              单次约 <strong>￥{pack.pricePerCallCny.toFixed(4)}</strong>
+            </li>
+          ))}
+        </ul>
+
+        <div className="mt-3 flex gap-2">
+          <button
+            className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
+              payChannel === "wechat_native"
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+            }`}
+            onClick={() => setPayChannel("wechat_native")}
+            disabled={payStatus === "creating" || payStatus === "pending"}
+          >
+            微信
+          </button>
+          <button
+            className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
+              payChannel === "alipay_qr"
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+            }`}
+            onClick={() => setPayChannel("alipay_qr")}
+            disabled={payStatus === "creating" || payStatus === "pending"}
+          >
+            支付宝
+          </button>
+          <span className="self-center text-[11px] text-slate-400">
+            默认推荐：{recommendedPayChannel === "alipay_qr" ? "支付宝" : "微信"}
+          </span>
+        </div>
+
+        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {GPU_OCR_CALL_PACKS.map((pack) => (
+            <button
+              key={pack.key}
+              className={`rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
+                selectedPackKey === pack.key
+                  ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                  : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+              }`}
+              onClick={() => setSelectedPackKey(pack.key)}
+              disabled={payStatus === "creating" || payStatus === "pending"}
+            >
+              <div className="font-semibold">{pack.name}</div>
+              <div className="mt-0.5 text-[11px] text-slate-500">
+                {pack.calls} 次 · ￥{pack.priceCny}
               </div>
-            )}
-          </div>
+            </button>
+          ))}
         </div>
-      )}
+
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <button className="btn-primary" onClick={createPayOrder} disabled={payStatus === "creating" || payStatus === "pending"}>
+            {payStatus === "creating" ? "创建中..." : payStatus === "pending" ? "等待支付..." : "生成二维码"}
+          </button>
+          <button
+            className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+            onClick={() => setPayOpen(false)}
+          >
+            关闭
+          </button>
+        </div>
+
+        {payMessage && <p className="mt-2 text-xs text-slate-600">{payMessage}</p>}
+        {orderQrImage && (
+          <div className="mt-3 flex items-center justify-center">
+            <img src={orderQrImage} alt="支付二维码" className="h-56 w-56 rounded-xl ring-1 ring-slate-200" />
+          </div>
+        )}
+      </ModalShell>
     </>
   );
 }
-

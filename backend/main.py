@@ -1512,7 +1512,8 @@ def _create_and_send_random_code(tenant_id: str, client_id: str, purpose: str) -
             """,
             (tenant_id, client_id, purpose),
         ).fetchone()
-        if row and row.get("created_at"):
+        # sqlite3.Row 无 .get()，只能用下标或 dict(row)
+        if row and row["created_at"] is not None:
             try:
                 created_at = str(row["created_at"]).replace("Z", "+00:00")
                 if " " in created_at and "T" not in created_at:

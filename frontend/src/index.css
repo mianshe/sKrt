@@ -28,6 +28,20 @@ body {
   min-height: 100vh;
 }
 
+/* Backfill older fullscreen modal containers so they stay centered on large desktop viewports. */
+[class*="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4"] {
+  overflow-y: auto;
+  padding-top: 1rem;
+  padding-bottom: 1rem;
+}
+
+[class*="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4"] > :first-child {
+  margin-top: auto;
+  margin-bottom: auto;
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+}
+
 h1,
 h2,
 h3 {

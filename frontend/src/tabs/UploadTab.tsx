@@ -5,7 +5,6 @@ import {
   EXTERNAL_OCR_SIZE_THRESHOLD_BYTES,
   ExternalOcrConfirmRequiredError,
   resumeChunkUploadAfterExternalOcrConfirm,
-  getAccessToken,
   fetchTenantQuotaStatus,
   buildLocalProcessSnapshot,
   CHUNK_UPLOAD_THRESHOLD,
@@ -13,6 +12,8 @@ import {
   fileKeyForUpload,
   type TenantQuotaStatus,
 } from "../hooks/useDocuments";
+import { getAccessToken, useAccessToken } from "../lib/auth";
+import Portal from "../components/Portal";
 import {
   listLocalGuestDocuments,
   putLocalGuestDocument,
@@ -100,6 +101,8 @@ function UploadTab({
   const [guestLocalDocs, setGuestLocalDocs] = useState<LocalGuestDoc[]>([]);
   const [userBackups, setUserBackups] = useState<LocalUserBackupRecord[]>([]);
   const [quota, setQuota] = useState<TenantQuotaStatus | null>(null);
+  const accessToken = useAccessToken();
+  const loggedIn = Boolean(accessToken);
 
   const localIdMapRef = useRef<Map<string, string>>(new Map());
   const filesBackupRef = useRef<File[]>([]);
@@ -115,12 +118,12 @@ function UploadTab({
   }, [authSession, refreshLocalLists]);
 
   useEffect(() => {
-    if (!getAccessToken()) {
+    if (!loggedIn) {
       setQuota(null);
       return;
     }
     void fetchTenantQuotaStatus().then(setQuota);
-  }, [authSession]);
+  }, [authSession, loggedIn]);
 
   useEffect(() => {
     setPreUploadLargePdfApproved(false);
@@ -422,32 +425,30 @@ function UploadTab({
         </div>
 
         {externalOcrModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-            <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-              <p className="text-sm font-semibold text-slate-800">
-                此为扫描件或超大 PDF，因处理器受限，超过 10MB 的需要调用外部 OCR，是否继续？
-              </p>
-              <p className="mt-1 text-xs text-slate-500">
-                继续将按扫描页数扣减外部 OCR 次数余额（特殊用户可能不限）。套餐参考：{pricingText}
-              </p>
-              <div className="mt-3 flex gap-2">
-                <button
-                  className="btn-primary"
-                  onClick={() => void handleExternalOcrModalContinue()}
-                  disabled={uploading}
-                >
-                  继续
-                </button>
-                <button
-                  className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                  onClick={handleExternalOcrModalCancel}
-                  disabled={uploading}
-                >
-                  取消
-                </button>
+          <Portal>
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+              <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+                <p className="text-sm font-semibold text-slate-800">
+                  此为扫描件或超大 PDF，因处理器受限，超过 10MB 的需要调用外部 OCR，是否继续？
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  继续将按扫描页数扣减外部 OCR 次数余额（特殊用户可能不限）。套餐参考：{pricingText}
+                </p>
+                <div className="mt-3 flex gap-2">
+                  <button className="btn-primary" onClick={() => void handleExternalOcrModalContinue()} disabled={uploading}>
+                    继续
+                  </button>
+                  <button
+                    className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+                    onClick={handleExternalOcrModalCancel}
+                    disabled={uploading}
+                  >
+                    取消
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
+          </Portal>
         )}
 
         {(uploading || uploadProgress > 0 || parseProgress > 0) && (
@@ -528,7 +529,7 @@ function UploadTab({
 
       <div className="card p-4">
         <h3 className="mb-2 text-sm font-semibold text-slate-700">本机副本（仅当前浏览器）</h3>
-        {getAccessToken() ? (
+        {loggedIn ? (
           <div className="space-y-2">
             {userBackups.map((b) => (
               <div

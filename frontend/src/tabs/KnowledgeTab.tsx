@@ -7,8 +7,8 @@ import {
   suggestedDocSummaryFilename,
   suggestedGlobalSummaryFilename,
 } from "../lib/exportSummaryDocx";
+import { API_BASE } from "../config/apiBase";
 
-const API_BASE = (globalThis as any).__API_BASE__ || "http://localhost:8000";
 const TENANT_KEY = "xm_tenant_id";
 
 type DocSummary = {

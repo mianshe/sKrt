@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import type { LocalProcessSnapshot } from "../lib/localUserBackup";
+import { API_BASE } from "../config/apiBase";
+import { getAccessToken, setAccessToken, useAccessToken } from "../lib/auth";
 
-const API_BASE = (globalThis as any).__API_BASE__ || "http://localhost:8000";
 const TENANT_KEY = "xm_tenant_id";
 const CLIENT_KEY = "xm_client_id";
-const ACCESS_TOKEN_KEY = "xm_access_token";
 
 function tenantId(): string {
   try {
@@ -14,22 +14,7 @@ function tenantId(): string {
   }
 }
 
-export function getAccessToken(): string {
-  try {
-    return localStorage.getItem(ACCESS_TOKEN_KEY)?.trim() || "";
-  } catch {
-    return "";
-  }
-}
-
-export function setAccessToken(token: string | null): void {
-  try {
-    if (token) localStorage.setItem(ACCESS_TOKEN_KEY, token);
-    else localStorage.removeItem(ACCESS_TOKEN_KEY);
-  } catch {
-    /* ignore */
-  }
-}
+export { getAccessToken, setAccessToken, useAccessToken };
 
 export function withTenantHeaders(base?: Record<string, string>): Record<string, string> {
   let clientId = "";

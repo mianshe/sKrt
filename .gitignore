@@ -31,3 +31,14 @@ Thumbs.db
 .git_backup_*/
 data/uploads/
 *.zip
+
+# Android / TWA local environment
+twa-skrt/android-sdk/
+twa-skrt/jdk17/
+twa-skrt/*.tmp
+twa-skrt/skrt-twa/.gradle/
+twa-skrt/skrt-twa/**/build/
+twa-skrt/skrt-twa/*.apk
+twa-skrt/skrt-twa/*.aab
+twa-skrt/skrt-twa/*.idsig
+twa-skrt/skrt-twa/*.jks

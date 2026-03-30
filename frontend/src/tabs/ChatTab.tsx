@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import ChatMessage, { ChatItem } from "../components/ChatMessage";
 import { ExamChunkUploadResult } from "../hooks/useDocuments";
+import { API_BASE } from "../config/apiBase";
 
-const API_BASE = (globalThis as any).__API_BASE__ || "http://localhost:8000";
 const CHAT_STORAGE_KEY = "xm_chat_state_v1";
 const CHAT_SESSION_KEY = "xm_chat_session_id_v1";
 const TENANT_KEY = "xm_tenant_id";
