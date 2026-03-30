@@ -44,6 +44,19 @@ class EasyPayProvider(PaymentProvider):
         raw = "&".join(items) + self.key
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+    def _normalize_response(self, parsed: Any, raw_text: str) -> Dict[str, Any]:
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            text = parsed.strip()
+            return {"code": -1, "msg": "invalid_json", "raw": text[:1000], "parsed_type": "string"}
+        return {
+            "code": -1,
+            "msg": "invalid_json",
+            "raw": (raw_text or "").strip()[:1000],
+            "parsed_type": type(parsed).__name__,
+        }
+
     def _post_form(self, endpoint: str, form: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.api_base}/{endpoint.lstrip('/')}"
         body = urlencode({k: str(v) for k, v in form.items() if v is not None}).encode("utf-8")
@@ -53,14 +66,14 @@ class EasyPayProvider(PaymentProvider):
         with urlopen(req, timeout=15) as resp:  # nosec B310
             raw = resp.read().decode("utf-8", errors="ignore")
         try:
-            return json.loads(raw or "{}")
+            return self._normalize_response(json.loads(raw or "{}"), raw)
         except Exception:
             text = (raw or "").strip()
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end > start:
                 try:
-                    return json.loads(text[start : end + 1])
+                    return self._normalize_response(json.loads(text[start : end + 1]), text)
                 except Exception:
                     pass
             logger.warning("easypay returned non-json response: %s", text[:300])
@@ -105,6 +118,9 @@ class EasyPayProvider(PaymentProvider):
             return_url,
         )
         rsp = self._post_form("submit.php", form)
+        if not isinstance(rsp, dict):
+            logger.warning("easypay create order normalized non-dict response order_no=%s type=%s", order_no, type(rsp).__name__)
+            rsp = {"code": -1, "msg": "invalid_json", "raw": str(rsp)[:1000]}
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or "")
         code_url = str(rsp.get("code_url") or rsp.get("qrcode") or rsp.get("payurl") or "")
         status_ok = str(rsp.get("code") or "") == "1" or str(rsp.get("msg") or "").lower() in {"success", "ok"}
