@@ -1,12 +1,32 @@
-import { DragEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DocumentItem,
   UploadTaskItem,
   EXTERNAL_OCR_SIZE_THRESHOLD_BYTES,
   ExternalOcrConfirmRequiredError,
   resumeChunkUploadAfterExternalOcrConfirm,
+  getAccessToken,
+  fetchTenantQuotaStatus,
+  buildLocalProcessSnapshot,
+  CHUNK_UPLOAD_THRESHOLD,
+  downloadCloudDocumentOriginal,
+  fileKeyForUpload,
+  type TenantQuotaStatus,
 } from "../hooks/useDocuments";
-import { GPU_OCR_PAGE_PACKS } from "../config/gpuOcrPricing";
+import {
+  listLocalGuestDocuments,
+  putLocalGuestDocument,
+  deleteLocalGuestDocument,
+  type LocalGuestDoc,
+} from "../lib/localGuestDocuments";
+import {
+  deleteLocalUserBackup,
+  listLocalUserBackups,
+  putLocalUserBackup,
+  localDraftProcessJson,
+  type LocalUserBackupRecord,
+} from "../lib/localUserBackup";
+import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 
 type Props = {
   documents: DocumentItem[];
@@ -22,9 +42,47 @@ type Props = {
   onGetTask: (taskId: number) => Promise<UploadTaskItem>;
   onDelete: (id: number) => Promise<void>;
   onRefresh: () => Promise<void>;
+  authLocalEnabled?: boolean;
+  authSession?: number;
 };
 
-function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, onDelete, onRefresh }: Props) {
+async function mergeCloudIntoLocalBackups(
+  tasks: UploadTaskItem[],
+  files: File[],
+  localIdByKey: Map<string, string>
+): Promise<void> {
+  const token = getAccessToken();
+  if (!token) return;
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i];
+    const file = files[i];
+    if (!file) continue;
+    const k = fileKeyForUpload(file);
+    const localId = localIdByKey.get(k);
+    if (!localId) continue;
+    const snapshot = await buildLocalProcessSnapshot(task.task_id);
+    await putLocalUserBackup({
+      id: localId,
+      taskId: task.task_id,
+      filename: file.name,
+      createdAt: new Date().toISOString(),
+      originalBlob: file,
+      processJson: JSON.stringify(snapshot),
+    });
+  }
+}
+
+function UploadTab({
+  documents,
+  loading,
+  error,
+  onCreateUploadTasks,
+  onGetTask,
+  onDelete,
+  onRefresh,
+  authLocalEnabled = false,
+  authSession = 0,
+}: Props) {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [parseProgress, setParseProgress] = useState(0);
@@ -32,28 +90,45 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
   const [slowHint, setSlowHint] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [localInfo, setLocalInfo] = useState("");
   const [dragging, setDragging] = useState(false);
   const [preUploadLargePdfApproved, setPreUploadLargePdfApproved] = useState(false);
   const [externalOcrModalOpen, setExternalOcrModalOpen] = useState(false);
   const [externalOcrModalMode, setExternalOcrModalMode] = useState<"pre_upload" | "after_chunk" | null>(null);
   const [pendingChunkOcr, setPendingChunkOcr] = useState<ExternalOcrConfirmRequiredError | null>(null);
+  const [uploadToCloud, setUploadToCloud] = useState(false);
+  const [guestLocalDocs, setGuestLocalDocs] = useState<LocalGuestDoc[]>([]);
+  const [userBackups, setUserBackups] = useState<LocalUserBackupRecord[]>([]);
+  const [quota, setQuota] = useState<TenantQuotaStatus | null>(null);
 
-  const hasLargePdf = useMemo(
-    () =>
-      selectedFiles.some(
-        (f) => f.name.toLowerCase().endsWith(".pdf") && f.size > EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
-      ),
-    [selectedFiles]
-  );
+  const localIdMapRef = useRef<Map<string, string>>(new Map());
+  const filesBackupRef = useRef<File[]>([]);
+
+  const refreshLocalLists = useCallback(async () => {
+    const [g, u] = await Promise.all([listLocalGuestDocuments(), listLocalUserBackups()]);
+    setGuestLocalDocs(g);
+    setUserBackups(u);
+  }, []);
+
+  useEffect(() => {
+    void refreshLocalLists();
+  }, [authSession, refreshLocalLists]);
+
+  useEffect(() => {
+    if (!getAccessToken()) {
+      setQuota(null);
+      return;
+    }
+    void fetchTenantQuotaStatus().then(setQuota);
+  }, [authSession]);
 
   useEffect(() => {
     setPreUploadLargePdfApproved(false);
-  }, [selectedFiles]);
+  }, [selectedFiles, uploadToCloud]);
 
   const pricingText = useMemo(() => {
-    return GPU_OCR_PAGE_PACKS.map(
-      (p) =>
-        `${p.name}：${p.pages}次，¥${p.priceCny}（约 ¥${p.pricePerPageCny.toFixed(4)}/次）`
+    return GPU_OCR_CALL_PACKS.map(
+      (p) => `${p.name}（${p.calls} 次，¥${p.priceCny}，约 ¥${p.pricePerCallCny.toFixed(4)}/次）`
     ).join("；");
   }, []);
 
@@ -69,15 +144,15 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
 
         const phase = latest.find((item) => item.status !== "completed")?.phase || "completed";
         if (phase === "parsing") {
-          setPhaseText("正在解析文档...");
+          setPhaseText("正在解析文档…");
         } else if (phase === "indexing") {
-          setPhaseText("正在建立索引...");
+          setPhaseText("正在建立索引…");
         } else if (phase === "completed") {
           setPhaseText("上传与解析已完成");
         } else if (phase === "failed") {
           setPhaseText("任务失败");
         } else {
-          setPhaseText("任务排队中...");
+          setPhaseText("任务排队中…");
         }
 
         const hasFailed = latest.some((item) => item.status === "failed");
@@ -92,11 +167,69 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
     [onGetTask]
   );
 
+  const getOrCreateLocalId = useCallback((f: File): string => {
+    const k = fileKeyForUpload(f);
+    let id = localIdMapRef.current.get(k);
+    if (!id) {
+      id = crypto.randomUUID();
+      localIdMapRef.current.set(k, id);
+    }
+    return id;
+  }, []);
+
+  const saveOneFileLocally = useCallback(
+    async (file: File): Promise<void> => {
+      const id = getOrCreateLocalId(file);
+      const token = getAccessToken();
+      if (token) {
+        await putLocalUserBackup({
+          id,
+          taskId: 0,
+          filename: file.name,
+          createdAt: new Date().toISOString(),
+          originalBlob: file,
+          processJson: localDraftProcessJson(),
+        });
+      } else {
+        await putLocalGuestDocument({
+          id,
+          filename: file.name,
+          size: file.size,
+          createdAt: new Date().toISOString(),
+          blob: file,
+        });
+      }
+    },
+    [getOrCreateLocalId]
+  );
+
   const handleUpload = async () => {
     if (!selectedFiles.length) return;
     setLocalError("");
+    setLocalInfo("");
 
-    if (hasLargePdf && !preUploadLargePdfApproved) {
+    const failedLocalFiles: File[] = [];
+    for (const file of selectedFiles) {
+      try {
+        await saveOneFileLocally(file);
+      } catch {
+        failedLocalFiles.push(file);
+      }
+    }
+
+    const filesToUpload = uploadToCloud ? selectedFiles : failedLocalFiles;
+
+    if (filesToUpload.length === 0) {
+      setLocalInfo("已保存到本机（浏览器），未上传云端。");
+      await refreshLocalLists();
+      setSelectedFiles([]);
+      return;
+    }
+
+    const hasLargeInQueue = filesToUpload.some(
+      (f) => f.name.toLowerCase().endsWith(".pdf") && f.size > EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
+    );
+    if (hasLargeInQueue && !preUploadLargePdfApproved) {
       setExternalOcrModalMode("pre_upload");
       setExternalOcrModalOpen(true);
       return;
@@ -105,11 +238,13 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
     setUploading(true);
     setUploadProgress(0);
     setParseProgress(0);
-    setPhaseText("正在上传文件...");
+    setPhaseText("正在上传文件…");
     setSlowHint(false);
+    filesBackupRef.current = filesToUpload.slice();
+
     try {
-      const externalOcrConfirmed = !hasLargePdf || preUploadLargePdfApproved;
-      const tasks = await onCreateUploadTasks(selectedFiles, "all", "academic", setUploadProgress, {
+      const externalOcrConfirmed = !hasLargeInQueue || preUploadLargePdfApproved;
+      const tasks = await onCreateUploadTasks(filesToUpload, "all", "academic", setUploadProgress, {
         use_gpu_ocr: false,
         external_ocr_confirmed: externalOcrConfirmed,
       });
@@ -117,12 +252,15 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
         throw new Error("未创建上传任务");
       }
       setUploadProgress(100);
-      setPhaseText("上传完成，正在解析文档...");
+      setPhaseText("上传完成，正在解析文档…");
       const taskIds = tasks.map((t) => t.task_id);
       await pollTaskIds(taskIds);
+      await mergeCloudIntoLocalBackups(tasks, filesToUpload, localIdMapRef.current);
       await onRefresh();
+      await refreshLocalLists();
       setSelectedFiles([]);
       setPreUploadLargePdfApproved(false);
+      setLocalInfo(uploadToCloud ? "云端解析已完成，本机备份已更新。" : "本机保存失败部分已上传云端并完成解析。");
     } catch (e) {
       if (e instanceof ExternalOcrConfirmRequiredError) {
         setPendingChunkOcr(e);
@@ -151,7 +289,7 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
       setExternalOcrModalMode(null);
       setUploading(true);
       setUploadProgress(90);
-      setPhaseText("正在完成上传并解析文档...");
+      setPhaseText("正在完成上传并解析文档…");
       try {
         const task = await resumeChunkUploadAfterExternalOcrConfirm(
           p.uploadId,
@@ -161,9 +299,15 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
         );
         setUploadProgress(100);
         await pollTaskIds([task.task_id]);
+        const file = filesBackupRef.current.find((f) => fileKeyForUpload(f) === p.fileKey);
+        if (file) {
+          await mergeCloudIntoLocalBackups([task], [file], localIdMapRef.current);
+        }
         await onRefresh();
+        await refreshLocalLists();
         setSelectedFiles([]);
         setPreUploadLargePdfApproved(false);
+        setLocalInfo("云端解析已完成，本机备份已更新。");
       } catch (err) {
         setLocalError(err instanceof Error ? err.message : "上传失败");
       } finally {
@@ -180,7 +324,7 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
 
   const mergeFiles = (incoming: File[]) => {
     const map = new Map<string, File>();
-    [...selectedFiles, ...incoming].forEach((f) => map.set(`${f.name}-${f.size}-${f.lastModified}`, f));
+    [...selectedFiles, ...incoming].forEach((f) => map.set(fileKeyForUpload(f), f));
     setSelectedFiles(Array.from(map.values()));
   };
 
@@ -204,9 +348,40 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
     setDragging(false);
   };
 
+  const totalMb = selectedFiles.reduce((sum, f) => sum + f.size, 0) / (1024 * 1024);
+  const hasChunkSized = selectedFiles.some((f) => f.size >= CHUNK_UPLOAD_THRESHOLD);
+
   return (
     <section className="space-y-3">
       <div className="card p-4">
+        <p className="mb-2 text-xs text-slate-600">
+          默认先写入本机（IndexedDB）。勾选「上传云端」后所选文件会参与服务端解析与知识库检索；未勾选时，仅在本机保存失败时自动上传对应文件。
+        </p>
+        {authLocalEnabled && (
+          <p className="mb-2 text-xs text-violet-700">
+            登录后可使用「用户本机备份」库；未登录时使用游客本机存储，数据仅存于当前浏览器。
+          </p>
+        )}
+        <label className="mb-3 flex cursor-pointer items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={uploadToCloud}
+            onChange={(e) => setUploadToCloud(e.target.checked)}
+          />
+          <span>
+            <span className="font-semibold text-slate-800">上传云端</span>
+            <span className="block text-xs text-slate-500">勾选后全部所选文件上传并解析；不勾选则仅本机失败时自动上传。</span>
+          </span>
+        </label>
+        {quota && (
+          <p className="mb-2 text-xs text-slate-500">
+            配额：文档 {quota.doc_count}/{quota.max_documents} · 存储{" "}
+            {(quota.used_storage_bytes / (1024 * 1024)).toFixed(1)}/
+            {(quota.max_storage_bytes / (1024 * 1024)).toFixed(0)} MB
+          </p>
+        )}
+
         <div
           className={`relative rounded-3xl border-2 border-dashed p-7 text-center sm:p-12 ${
             dragging
@@ -224,18 +399,24 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
             accept=".pdf,.docx,.pptx,.txt,.md,.markdown,.png,.jpg,.jpeg,.bmp,.tiff,.webp"
             onChange={(e) => mergeFiles(Array.from(e.target.files || []))}
           />
-          <p className="mt-3 text-sm font-semibold text-violet-600">拖拽到这里，开始你的专属资料解析</p>
-          <p className="mt-1 text-xs text-slate-400">支持 PDF · DOCX · PPTX · TXT · MD · PNG · JPG 等格式</p>
-          {selectedFiles.length > 0 && (
-            <p className="mt-1 text-xs text-slate-500">
-              已选择 {selectedFiles.length} 个文件（总大小{" "}
-              {(selectedFiles.reduce((sum, f) => sum + f.size, 0) / (1024 * 1024)).toFixed(2)} MB）
+          <p className="mt-3 text-sm font-semibold text-violet-600">拖拽到此处，开始上传与解析</p>
+          <p className="mt-1 text-xs text-slate-400">支持 PDF、DOCX、PPTX、TXT、MD、图片等格式</p>
+          {hasChunkSized && (
+            <p className="mt-1 text-xs text-amber-700">
+              单个文件 ≥ {(CHUNK_UPLOAD_THRESHOLD / (1024 * 1024)).toFixed(0)} MB 时将使用分片上传，大文件请耐心等待。
             </p>
           )}
-          {slowHint && <p className="mt-1 text-xs text-slate-500">长文本解析会有点久哦，可以先去做别的事</p>}
-          {hasLargePdf && (
+          {selectedFiles.length > 0 && (
             <p className="mt-1 text-xs text-slate-500">
-              已选择超过 10MB 的 PDF，若为扫描件将提示是否调用外部 OCR（消耗额度）。套餐参考：{pricingText}
+              已选择 {selectedFiles.length} 个文件（合计约 {totalMb.toFixed(2)} MB）
+            </p>
+          )}
+          {slowHint && <p className="mt-1 text-xs text-slate-500">长文档解析可能较久，可先处理其他任务。</p>}
+          {selectedFiles.some(
+            (f) => f.name.toLowerCase().endsWith(".pdf") && f.size > EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
+          ) && (
+            <p className="mt-1 text-xs text-slate-500">
+              已选择超过 10MB 的 PDF；若为扫描件将提示是否调用外部 OCR（消耗额度）。套餐参考：{pricingText}
             </p>
           )}
         </div>
@@ -244,10 +425,10 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
             <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
               <p className="text-sm font-semibold text-slate-800">
-                此为扫描件，因处理器受限，超过10MB的需要调用外部OCR，是否继续
+                此为扫描件或超大 PDF，因处理器受限，超过 10MB 的需要调用外部 OCR，是否继续？
               </p>
               <p className="mt-1 text-xs text-slate-500">
-                继续将按页计为外部 OCR API 调用次数并扣减额度（特殊用户不受限）。{pricingText}
+                继续将按扫描页数扣减外部 OCR 次数余额（特殊用户可能不限）。套餐参考：{pricingText}
               </p>
               <div className="mt-3 flex gap-2">
                 <button
@@ -293,42 +474,109 @@ function UploadTab({ documents, loading, error, onCreateUploadTasks, onGetTask, 
           </div>
         )}
 
-        <div className="mt-3 flex gap-2">
+        <div className="mt-3 flex flex-wrap gap-2">
           <button className="btn-primary" disabled={loading || uploading || !selectedFiles.length} onClick={() => void handleUpload()}>
-            {uploading ? "处理中..." : "开始上传"}
+            {uploading ? "处理中…" : "开始处理"}
           </button>
           <button
             className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-violet-600 ring-1 ring-violet-200 transition hover:bg-violet-50"
             onClick={onRefresh}
           >
-            刷新
+            刷新列表
           </button>
         </div>
         {error && <p className="mt-2 text-xs text-rose-600">{error}</p>}
         {localError && <p className="mt-2 text-xs text-rose-600">{localError}</p>}
+        {localInfo && <p className="mt-2 text-xs text-emerald-700">{localInfo}</p>}
       </div>
 
       <div className="card p-4">
-        <h3 className="mb-2 text-sm font-semibold text-violet-600">✦ 文档管理</h3>
+        <h3 className="mb-2 text-sm font-semibold text-violet-600">云端文档</h3>
         <div className="space-y-2">
           {documents.map((doc) => (
             <div
               key={doc.id}
-              className="flex items-center justify-between rounded-2xl bg-gradient-to-r from-white to-violet-50/70 px-3 py-2 ring-1 ring-violet-100"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-gradient-to-r from-white to-violet-50/70 px-3 py-2 ring-1 ring-violet-100"
             >
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-medium">{doc.filename || doc.title}</p>
                 <p className="text-xs text-slate-500">
                   {doc.discipline} · {doc.document_type}
                 </p>
               </div>
-              <button className="btn-danger" onClick={() => onDelete(doc.id)}>
-                删除
-              </button>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  className="rounded-2xl bg-white/90 px-2 py-1.5 text-xs font-medium text-violet-700 ring-1 ring-violet-200 hover:bg-violet-50"
+                  onClick={() =>
+                    void downloadCloudDocumentOriginal(doc.id, doc.filename || doc.title || `doc-${doc.id}`).catch(
+                      (e) => setLocalError(e instanceof Error ? e.message : "下载失败")
+                    )
+                  }
+                >
+                  下载原件
+                </button>
+                <button className="btn-danger text-xs" onClick={() => onDelete(doc.id)}>
+                  删除
+                </button>
+              </div>
             </div>
           ))}
-          {documents.length === 0 && <p className="text-xs text-slate-500">暂无文档</p>}
+          {documents.length === 0 && <p className="text-xs text-slate-500">暂无云端文档。</p>}
         </div>
+      </div>
+
+      <div className="card p-4">
+        <h3 className="mb-2 text-sm font-semibold text-slate-700">本机副本（仅当前浏览器）</h3>
+        {getAccessToken() ? (
+          <div className="space-y-2">
+            {userBackups.map((b) => (
+              <div
+                key={b.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{b.filename}</p>
+                  <p className="text-xs text-slate-500">
+                    {b.taskId === 0 ? "仅本机草稿" : `任务 #${b.taskId}`} · {new Date(b.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="text-xs text-rose-600 hover:underline"
+                  onClick={() => void deleteLocalUserBackup(b.id).then(() => refreshLocalLists())}
+                >
+                  删除本机
+                </button>
+              </div>
+            ))}
+            {userBackups.length === 0 && <p className="text-xs text-slate-500">暂无用户本机备份。</p>}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {guestLocalDocs.map((g) => (
+              <div
+                key={g.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-slate-50 px-3 py-2 ring-1 ring-slate-200"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{g.filename}</p>
+                  <p className="text-xs text-slate-500">
+                    游客仅本机 · {(g.size / 1024).toFixed(1)} KB · {new Date(g.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="text-xs text-rose-600 hover:underline"
+                  onClick={() => void deleteLocalGuestDocument(g.id).then(() => refreshLocalLists())}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+            {guestLocalDocs.length === 0 && <p className="text-xs text-slate-500">暂无游客本机文件。</p>}
+          </div>
+        )}
       </div>
     </section>
   );

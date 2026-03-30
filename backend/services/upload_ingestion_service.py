@@ -23,6 +23,7 @@ from backend.services.pipeline import postgres_store
 from backend.services.supabase_storage import SupabaseStorageConfig, download_to_file, parse_supabase_uri
 from backend.services.r2_storage import R2StorageConfig, download_to_file as r2_download_to_file, parse_r2_uri
 from backend.services.upload_load_control import log_ingestion_event
+from backend.services import gpu_ocr_billing
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -161,6 +162,8 @@ class UploadIngestionService:
                 ("file_size_bytes", "ALTER TABLE upload_tasks ADD COLUMN file_size_bytes INTEGER NOT NULL DEFAULT 0"),
                 ("page_count", "ALTER TABLE upload_tasks ADD COLUMN page_count INTEGER NOT NULL DEFAULT 0"),
                 ("use_gpu_ocr", "ALTER TABLE upload_tasks ADD COLUMN use_gpu_ocr INTEGER NOT NULL DEFAULT 0"),
+                ("ocr_billing_client_id", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_client_id TEXT"),
+                ("ocr_billing_exempt", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_exempt INTEGER NOT NULL DEFAULT 0"),
                 ("extract_started_at", "ALTER TABLE upload_tasks ADD COLUMN extract_started_at TEXT"),
                 ("extract_finished_at", "ALTER TABLE upload_tasks ADD COLUMN extract_finished_at TEXT"),
                 ("index_started_at", "ALTER TABLE upload_tasks ADD COLUMN index_started_at TEXT"),
@@ -260,6 +263,8 @@ class UploadIngestionService:
         tenant_id: str,
         *,
         storage_basename: Optional[str] = None,
+        ocr_billing_client_id: Optional[str] = None,
+        ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
         """filename: 展示用原始文件名；storage_basename: 磁盘上的唯一文件名（默认同 filename，易同名覆盖）。"""
         disk_name = storage_basename if storage_basename is not None else filename
@@ -276,10 +281,20 @@ class UploadIngestionService:
             task_id = insert_returning_id(
                 conn,
                 """
-                INSERT INTO upload_tasks (tenant_id, filename, file_path, discipline, document_type, status, phase, file_size_bytes)
-                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?)
+                INSERT INTO upload_tasks (tenant_id, filename, file_path, discipline, document_type, status, phase, file_size_bytes,
+                    ocr_billing_client_id, ocr_billing_exempt)
+                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?)
                 """,
-                (tenant_id, filename, file_path, discipline, document_type, file_size_bytes),
+                (
+                    tenant_id,
+                    filename,
+                    file_path,
+                    discipline,
+                    document_type,
+                    file_size_bytes,
+                    ocr_billing_client_id,
+                    1 if ocr_billing_exempt else 0,
+                ),
             )
             conn.commit()
             return self.get_task(task_id, tenant_id=tenant_id)
@@ -294,6 +309,8 @@ class UploadIngestionService:
         tenant_id: str,
         *,
         storage_basename: str,
+        ocr_billing_client_id: Optional[str] = None,
+        ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
         """预签名直传：先占位 0 字节本地文件再建任务，客户端 PUT 完成后更新为 r2://。"""
         disk_name = storage_basename
@@ -306,6 +323,8 @@ class UploadIngestionService:
             document_type=document_type,
             tenant_id=tenant_id,
             storage_basename=storage_basename,
+            ocr_billing_client_id=ocr_billing_client_id,
+            ocr_billing_exempt=ocr_billing_exempt,
         )
 
     def get_task(self, task_id: int, tenant_id: str) -> Dict[str, Any]:
@@ -315,7 +334,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_billing_client_id, ocr_billing_exempt,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -336,7 +355,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_billing_client_id, ocr_billing_exempt,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -754,6 +773,19 @@ class UploadIngestionService:
                 self.parser.parse, local_fp, task["document_type"], ocr_engine_override=ocr_override
             )
             parsed = await asyncio.get_running_loop().run_in_executor(None, parse_fn)
+
+            try:
+                bill = int(parsed.metadata.get("ocr_billable_api_calls") or 0)
+            except (TypeError, ValueError):
+                bill = 0
+            use_gpu_flag = bool(int(task.get("use_gpu_ocr") or 0))
+            exempt = bool(int(task.get("ocr_billing_exempt") or 0))
+            bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
+            if use_gpu_flag and not exempt and bill > 0:
+                bal = gpu_ocr_billing.get_paid_calls_balance(str(tenant_id), bill_cid)
+                if bal < bill:
+                    raise RuntimeError(f"外部 OCR 次数不足（解析需扣 {bill} 次，当前余额 {bal}）")
+                gpu_ocr_billing.add_paid_calls(str(tenant_id), bill_cid, -bill, "consume_ocr_actual_api_calls")
 
             self._update_task_page_count_from_parsed(task_id, parsed)
 

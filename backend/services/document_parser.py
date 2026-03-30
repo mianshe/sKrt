@@ -80,6 +80,8 @@ class DocumentParser:
         self._baidu_token_deadline: float = 0.0
         # OCR 逐页缓存（由 upload_ingestion_service 注入 task_id；读写走 knowledge_store）
         self._ocr_cache_task_id: int = 0
+        # 与供应商计费对齐：百度/HTTP OCR 成功 API 调用次数（入库后扣减余额）
+        self._ocr_billable_api_calls: int = 0
 
     def set_ocr_cache(self, task_id: int) -> None:
         """注入 OCR 页级缓存任务 ID，由 UploadIngestionService 调用。"""
@@ -136,6 +138,7 @@ class DocumentParser:
             pass
 
     def parse(self, file_path: str, document_type: str, *, ocr_engine_override: Optional[str] = None) -> ParsedDocument:
+        self._ocr_billable_api_calls = 0
         ext = os.path.splitext(file_path)[1].lower()
         pdf_page_count: Optional[int] = None
         if ext == ".pdf":
@@ -157,6 +160,7 @@ class DocumentParser:
         if pdf_page_count is not None and pdf_page_count > 0:
             metadata["pdf_page_count"] = int(pdf_page_count)
         if ext == ".pdf":
+            metadata["ocr_billable_api_calls"] = int(max(0, self._ocr_billable_api_calls))
             metadata["toc"] = self._extract_pdf_toc(file_path)
 
         # 自动检测文档形态、图片、编码质量
@@ -260,26 +264,37 @@ class DocumentParser:
             elif engine == "tesseract":
                 txt, err = self._ocr_pdf_pages_tesseract(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
             elif engine == "remote":
-                txt, err = self._ocr_pdf_pages_http_api(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                txt, err, ncalls = self._ocr_pdf_pages_http_api(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                if txt:
+                    self._ocr_billable_api_calls = ncalls
+                    return txt, ""
+                engine_errors.append(f"{engine}:{err or 'empty'}")
+                continue
             else:
-                txt, err = self._ocr_pdf_pages_baidu(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                txt, err, ncalls = self._ocr_pdf_pages_baidu(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                if txt:
+                    self._ocr_billable_api_calls = ncalls
+                    return txt, ""
+                engine_errors.append(f"{engine}:{err or 'empty'}")
+                continue
             if txt:
                 return txt, ""
             engine_errors.append(f"{engine}:{err or 'empty'}")
 
         return "", "; ".join(engine_errors)
 
-    def _ocr_pdf_pages_http_api(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
+    def _ocr_pdf_pages_http_api(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str, int]:
         """
         外部 HTTP OCR（例如远端 PaddleOCR 服务）。优先读 OCR_API_*，仍兼容 GPU_OCR_*。
           - OCR_API_BASE：根 URL，无尾斜杠（旧：GPU_OCR_ENDPOINT）
           - OCR_API_KEY：可选，请求头 X-API-Key（旧：GPU_OCR_API_KEY）
           - OCR_API_TIMEOUT_SEC（旧：GPU_OCR_TIMEOUT_SEC）
         POST {OCR_API_BASE}/ocr/pdf，multipart file，JSON { ok, text, error? }。
+        返回 (text, error, successful_http_calls)。
         """
         endpoint = (os.getenv("OCR_API_BASE", "") or os.getenv("GPU_OCR_ENDPOINT", "") or "").strip().rstrip("/")
         if not endpoint:
-            return "", "ocr-api-base-not-configured"
+            return "", "ocr-api-base-not-configured", 0
         api_key = (os.getenv("OCR_API_KEY", "") or os.getenv("GPU_OCR_API_KEY", "") or "").strip()
         timeout_raw = (os.getenv("OCR_API_TIMEOUT_SEC", "") or os.getenv("GPU_OCR_TIMEOUT_SEC", "") or "900").strip() or "900"
         timeout_sec = self._safe_int(timeout_raw, 900, min_value=30, max_value=7200)
@@ -295,13 +310,13 @@ class DocumentParser:
             resp.raise_for_status()
             payload = resp.json()
             if isinstance(payload, dict) and payload.get("ok") and str(payload.get("text") or "").strip():
-                return str(payload.get("text") or ""), ""
+                return str(payload.get("text") or ""), "", 1
             err = ""
             if isinstance(payload, dict):
                 err = str(payload.get("error") or payload.get("detail") or "")
-            return "", err or "ocr-api-empty"
+            return "", err or "ocr-api-empty", 0
         except Exception as exc:
-            return "", f"ocr-api-failed:{exc}"
+            return "", f"ocr-api-failed:{exc}", 0
 
     def _pdf_page_count(self, file_path: str) -> int:
         try:
@@ -613,12 +628,13 @@ class DocumentParser:
             return "", "image-too-large-after-base64"
         return b64, ""
 
-    def _ocr_pdf_pages_baidu(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
+    def _ocr_pdf_pages_baidu(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str, int]:
+        """返回 (text, error, successful_baidu_api_calls)。"""
         if not self._baidu_ocr_configured():
-            return "", "not-configured"
+            return "", "not-configured", 0
         token, terr = self._baidu_refresh_token()
         if not token:
-            return "", terr or "no-token"
+            return "", terr or "no-token", 0
         product = (os.getenv("BAIDU_OCR_PRODUCT", "accurate_basic").strip().lower() or "accurate_basic")
         if product not in {"accurate_basic", "general_basic"}:
             product = "accurate_basic"
@@ -627,6 +643,7 @@ class DocumentParser:
         delay_ms = self._safe_int(os.getenv("PDF_OCR_BAIDU_PAGE_DELAY_MS", "0"), 0, min_value=0, max_value=5000)
         ocr_pages: List[str] = []
         page_idx = 0
+        api_ok_count = 0
         try:
             for img in self._iter_pdf_page_images(file_path, dpi, max_pages):
                 page_idx += 1
@@ -635,7 +652,7 @@ class DocumentParser:
                 try:
                     b64, enc_err = self._image_to_baidu_jpeg_base64(img)
                     if not b64:
-                        return "", enc_err or "encode-failed"
+                        return "", enc_err or "encode-failed", api_ok_count
                     with httpx.Client(timeout=timeout) as client:
                         r = client.post(
                             ocr_url,
@@ -649,25 +666,26 @@ class DocumentParser:
                     except Exception:
                         pass
                 if r.status_code != 200:
-                    return "", f"http-{r.status_code}"
+                    return "", f"http-{r.status_code}", api_ok_count
                 try:
                     payload = r.json()
                 except Exception:
-                    return "", "bad-json"
+                    return "", "bad-json", api_ok_count
                 err_code = payload.get("error_code")
                 if err_code not in (None, 0):
-                    return "", f"api-{err_code}:{payload.get('error_msg', '')}"[:200]
+                    return "", f"api-{err_code}:{payload.get('error_msg', '')}"[:200], api_ok_count
+                api_ok_count += 1
                 words = payload.get("words_result") or []
                 lines = [str(item.get("words", "")).strip() for item in words if isinstance(item, dict)]
                 block = "\n".join(lines)
                 if block:
                     ocr_pages.append(block)
         except Exception as exc:
-            return "", f"ocr-failed:{exc}"
+            return "", f"ocr-failed:{exc}", api_ok_count
         merged = self._normalize_pdf_text("\n".join(ocr_pages))
         if not merged:
-            return "", "empty-text"
-        return merged, ""
+            return "", "empty-text", api_ok_count
+        return merged, "", api_ok_count
 
     def _get_paddle_runtime(self) -> Optional[Any]:
         if self._paddle_ocr is not None:

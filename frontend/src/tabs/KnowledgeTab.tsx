@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
 import { SummaryPayload } from "../components/SummaryCards";
+import {
+  downloadDocxBlob,
+  exportDocSummaryToDocxBlob,
+  exportGlobalSummaryToDocxBlob,
+  suggestedDocSummaryFilename,
+  suggestedGlobalSummaryFilename,
+} from "../lib/exportSummaryDocx";
 
 const API_BASE = (globalThis as any).__API_BASE__ || "http://localhost:8000";
 const TENANT_KEY = "xm_tenant_id";
@@ -234,8 +241,24 @@ function KnowledgeTab({}: Props) {
       </div>
 
       <div className="card p-4">
-        <div className="mb-2 flex items-center justify-between">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold text-violet-600">✦ 重点提炼</h3>
+          {!summaryLoading && summary && (
+            <button
+              type="button"
+              className="rounded-lg border border-violet-200 bg-white px-2 py-1 text-[11px] font-medium text-violet-700 shadow-sm hover:bg-violet-50"
+              onClick={async () => {
+                try {
+                  const blob = await exportGlobalSummaryToDocxBlob(summary);
+                  downloadDocxBlob(blob, suggestedGlobalSummaryFilename());
+                } catch (e) {
+                  console.error(e);
+                }
+              }}
+            >
+              下载 Word
+            </button>
+          )}
         </div>
 
         {summaryLoading && <p className="text-xs text-slate-500">全局重点提炼中...</p>}
@@ -330,22 +353,41 @@ function KnowledgeTab({}: Props) {
             const isExpanded = expandedDoc === ds.document_id;
             return (
               <div key={ds.document_id} className="rounded-2xl bg-gradient-to-r from-white to-violet-50/70 ring-1 ring-violet-100">
-                <button
-                  className="w-full px-3 py-2 text-left"
-                  onClick={() => setExpandedDoc(isExpanded ? null : ds.document_id)}
-                >
-                  <p className="text-sm font-medium text-slate-800 truncate">{s.title || s.filename}</p>
-                  <p className="text-[11px] text-slate-500">
-                    {s.document_type} · {s.discipline} · {s.page_count}页 · {s.chunk_count}块 · {s.section_count}节
-                  </p>
-                  {s.top_keywords.length > 0 && (
-                    <div className="mt-1 flex flex-wrap gap-1">
-                      {s.top_keywords.slice(0, 12).map((kw) => (
-                        <span key={kw} className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">{kw}</span>
-                      ))}
-                    </div>
-                  )}
-                </button>
+                <div className="flex items-start gap-2 px-3 py-2">
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left"
+                    onClick={() => setExpandedDoc(isExpanded ? null : ds.document_id)}
+                  >
+                    <p className="text-sm font-medium text-slate-800 truncate">{s.title || s.filename}</p>
+                    <p className="text-[11px] text-slate-500">
+                      {s.document_type} · {s.discipline} · {s.page_count}页 · {s.chunk_count}块 · {s.section_count}节
+                    </p>
+                    {s.top_keywords.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {s.top_keywords.slice(0, 12).map((kw) => (
+                          <span key={kw} className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">{kw}</span>
+                        ))}
+                      </div>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-lg border border-violet-200 bg-white px-2 py-1 text-[10px] font-medium text-violet-700 shadow-sm hover:bg-violet-50"
+                    title="下载本文摘要为 Word"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      try {
+                        const blob = await exportDocSummaryToDocxBlob(ds.document_id, s);
+                        downloadDocxBlob(blob, suggestedDocSummaryFilename(ds.document_id, s));
+                      } catch (err) {
+                        console.error(err);
+                      }
+                    }}
+                  >
+                    下载 Word
+                  </button>
+                </div>
                 {isExpanded && (
                   <div className="space-y-3 px-3 pb-3">
                     {/* 结论 / 要点 */}

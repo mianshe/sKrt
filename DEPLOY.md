@@ -51,7 +51,7 @@ VITE_API_BASE=http://localhost:8000
    - 15 分钟无请求会自动休眠
    - 首次访问需要 30-60 秒唤醒
 
-2. **文件存储**：
+2. **文件存储**（与知识库、PostgreSQL 对照见同目录 `.env.example` 顶部注释）：
    - Render 提供 1GB 持久化磁盘（已配置在 render.yaml）
    - 挂载路径：`/opt/render/project/src/data`
    - 如需对象存储持久化（推荐论文 PDF）：推荐 Cloudflare R2（后端代写，前端不直传）：

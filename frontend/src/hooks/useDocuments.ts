@@ -1,14 +1,33 @@
 import { useCallback, useEffect, useState } from "react";
+import type { LocalProcessSnapshot } from "../lib/localUserBackup";
 
 const API_BASE = (globalThis as any).__API_BASE__ || "http://localhost:8000";
 const TENANT_KEY = "xm_tenant_id";
 const CLIENT_KEY = "xm_client_id";
+const ACCESS_TOKEN_KEY = "xm_access_token";
 
 function tenantId(): string {
   try {
     return localStorage.getItem(TENANT_KEY)?.trim() || "public";
   } catch {
     return "public";
+  }
+}
+
+export function getAccessToken(): string {
+  try {
+    return localStorage.getItem(ACCESS_TOKEN_KEY)?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setAccessToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(ACCESS_TOKEN_KEY, token);
+    else localStorage.removeItem(ACCESS_TOKEN_KEY);
+  } catch {
+    /* ignore */
   }
 }
 
@@ -23,11 +42,51 @@ export function withTenantHeaders(base?: Record<string, string>): Record<string,
   } catch {
     clientId = "";
   }
-  return { ...(base || {}), "X-Tenant-Id": tenantId(), ...(clientId ? { "X-Client-Id": clientId } : {}) };
+  const headers: Record<string, string> = {
+    ...(base || {}),
+    "X-Tenant-Id": tenantId(),
+    ...(clientId ? { "X-Client-Id": clientId } : {}),
+  };
+  const tok = getAccessToken();
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+  return headers;
+}
+
+export type TenantQuotaStatus = {
+  tenant_id: string;
+  used_storage_bytes: number;
+  max_storage_bytes: number;
+  doc_count: number;
+  max_documents: number;
+  vector_count: number;
+  max_vectors: number;
+};
+
+/** GET /tenant/quota/status；无权限或失败时返回 null */
+export async function fetchTenantQuotaStatus(): Promise<TenantQuotaStatus | null> {
+  try {
+    const res = await fetch(`${API_BASE}/tenant/quota/status`, {
+      headers: withTenantHeaders(),
+      credentials: "include",
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as TenantQuotaStatus;
+    if (typeof data?.used_storage_bytes !== "number" || typeof data?.max_storage_bytes !== "number") {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 /** 与后端 _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES 一致：超过此大小的 PDF 可能触发外部 OCR 确认 */
 export const EXTERNAL_OCR_SIZE_THRESHOLD_BYTES = 10 * 1024 * 1024;
+
+/** 与上传页本机备份 id 映射一致（同一文件多次确认需稳定 key） */
+export function fileKeyForUpload(f: File): string {
+  return `${f.name}-${f.size}-${f.lastModified}`;
+}
 
 /** 分片合并后服务端要求确认外部 OCR（HTTP 409）时抛出，供上传页二次调用 complete */
 export class ExternalOcrConfirmRequiredError extends Error {
@@ -40,7 +99,8 @@ export class ExternalOcrConfirmRequiredError extends Error {
       documentType: string;
       useGpuOcr: boolean;
       onUploadPercent?: (n: number) => void;
-    }
+    },
+    public readonly fileKey: string
   ) {
     super("external_ocr_confirm_required");
   }
@@ -49,7 +109,7 @@ export class ExternalOcrConfirmRequiredError extends Error {
 /** 单块大小（与后端流式读缓冲匹配，不宜过大） */
 const CHUNK_BYTES = 4 * 1024 * 1024;
 /** 大于等于此字节数走分片上传，避免单次 POST 过大导致超时或后端崩溃 */
-const CHUNK_UPLOAD_THRESHOLD = 1024 * 1024;
+export const CHUNK_UPLOAD_THRESHOLD = 1024 * 1024;
 
 const POLL_MS = 2000;
 const POLL_MAX_MS = 45 * 60 * 1000;
@@ -94,6 +154,10 @@ type UploadTaskPayload = {
   discipline?: string;
   document_type?: string;
   page_count?: number;
+  document_id?: number | null;
+  file_size_bytes?: number;
+  created_at?: string;
+  updated_at?: string;
   status?: string;
   phase?: string;
   progress_percent?: number;
@@ -123,6 +187,8 @@ export type UploadTaskItem = {
   discipline: string;
   document_type: string;
   page_count: number;
+  document_id?: number | null;
+  file_size_bytes?: number;
   status: string;
   phase: string;
   progress_percent: number;
@@ -131,17 +197,81 @@ export type UploadTaskItem = {
 };
 
 function normalizeTask(task: UploadTaskPayload): UploadTaskItem {
+  const rawDoc = task.document_id;
+  let document_id: number | null | undefined;
+  if (rawDoc === null || rawDoc === undefined) document_id = rawDoc;
+  else {
+    const n = Number(rawDoc);
+    document_id = Number.isFinite(n) ? n : undefined;
+  }
   return {
     task_id: Number(pickTaskId(task) || 0),
     filename: String(task.filename || ""),
     discipline: String(task.discipline || "all"),
     document_type: String(task.document_type || "academic"),
     page_count: Number(task.page_count || 0),
+    document_id,
+    file_size_bytes: typeof task.file_size_bytes === "number" ? task.file_size_bytes : undefined,
     status: String(task.status || "queued"),
     phase: String(task.phase || task.status || "queued"),
     progress_percent: Number(task.progress_percent || 0),
     error_message: String(task.error_message || ""),
     retries: Number(task.retries || 0),
+  };
+}
+
+async function fetchTaskPayloadForBackup(taskId: number): Promise<Record<string, unknown>> {
+  const resp = await fetch(`${API_BASE}/upload/tasks/${taskId}`, {
+    headers: withTenantHeaders(),
+    credentials: "include",
+  });
+  if (!resp.ok) throw new Error(`任务 ${taskId} 拉取失败`);
+  return (await resp.json()) as Record<string, unknown>;
+}
+
+/** 拉取当前租户文档列表（用于本机备份时附带知识库条目元数据） */
+export async function fetchDocumentsList(): Promise<DocumentItem[]> {
+  const resp = await fetch(`${API_BASE}/documents`, { headers: withTenantHeaders(), credentials: "include" });
+  if (!resp.ok) return [];
+  const data = (await resp.json()) as { documents?: DocumentItem[] };
+  return data.documents || [];
+}
+
+/** 云端任务完成后：组装「过程摘要」JSON（任务进度字段 + 对应文档元数据，不含向量分块全文） */
+
+export async function downloadCloudDocumentOriginal(docId: number, filename: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/documents/${docId}/original`, {
+    headers: withTenantHeaders(),
+    credentials: "include",
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(t || "下载失败");
+  }
+  const blob = await resp.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename.replace(/[\\/]/g, "_");
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+export async function buildLocalProcessSnapshot(taskId: number): Promise<LocalProcessSnapshot> {
+  const task = await fetchTaskPayloadForBackup(taskId);
+  const rawDoc = task.document_id;
+  const docId =
+    typeof rawDoc === "number" && Number.isFinite(rawDoc)
+      ? rawDoc
+      : rawDoc != null && typeof rawDoc === "string" && /^\d+$/.test(rawDoc)
+        ? Number(rawDoc)
+        : null;
+  const docs = await fetchDocumentsList();
+  const document = docId != null ? docs.find((d) => d.id === docId) ?? null : null;
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    task,
+    document: document ? (JSON.parse(JSON.stringify(document)) as Record<string, unknown>) : null,
   };
 }
 
@@ -370,12 +500,17 @@ async function createSingleFileChunkTask(
       /* ignore */
     }
     if (j.code === "external_ocr_confirm_required") {
-      throw new ExternalOcrConfirmRequiredError(j.page_count ?? 0, j.upload_id || upload_id, {
-        discipline,
-        documentType,
-        useGpuOcr,
-        onUploadPercent,
-      });
+      throw new ExternalOcrConfirmRequiredError(
+        j.page_count ?? 0,
+        j.upload_id || upload_id,
+        {
+          discipline,
+          documentType,
+          useGpuOcr,
+          onUploadPercent,
+        },
+        fileKeyForUpload(file)
+      );
     }
   }
   if (!completeResp.ok) {

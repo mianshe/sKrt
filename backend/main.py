@@ -24,8 +24,9 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from backend.runtime_config import RuntimeConfig
 from backend.services.chunker import DocumentChunker
@@ -49,7 +50,10 @@ from backend.services.pipeline import DeepPipelineService
 from backend.services.pipeline import postgres_store as pg_store
 from backend.services.security_context import IdentityContext, JwtValidator, to_identity_context
 from backend.services.email_sender import send_plain_email
+from backend.services.client_ip import normalized_signup_ip
+from backend.services import local_auth_service
 from backend.services import knowledge_store
+from backend.services import gpu_ocr_billing
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
 from backend.services.payments.easypay_provider import EasyPayProvider
@@ -83,6 +87,9 @@ knowledge_store.configure(
     database_url=RUNTIME_CONFIG.postgres.database_url,
 )
 _cleanup_task: Optional[asyncio.Task[Any]] = None
+
+# 每租户默认存储上限（与 TENANT_DEFAULT_MAX_STORAGE_BYTES 未设置时一致）；原件多在 R2，默认 100MB
+_DEFAULT_TENANT_MAX_STORAGE_BYTES = 100 * 1024 * 1024
 
 
 class ChatRequest(BaseModel):
@@ -268,8 +275,48 @@ def _get_request_identity(request: Request) -> RequestIdentity:
     roles: List[str] = []
     permissions: List[str] = []
     auth_source = "header"
+    token = _extract_bearer_token(request)
+
+    if token and local_auth_service.local_jwt_enabled():
+        try:
+            claims = local_auth_service.decode_local_access_token(token)
+            tenant_id = _normalize_tenant_id(str(claims.get("tenant_id") or claims.get("sub") or ""))
+            user_id = _normalize_user_id(str(claims.get("sub") or ""))
+            roles_raw = claims.get("roles", [])
+            perms_raw = claims.get("permissions", [])
+            if isinstance(roles_raw, str):
+                roles = [x.strip() for x in roles_raw.split(",") if x.strip()]
+            else:
+                roles = [str(x).strip() for x in (roles_raw or []) if str(x).strip()]
+            if isinstance(perms_raw, str):
+                permissions = [x.strip() for x in perms_raw.split(",") if x.strip()]
+            else:
+                permissions = [str(x).strip() for x in (perms_raw or []) if str(x).strip()]
+            if not roles:
+                roles = ["tenant_admin"]
+            if not permissions:
+                permissions = ["tenant.*"]
+            auth_source = "local_jwt"
+            if not tenant_id:
+                tenant_id = user_id
+            if not user_id:
+                raise HTTPException(status_code=401, detail="token 缺少 sub")
+            out_l: RequestIdentity = {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "roles": roles,
+                "permissions": permissions,
+                "auth_source": auth_source,
+            }
+            request.state.identity = out_l
+            return out_l
+        except HTTPException:
+            raise
+        except Exception as loc_exc:
+            if not (RUNTIME_CONFIG.auth.enabled and _jwt_validator is not None):
+                raise HTTPException(status_code=401, detail="token 无效或已过期") from loc_exc
+
     if RUNTIME_CONFIG.auth.enabled and _jwt_validator is not None:
-        token = _extract_bearer_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="缺少 Bearer token")
         try:
@@ -323,6 +370,44 @@ def _get_request_identity(request: Request) -> RequestIdentity:
     }
     request.state.identity = out
     return out
+
+
+def _ingest_identity_or_raise(request: Request) -> RequestIdentity:
+    """开启本地邮箱登录且要求登录入库时，未携带有效本地 JWT 则 401。"""
+    identity = _get_request_identity(request)
+    if local_auth_service.ingest_requires_login() and local_auth_service.is_anonymous_local_guest(identity):
+        raise HTTPException(status_code=401, detail="请先登录后再上传或同步服务器知识库")
+    return identity
+
+
+def _billing_tenant_client(request: Request) -> Tuple[str, str]:
+    identity = _get_request_identity(request)
+    if identity.get("auth_source") == "local_jwt":
+        uid = str(identity.get("user_id") or "")
+        tid = str(identity.get("tenant_id") or uid)
+        return tid, uid
+    return str(identity.get("tenant_id", "public")), _client_id_from_request(request)
+
+
+def _ocr_billing_tenant_client(request: Request) -> Tuple[str, str]:
+    identity = _get_request_identity(request)
+    if local_auth_service.local_jwt_enabled():
+        if identity.get("auth_source") != "local_jwt":
+            raise HTTPException(status_code=401, detail="请先登录后使用外部 OCR 与点数功能")
+        uid = str(identity.get("user_id") or "")
+        tid = str(identity.get("tenant_id") or uid)
+        return tid, uid
+    return str(identity.get("tenant_id", "public")), _client_id_from_request(request)
+
+
+def _task_ocr_billing_from_request(request: Request) -> Tuple[Optional[str], bool]:
+    """写入 upload_tasks 的 OCR 计费 client_id（与余额表一致）及是否免扣费（特殊用户）。"""
+    exempt = _is_special_user(request)
+    try:
+        _, cid = _ocr_billing_tenant_client(request)
+    except HTTPException:
+        _, cid = _billing_tenant_client(request)
+    return (cid if cid else None), exempt
 
 
 def _has_role(identity: RequestIdentity, role: str) -> bool:
@@ -552,12 +637,69 @@ def _security_event(
             conn.close()
 
 
+def _tenant_used_storage_bytes(tenant_id: str) -> int:
+    """按租户汇总已用存储：upload_tasks（非 failed）+ 仅同步 POST /upload 写入的 documents.metadata.source_file_size（排除已有 upload_tasks 关联的文档，避免双计）。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(CAST(file_size_bytes AS INTEGER)), 0) AS s
+            FROM upload_tasks
+            WHERE tenant_id = ? AND IFNULL(status, '') != 'failed'
+            """,
+            (tenant_id,),
+        ).fetchone()
+        total = int(row["s"] or 0)
+        try:
+            if knowledge_store.use_postgres():
+                row2 = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(
+                        CASE
+                            WHEN (metadata::json->>'source_file_size') ~ '^[0-9]+$'
+                            THEN (metadata::json->>'source_file_size')::bigint
+                            ELSE 0
+                        END
+                    ), 0) AS s
+                    FROM documents d
+                    WHERE d.tenant_id = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM upload_tasks ut
+                        WHERE ut.document_id = d.id AND ut.tenant_id = d.tenant_id
+                      )
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+            else:
+                row2 = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(CAST(json_extract(d.metadata, '$.source_file_size') AS INTEGER)), 0) AS s
+                    FROM documents d
+                    WHERE d.tenant_id = ?
+                      AND json_extract(d.metadata, '$.source_file_size') IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM upload_tasks ut
+                        WHERE ut.document_id = d.id AND ut.tenant_id = d.tenant_id
+                      )
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+            total += int(row2["s"] or 0)
+        except Exception:
+            logger.exception("tenant legacy document storage sum failed tenant=%s", tenant_id)
+    finally:
+        conn.close()
+    return total
+
+
 def _tenant_quota_snapshot(identity: RequestIdentity) -> Dict[str, Any]:
     tenant_id = str(identity.get("tenant_id", "public"))
     quotas = {
         "max_documents": int(os.getenv("TENANT_DEFAULT_MAX_DOCUMENTS", "1000") or 1000),
         "max_vectors": int(os.getenv("TENANT_DEFAULT_MAX_VECTORS", "1000000") or 1000000),
-        "max_storage_bytes": int(os.getenv("TENANT_DEFAULT_MAX_STORAGE_BYTES", str(5 * 1024 * 1024 * 1024)) or 5 * 1024 * 1024 * 1024),
+        "max_storage_bytes": int(
+            os.getenv("TENANT_DEFAULT_MAX_STORAGE_BYTES", str(_DEFAULT_TENANT_MAX_STORAGE_BYTES)) or _DEFAULT_TENANT_MAX_STORAGE_BYTES
+        ),
     }
     if RUNTIME_CONFIG.postgres.enabled:
         conn = None
@@ -584,22 +726,27 @@ def _tenant_quota_snapshot(identity: RequestIdentity) -> Dict[str, Any]:
         )
     finally:
         conn_sql.close()
-    usage = _capacity_snapshot()
+    used_storage = _tenant_used_storage_bytes(tenant_id)
     return {
         **quotas,
         "doc_count": docs,
         "vector_count": vecs,
-        "used_storage_bytes": int(usage["used_bytes"]),
+        "used_storage_bytes": used_storage,
         "tenant_id": tenant_id,
     }
 
 
-def _enforce_tenant_quota(identity: RequestIdentity) -> None:
+def _enforce_tenant_quota(identity: RequestIdentity, additional_bytes: int = 0) -> None:
     quota = _tenant_quota_snapshot(identity)
     if quota["doc_count"] >= quota["max_documents"]:
         raise HTTPException(status_code=429, detail="租户文档配额已满，请联系管理员扩容。")
     if quota["vector_count"] >= quota["max_vectors"]:
         raise HTTPException(status_code=429, detail="租户向量配额已满，请联系管理员扩容。")
+    cap = int(quota.get("max_storage_bytes") or 0)
+    used = int(quota.get("used_storage_bytes") or 0)
+    add = max(0, int(additional_bytes))
+    if cap > 0 and used + add > cap:
+        raise HTTPException(status_code=429, detail="租户存储配额已满，请删除部分文档或联系管理员扩容。")
 
 
 def _init_db() -> None:
@@ -1091,6 +1238,36 @@ def _init_runtime_tables() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runpod_jobs_task ON runpod_jobs(task_id, created_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_registration_codes (
+                email TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                expires_at_unix REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signup_ip_free_ocr_grants (
+                client_ip TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (client_ip, email)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signup_ip_grants_ip ON signup_ip_free_ocr_grants(client_ip)")
         conn.commit()
     finally:
         conn.close()
@@ -1215,22 +1392,42 @@ def _gpu_monthly_limit() -> int:
     return max(0, min(v, 100000))
 
 
-def _gpu_daily_page_limit() -> int:
-    # 默认：普通用户每日 100 页
+def _gpu_daily_call_limit() -> int:
+    """外部 OCR 每日额度（按「次数」计，与余额扣减单位一致）。兼容旧名 GPU_OCR_DAILY_PAGE_LIMIT。"""
     try:
-        v = int((os.getenv("GPU_OCR_DAILY_PAGE_LIMIT") or "100").strip() or "100")
+        v = int(
+            (os.getenv("GPU_OCR_DAILY_CALL_LIMIT") or os.getenv("GPU_OCR_DAILY_PAGE_LIMIT") or "100").strip() or "100"
+        )
     except ValueError:
         v = 100
     return max(0, min(v, 100000))
 
 
-def _gpu_monthly_global_page_limit() -> int:
-    # 默认：全站每月 3000 页（北京时间月）
+def _gpu_monthly_global_call_limit() -> int:
+    """全站每月外部 OCR 次数上限（北京时间月）。兼容 GPU_OCR_MONTHLY_GLOBAL_PAGE_LIMIT。"""
     try:
-        v = int((os.getenv("GPU_OCR_MONTHLY_GLOBAL_PAGE_LIMIT") or "3000").strip() or "3000")
+        v = int(
+            (
+                os.getenv("GPU_OCR_MONTHLY_GLOBAL_CALL_LIMIT")
+                or os.getenv("GPU_OCR_MONTHLY_GLOBAL_PAGE_LIMIT")
+                or "3000"
+            ).strip()
+            or "3000"
+        )
     except ValueError:
         v = 3000
     return max(0, min(v, 10**9))
+
+
+def _gpu_ocr_initial_free_calls() -> int:
+    """新用户（尚无余额行）首次触达时赠送的外部 OCR 次数，默认 100。兼容 GPU_OCR_INITIAL_FREE_PAGES。"""
+    try:
+        v = int(
+            (os.getenv("GPU_OCR_INITIAL_FREE_CALLS") or os.getenv("GPU_OCR_INITIAL_FREE_PAGES") or "100").strip() or "100"
+        )
+    except ValueError:
+        v = 100
+    return max(0, min(v, 1_000_000))
 
 
 def _gpu_scan_text_char_threshold() -> int:
@@ -1249,10 +1446,11 @@ def _pay_provider_name() -> str:
     return (os.getenv("PAY_PROVIDER") or "easypay").strip().lower()
 
 
-PAY_PAGE_PACKS: Dict[str, Dict[str, Any]] = {
-    "A": {"pages": 500, "amount_cny": 9.9},
-    "B": {"pages": 2000, "amount_cny": 29.9},
-    "C": {"pages": 5000, "amount_cny": 59.9},
+# 键为次数（与 gpu_ocr_paid_pages_balance 扣减单位一致；DB 列名仍沿用 pages 历史字段）
+PAY_OCR_CALL_PACKS: Dict[str, Dict[str, Any]] = {
+    "A": {"calls": 500, "amount_cny": 9.9},
+    "B": {"calls": 2000, "amount_cny": 29.9},
+    "C": {"calls": 5000, "amount_cny": 59.9},
 }
 
 
@@ -1391,13 +1589,13 @@ def _get_payment_provider() -> EasyPayProvider:
 
 
 def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: str) -> Dict[str, Any]:
-    pack = PAY_PAGE_PACKS.get(pack_key)
+    pack = PAY_OCR_CALL_PACKS.get(pack_key)
     if not pack:
-        raise HTTPException(status_code=400, detail="无效页包")
+        raise HTTPException(status_code=400, detail="无效次数包")
     if channel not in {"wechat_native", "alipay_qr"}:
         raise HTTPException(status_code=400, detail="无效支付渠道")
     order_no = _new_order_no()
-    pages = int(pack["pages"])
+    calls = int(pack["calls"])
     amount_cny = float(pack["amount_cny"])
     conn = _conn()
     try:
@@ -1406,10 +1604,10 @@ def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: st
             INSERT INTO pay_orders(order_no, tenant_id, client_id, pack_key, pages, amount_cny, status, provider, channel)
             VALUES(?,?,?,?,?,?, 'pending', ?, ?)
             """,
-            (order_no, tenant_id, client_id, pack_key, pages, amount_cny, _pay_provider_name(), channel),
+            (order_no, tenant_id, client_id, pack_key, calls, amount_cny, _pay_provider_name(), channel),
         )
         conn.commit()
-        return {"order_no": order_no, "pages": pages, "amount_cny": amount_cny, "channel": channel}
+        return {"order_no": order_no, "calls": calls, "pages": calls, "amount_cny": amount_cny, "channel": channel}
     finally:
         conn.close()
 
@@ -1566,65 +1764,50 @@ def _verify_redeem_code(raw_code: str) -> bool:
     return False
 
 
-def _get_gpu_paid_pages_balance(tenant_id: str, client_id: str) -> int:
+def _get_gpu_paid_calls_balance(tenant_id: str, client_id: str) -> int:
+    return gpu_ocr_billing.get_paid_calls_balance(tenant_id, client_id)
+
+
+def _ensure_gpu_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
+    grant = _gpu_ocr_initial_free_calls()
+    if grant <= 0:
+        return
     conn = _conn()
     try:
         row = conn.execute(
-            "SELECT pages_balance FROM gpu_ocr_paid_pages_balance WHERE tenant_id=? AND client_id=?",
+            "SELECT 1 FROM gpu_ocr_paid_pages_balance WHERE tenant_id=? AND client_id=?",
             (tenant_id, client_id),
         ).fetchone()
-        return int(row["pages_balance"]) if row else 0
-    finally:
-        conn.close()
-
-
-def _add_gpu_paid_pages(tenant_id: str, client_id: str, delta_pages: int, reason: str) -> int:
-    delta = int(delta_pages or 0)
-    if delta == 0:
-        return _get_gpu_paid_pages_balance(tenant_id, client_id)
-    conn = _conn()
-    try:
+        if row is not None:
+            return
         conn.execute(
-            """
-            INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance)
-            VALUES(?, ?, ?)
-            ON CONFLICT(tenant_id, client_id) DO UPDATE
-            SET pages_balance = pages_balance + excluded.pages_balance, updated_at=CURRENT_TIMESTAMP
-            """,
-            (tenant_id, client_id, delta),
+            "INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance) VALUES(?,?,?)",
+            (tenant_id, client_id, grant),
         )
         conn.execute(
             "INSERT INTO gpu_ocr_paid_pages_ledger(tenant_id, client_id, delta_pages, reason) VALUES(?,?,?,?)",
-            (tenant_id, client_id, delta, str(reason or "")),
+            (tenant_id, client_id, grant, "initial_free_grant"),
         )
-        row = conn.execute(
-            "SELECT pages_balance FROM gpu_ocr_paid_pages_balance WHERE tenant_id=? AND client_id=?",
-            (tenant_id, client_id),
-        ).fetchone()
         conn.commit()
-        return int(row["pages_balance"]) if row else 0
     finally:
         conn.close()
 
 
-def _consume_gpu_pages_with_paid_balance_or_raise(request: Request, tenant_id: str, page_count: int) -> None:
+def _add_gpu_paid_calls(tenant_id: str, client_id: str, delta_calls: int, reason: str) -> int:
+    return gpu_ocr_billing.add_paid_calls(tenant_id, client_id, delta_calls, reason)
+
+
+def _ensure_gpu_calls_balance_covers_or_raise(request: Request, page_count: int) -> None:
+    """上传阶段仅校验余额是否够覆盖预估 PDF 页数；实际扣减在解析完成后按成功 API 次数结算。"""
     if _is_special_user(request):
         return
-    pages = max(1, int(page_count or 0))
-    client_id = _client_id_from_request(request)
-
-    paid = _get_gpu_paid_pages_balance(tenant_id, client_id)
-    if paid > 0:
-        use_paid = min(pages, paid)
-        # 扣付费/赠送余额并写流水
-        _add_gpu_paid_pages(tenant_id, client_id, -use_paid, reason="consume_gpu_ocr_pages")
-        pages -= use_paid
-    if pages <= 0:
-        return
-
-    # 剩余走免费额度（每日 / 全站月）
-    _consume_gpu_page_quota_or_raise(request, tenant_id, pages)
-    _consume_global_gpu_monthly_pages_or_raise(request, pages)
+    call_units = max(1, int(page_count or 0))
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
+    if not local_auth_service.local_jwt_enabled():
+        _ensure_gpu_ocr_initial_balance(tenant_id, client_id)
+    paid = _get_gpu_paid_calls_balance(tenant_id, client_id)
+    if paid < call_units:
+        raise HTTPException(status_code=429, detail="外部 OCR 次数不足，请购买次数包")
 
 
 def _pdf_scan_decision(file_path: Path) -> Dict[str, Any]:
@@ -1687,7 +1870,6 @@ def _external_ocr_scan_quota_result(
     use_gpu_ocr_req: bool,
     external_ocr_confirmed: bool,
     request: Request,
-    tenant_id: str,
     upload_id: Optional[str] = None,
 ) -> Tuple[bool, Optional[JSONResponse]]:
     """
@@ -1714,7 +1896,7 @@ def _external_ocr_scan_quota_result(
             payload["upload_id"] = upload_id
         return False, JSONResponse(status_code=409, content=payload)
     pages = int(decision.get("page_count") or 1)
-    _consume_gpu_pages_with_paid_balance_or_raise(request, tenant_id, pages)
+    _ensure_gpu_calls_balance_covers_or_raise(request, pages)
     return True, None
 
 
@@ -1749,14 +1931,14 @@ def _consume_global_gpu_monthly_or_raise(request: Request) -> None:
         conn.close()
 
 
-def _consume_gpu_page_quota_or_raise(request: Request, tenant_id: str, page_count: int) -> None:
+def _consume_gpu_page_quota_or_raise(request: Request, page_count: int) -> None:
     if _is_special_user(request):
         return
     pages = max(1, int(page_count or 0))
-    daily_limit = _gpu_daily_page_limit()
+    daily_limit = _gpu_daily_call_limit()
     if daily_limit <= 0:
         raise HTTPException(status_code=403, detail="外部 OCR 未开放")
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     day = _day_key_beijing()
     conn = _conn()
     try:
@@ -1787,7 +1969,7 @@ def _consume_global_gpu_monthly_pages_or_raise(request: Request, page_count: int
     if _is_special_user(request):
         return
     pages = max(1, int(page_count or 0))
-    limit = _gpu_monthly_global_page_limit()
+    limit = _gpu_monthly_global_call_limit()
     if limit <= 0:
         raise HTTPException(status_code=403, detail="外部 OCR 未开放")
     month_key = _month_key_beijing()
@@ -1837,9 +2019,7 @@ async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...))
         ttl = int((os.getenv("SPECIAL_OCR_TTL_SEC") or str(30 * 86400)).strip() or str(30 * 86400))
     except ValueError:
         ttl = 30 * 86400
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _billing_tenant_client(request)
     if not _verify_and_consume_random_code(tenant_id, client_id, "special_unlock", raw_key):
         raise HTTPException(status_code=403, detail="随机码错误或已过期")
     token = _make_special_cookie(secret, tenant_id, ttl_sec=ttl)
@@ -1858,9 +2038,7 @@ async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...))
 
 @app.post("/auth/special-ocr/send-code")
 async def send_special_unlock_code(request: Request) -> Dict[str, Any]:
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _billing_tenant_client(request)
     try:
         return _create_and_send_random_code(tenant_id, client_id, "special_unlock")
     except HTTPException:
@@ -1870,44 +2048,134 @@ async def send_special_unlock_code(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"发送失败: {exc}")
 
 
-@app.get("/gpu/ocr/quota")
-async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
-    month_key = _month_key_beijing()
-    limit = _gpu_monthly_global_page_limit()
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
-    day = _day_key_beijing()
-    daily_limit = _gpu_daily_page_limit()
+@app.post("/auth/register/request-code")
+async def auth_register_request_code(request: Request, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if not local_auth_service.local_jwt_enabled():
+        raise HTTPException(status_code=503, detail="未配置 AUTH_LOCAL_JWT_SECRET，无法使用邮箱注册")
+    email = local_auth_service.normalize_email(str(body.get("email") or ""))
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="邮箱无效")
+    code = f"{secrets.randbelow(900000) + 100000:06d}"
     conn = _conn()
     try:
-        row = conn.execute(
-            "SELECT pages_used FROM gpu_ocr_global_monthly_pages WHERE month_key=?",
-            (month_key,),
-        ).fetchone()
-        used = int(row["pages_used"]) if row else 0
-        row2 = conn.execute(
-            "SELECT pages_used FROM gpu_ocr_daily_pages WHERE tenant_id=? AND client_id=? AND day=?",
-            (tenant_id, client_id, day),
-        ).fetchone()
-        daily_used = int(row2["pages_used"]) if row2 else 0
-        row3 = conn.execute(
-            "SELECT pages_balance FROM gpu_ocr_paid_pages_balance WHERE tenant_id=? AND client_id=?",
-            (tenant_id, client_id),
-        ).fetchone()
-        paid_balance = int(row3["pages_balance"]) if row3 else 0
+        local_auth_service.store_registration_code(conn, email, code)
+        conn.commit()
     finally:
         conn.close()
-    remaining = max(0, int(limit) - int(used))
+    echo = (os.getenv("AUTH_REGISTER_ECHO_CODE", "0") or "0").strip() in {"1", "true", "yes", "on"}
+    try:
+        local_auth_service.send_register_code_email(email, code)
+    except Exception as exc:
+        if echo:
+            return {"ok": True, "expires_in_sec": 600, "dev_code": code, "warning": "SMTP 未配置，仅开发环境返回 dev_code"}
+        logger.exception("register email send failed")
+        raise HTTPException(status_code=502, detail=f"邮件发送失败: {exc}") from exc
+    out: Dict[str, Any] = {"ok": True, "expires_in_sec": 600}
+    if echo:
+        out["dev_code"] = code
+    return out
+
+
+@app.post("/auth/register/complete")
+async def auth_register_complete(request: Request, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if not local_auth_service.local_jwt_enabled():
+        raise HTTPException(status_code=503, detail="未配置 AUTH_LOCAL_JWT_SECRET")
+    email = local_auth_service.normalize_email(str(body.get("email") or ""))
+    password = str(body.get("password") or "")
+    code = str(body.get("code") or "").strip()
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="邮箱无效")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="密码至少 8 位")
+    ip = normalized_signup_ip(request)
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT id FROM app_users WHERE email = ?", (email,)).fetchone()
+        if row:
+            raise HTTPException(status_code=400, detail="该邮箱已注册")
+        if not local_auth_service.verify_registration_code(conn, email, code):
+            raise HTTPException(status_code=400, detail="验证码错误或已过期")
+        free_calls = local_auth_service.decide_signup_free_calls(conn, ip, email)
+        uid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO app_users(id, email, password_hash) VALUES(?,?,?)",
+            (uid, email, local_auth_service.hash_password(password)),
+        )
+        if free_calls > 0:
+            local_auth_service.record_signup_grant(conn, ip, email)
+            conn.execute(
+                "INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance) VALUES(?,?,?)",
+                (uid, uid, free_calls),
+            )
+            conn.execute(
+                "INSERT INTO gpu_ocr_paid_pages_ledger(tenant_id, client_id, delta_pages, reason) VALUES(?,?,?,?)",
+                (uid, uid, free_calls, "signup_free_grant"),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance) VALUES(?,?,?)",
+                (uid, uid, 0),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    token = local_auth_service.issue_local_access_token(user_id=uid, email=email)
     return {
-        "month_key": month_key,
-        "used": int(used),
-        "limit": int(limit),
-        "remaining": int(remaining),
-        "daily_used": int(daily_used),
-        "daily_limit": int(daily_limit),
+        "ok": True,
+        "access_token": token,
+        "token_type": "Bearer",
+        "free_ocr_calls_granted": int(free_calls),
+        "free_ocr_pages_granted": int(free_calls),
+    }
+
+
+@app.post("/auth/login")
+async def auth_login(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if not local_auth_service.local_jwt_enabled():
+        raise HTTPException(status_code=503, detail="未配置 AUTH_LOCAL_JWT_SECRET")
+    email = local_auth_service.normalize_email(str(body.get("email") or ""))
+    password = str(body.get("password") or "")
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT id, password_hash FROM app_users WHERE email = ?", (email,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not local_auth_service.verify_password(password, str(row["password_hash"])):
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
+    uid = str(row["id"])
+    token = local_auth_service.issue_local_access_token(user_id=uid, email=email)
+    return {"ok": True, "access_token": token, "token_type": "Bearer"}
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request) -> Dict[str, Any]:
+    identity = _get_request_identity(request)
+    if identity.get("auth_source") != "local_jwt":
+        raise HTTPException(status_code=401, detail="需要登录")
+    return {
+        "ok": True,
+        "user_id": str(identity.get("user_id") or ""),
+        "tenant_id": str(identity.get("tenant_id") or ""),
+    }
+
+
+@app.get("/gpu/ocr/quota")
+async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
+    special = bool(_is_special_user(request))
+    if not special and not local_auth_service.local_jwt_enabled():
+        _ensure_gpu_ocr_initial_balance(tenant_id, client_id)
+    paid_balance = _get_gpu_paid_calls_balance(tenant_id, client_id)
+    return {
+        "month_key": _month_key_beijing(),
         "paid_balance": int(max(0, paid_balance)),
-        "special": bool(_is_special_user(request)),
+        "paid_calls": int(max(0, paid_balance)),
+        "special": special,
+        "used": 0,
+        "limit": 0,
+        "remaining": 0,
+        "daily_used": 0,
+        "daily_limit": 0,
     }
 
 
@@ -1944,20 +2212,21 @@ async def redeem_gpu_ocr_pages(request: Request, body: Dict[str, Any] = Body(...
     raw_code = str(body.get("code") or "").strip()
     if not raw_code:
         raise HTTPException(status_code=400, detail="缺少随机码")
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     if not _verify_and_consume_random_code(tenant_id, client_id, "gpu_redeem", raw_code):
         raise HTTPException(status_code=403, detail="随机码错误或已过期")
-    new_balance = _add_gpu_paid_pages(tenant_id, client_id, 500, reason="redeem_500_pages")
-    return {"ok": True, "delta_pages": 500, "paid_balance": int(max(0, new_balance))}
+    new_balance = _add_gpu_paid_calls(tenant_id, client_id, 500, reason="redeem_500_calls")
+    return {
+        "ok": True,
+        "delta_calls": 500,
+        "delta_pages": 500,
+        "paid_balance": int(max(0, new_balance)),
+    }
 
 
 @app.post("/gpu/ocr/redeem/send-code")
 async def send_gpu_redeem_code(request: Request) -> Dict[str, Any]:
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     try:
         return _create_and_send_random_code(tenant_id, client_id, "gpu_redeem")
     except HTTPException:
@@ -1973,12 +2242,10 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     notify_url = (os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip()
     if not notify_url:
         raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     created = _create_pay_order(tenant_id, client_id, body.pack_key, body.channel)
     order_no = str(created["order_no"])
-    pages = int(created["pages"])
+    calls = int(created.get("calls") or created.get("pages") or 0)
     amount_cny = float(created["amount_cny"])
     channel = str(created["channel"])
     total_fee = _amount_to_fen(amount_cny)
@@ -1987,7 +2254,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
             order_no=order_no,
             amount_fen=total_fee,
             channel=channel,
-            subject=f"sKrt 页包{body.pack_key} {pages}页",
+            subject=f"sKrt 次数包{body.pack_key} {calls}次",
             notify_url=notify_url,
         )
     except Exception as exc:
@@ -2010,7 +2277,8 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         "order_no": order_no,
         "pack_key": body.pack_key,
         "channel": channel,
-        "pages": pages,
+        "calls": calls,
+        "pages": calls,
         "amount_cny": amount_cny,
         "status": "pending",
         "code_url": code_url,
@@ -2020,9 +2288,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
 
 @app.get("/gpu/ocr/pay/order/{order_no}")
 async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     row = _get_pay_order(order_no)
     if not row:
         raise HTTPException(status_code=404, detail="订单不存在")
@@ -2036,6 +2302,7 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
         "channel": str(order.get("channel") or "wechat_native"),
         "refund_status": str(order.get("refund_status") or "none"),
         "pack_key": str(order.get("pack_key") or ""),
+        "calls": int(order.get("pages") or 0),
         "pages": int(order.get("pages") or 0),
         "amount_cny": float(order.get("amount_cny") or 0),
         "credited_pages": int(order.get("credited_pages") or 0),
@@ -2089,9 +2356,7 @@ async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRe
     row = _get_pay_order(order_no)
     if not row:
         raise HTTPException(status_code=404, detail="订单不存在")
-    identity = _get_request_identity(request)
-    tenant_id = str(identity.get("tenant_id", "public"))
-    client_id = _client_id_from_request(request)
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
     order = dict(row)
     if str(order.get("tenant_id")) != tenant_id or str(order.get("client_id")) != client_id:
         raise HTTPException(status_code=403, detail="订单不属于当前用户")
@@ -2439,7 +2704,16 @@ async def _save_upload_file_stream(upload_file: UploadFile, target_path: Path, r
 
 
 async def _handle_completed_chunked_upload(
-    target_path: Path, filename: str, discipline: str, document_type: str, purpose: str, tenant_id: str, use_gpu_ocr: bool
+    target_path: Path,
+    filename: str,
+    discipline: str,
+    document_type: str,
+    purpose: str,
+    tenant_id: str,
+    use_gpu_ocr: bool,
+    *,
+    ocr_billing_client_id: Optional[str] = None,
+    ocr_billing_exempt: bool = False,
 ) -> Dict[str, Any]:
     if purpose == "docs":
         task = upload_ingestion_service.create_task(
@@ -2448,6 +2722,8 @@ async def _handle_completed_chunked_upload(
             document_type=document_type or _guess_doc_type(filename),
             storage_basename=target_path.name,
             tenant_id=tenant_id,
+            ocr_billing_client_id=ocr_billing_client_id,
+            ocr_billing_exempt=ocr_billing_exempt,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(use_gpu_ocr))
         _spawn_ingestion_worker(int(task.get("id", 0)), tenant_id=tenant_id)
@@ -2512,6 +2788,8 @@ async def health() -> Dict[str, Any]:
         "tenant_header_name": RUNTIME_CONFIG.tenant.header_name,
         "tenant_require_header": RUNTIME_CONFIG.tenant.require_header,
         "auth_jwt_enabled": bool(RUNTIME_CONFIG.auth.enabled),
+        "auth_local_jwt_enabled": bool(local_auth_service.local_jwt_enabled()),
+        "auth_ingest_requires_login": bool(local_auth_service.ingest_requires_login()),
         "auth_membership_check": bool(RUNTIME_CONFIG.auth.require_membership_check),
         "capacity": capacity,
     }
@@ -2560,9 +2838,9 @@ async def security_baseline(request: Request) -> Dict[str, Any]:
 @app.post("/upload/chunks/init")
 async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str, Any]:
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    _enforce_tenant_quota(identity)
+    _enforce_tenant_quota(identity, additional_bytes=int(req.total_size))
     tenant_id = str(identity.get("tenant_id", "public"))
     filename = _safe_filename(req.filename)
     suffix = Path(filename).suffix.lower()
@@ -2595,7 +2873,7 @@ async def put_chunk(upload_id: str, chunk_index: int, request: Request, chunk: U
     meta = _chunk_uploads.get(upload_id)
     if not meta:
         raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     if str(meta.get("tenant_id", "")) != str(identity.get("tenant_id", "public")):
         raise HTTPException(status_code=403, detail="租户不匹配，禁止跨租户上传分片。")
@@ -2617,7 +2895,7 @@ async def complete_chunk_upload(
     if not meta:
         raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     tenant_id = str(identity.get("tenant_id", "public"))
     if str(meta.get("tenant_id", "")) != tenant_id:
@@ -2670,6 +2948,8 @@ async def complete_chunk_upload(
         if actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES:
             use_gpu_ocr = True
 
+    _enforce_tenant_quota(identity, additional_bytes=int(actual_size))
+
     merged_sha256 = _calc_sha256(final_path) if final_path.exists() else ""
 
     use_task_gpu, ocr_resp = _external_ocr_scan_quota_result(
@@ -2679,7 +2959,6 @@ async def complete_chunk_upload(
         use_gpu_ocr_req=use_gpu_ocr,
         external_ocr_confirmed=external_ocr_confirmed,
         request=request,
-        tenant_id=tenant_id,
         upload_id=upload_id,
     )
     if ocr_resp is not None:
@@ -2721,7 +3000,7 @@ async def complete_chunk_upload(
         except Exception:
             logger.exception("upload to r2 failed for chunked upload (fallback to local file_path)")
 
-    client_id = _client_id_from_request(request)
+    _btid, client_id = _billing_tenant_client(request)
     if purpose == "docs":
         conn_th = _conn()
         try:
@@ -2735,6 +3014,7 @@ async def complete_chunk_upload(
         finally:
             conn_th.close()
 
+    ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     result = await _handle_completed_chunked_upload(
         target_path=final_path,
         filename=target_filename,
@@ -2743,6 +3023,8 @@ async def complete_chunk_upload(
         purpose=purpose,
         tenant_id=tenant_id,
         use_gpu_ocr=use_gpu_ocr,
+        ocr_billing_client_id=ocr_cid,
+        ocr_billing_exempt=ocr_ex,
     )
 
     # 若上面已写入 R2，则把 task.file_path 更新为 r2://...（并确保本地文件可删除）
@@ -2792,9 +3074,8 @@ async def upload_documents(
     document_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    _enforce_tenant_quota(identity)
     tenant_id = str(identity.get("tenant_id", "public"))
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
@@ -2811,9 +3092,13 @@ async def upload_documents(
         target = UPLOAD_DIR / storage
         await _save_upload_file_stream(f, target)
 
+        sz = int(target.stat().st_size) if target.exists() else 0
+        _enforce_tenant_quota(identity, additional_bytes=sz)
+
         dtype = document_type or _guess_doc_type(f.filename)
         parsed = parser.parse(str(target), dtype)
         merged_meta = dict(parsed.metadata)
+        merged_meta["source_file_size"] = sz
         merged_meta["discipline"] = discipline if discipline != "auto" else parsed.metadata.get("discipline", "general")
         merged_meta["embedding_model"] = ai_router.get_active_embedding_model_id()
         chunks = chunker.chunk_document(parsed.text, dtype, parsed.metadata.get("title", f.filename))
@@ -2865,9 +3150,8 @@ async def create_upload_tasks(
     external_ocr_confirmed: bool = False,
 ) -> Any:
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    _enforce_tenant_quota(identity)
     tenant_id = str(identity.get("tenant_id", "public"))
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
@@ -2883,7 +3167,7 @@ async def create_upload_tasks(
     if valid_count == 0:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
 
-    client_id = _client_id_from_request(request)
+    _btid, client_id = _billing_tenant_client(request)
     conn_th = _conn()
     try:
         enforce_upload_create_allowed(
@@ -2896,6 +3180,7 @@ async def create_upload_tasks(
     finally:
         conn_th.close()
 
+    ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     tasks: List[Dict[str, Any]] = []
     r2_cfg = R2StorageConfig.from_env()
     r2_prefix = (os.getenv("R2_STORAGE_PREFIX") or "").strip().strip("/")
@@ -2926,7 +3211,6 @@ async def create_upload_tasks(
             use_gpu_ocr_req=try_ocr,
             external_ocr_confirmed=external_ocr_confirmed,
             request=request,
-            tenant_id=tenant_id,
             upload_id=None,
         )
         if ocr_resp is not None:
@@ -2936,6 +3220,8 @@ async def create_upload_tasks(
                 pass
             return ocr_resp
 
+        _enforce_tenant_quota(identity, additional_bytes=int(sz))
+
         dtype = document_type or _guess_doc_type(f.filename)
         task = upload_ingestion_service.create_task(
             filename=f.filename,
@@ -2943,6 +3229,8 @@ async def create_upload_tasks(
             document_type=dtype,
             storage_basename=storage,
             tenant_id=tenant_id,
+            ocr_billing_client_id=ocr_cid,
+            ocr_billing_exempt=ocr_ex,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
         # 优先：R2（S3 兼容）持久化，并把 upload_tasks.file_path 指向 r2://bucket/key
@@ -3014,7 +3302,7 @@ async def create_upload_task_single_file(
 async def upload_tasks_presign_init(request: Request, body: UploadPresignInitRequest) -> Dict[str, Any]:
     """R2 预签名 PUT 直传：先创建占位任务，客户端上传完成后调用 presign-complete。"""
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     _enforce_tenant_quota(identity)
     tenant_id = str(identity.get("tenant_id", "public"))
@@ -3027,7 +3315,7 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     if suffix not in {".pdf", ".docx", ".txt", ".md", ".markdown"}:
         raise HTTPException(status_code=400, detail=f"不支持的文件格式: {filename}")
 
-    client_id = _client_id_from_request(request)
+    _btid, client_id = _billing_tenant_client(request)
     conn_th = _conn()
     try:
         enforce_upload_create_allowed(
@@ -3043,12 +3331,15 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     storage = _unique_upload_basename(filename)
     dtype = body.document_type or _guess_doc_type(filename)
     disc = body.discipline if body.discipline != "auto" else "all"
+    ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     task = upload_ingestion_service.create_task_placeholder(
         filename=filename,
         discipline=disc,
         document_type=dtype,
         tenant_id=tenant_id,
         storage_basename=storage,
+        ocr_billing_client_id=ocr_cid,
+        ocr_billing_exempt=ocr_ex,
     )
     upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), False)
 
@@ -3090,7 +3381,7 @@ async def upload_tasks_presign_complete(
 ) -> Dict[str, Any]:
     """预签名上传完成后校验对象元数据、更新任务并启动解析（或 RQ 入队）。"""
     _ensure_capacity_for_write()
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     tenant_id = str(identity.get("tenant_id", "public"))
     r2_cfg = R2StorageConfig.from_env()
@@ -3122,6 +3413,8 @@ async def upload_tasks_presign_complete(
     sz = int(meta.get("content_length") or 0)
     if sz <= 0:
         raise HTTPException(status_code=400, detail="对象大小为 0，请重新上传")
+
+    _enforce_tenant_quota(identity, additional_bytes=sz)
 
     uri = r2_uri(r2_cfg.bucket, object_key)
     upload_ingestion_service.update_task_file_path(task_id, uri)
@@ -3156,7 +3449,6 @@ async def upload_tasks_presign_complete(
                     use_gpu_ocr_req=True,
                     external_ocr_confirmed=bool(body.external_ocr_confirmed),
                     request=request,
-                    tenant_id=tenant_id,
                     upload_id=None,
                 )
                 if ocr_resp is not None:
@@ -3184,6 +3476,8 @@ async def list_upload_tasks(request: Request, limit: int = 50) -> Dict[str, Any]
     """列出最近上传任务（含 task_id），便于在 /docs 或浏览器中查看 ID 再调 GET /upload/tasks/{{id}}。"""
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.upload.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        return {"tasks": []}
     tenant_id = str(identity.get("tenant_id", "public"))
     rows = upload_ingestion_service.list_tasks(limit=min(max(limit, 1), 200), tenant_id=tenant_id)
     return {"tasks": [_normalize_task(t) for t in rows]}
@@ -3194,6 +3488,8 @@ async def get_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
     try:
         identity = _get_request_identity(request)
         _require_permission(identity, "tenant.upload.read")
+        if local_auth_service.is_anonymous_local_guest(identity):
+            raise HTTPException(status_code=404, detail="上传任务不存在")
         task = upload_ingestion_service.get_task(task_id, tenant_id=str(identity.get("tenant_id", "public")))
     except ValueError:
         raise HTTPException(status_code=404, detail="上传任务不存在")
@@ -3242,6 +3538,8 @@ async def get_upload_queue_metrics_endpoint(request: Request) -> Dict[str, Any]:
 async def list_documents(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.documents.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        return {"documents": []}
     tenant_id = str(identity.get("tenant_id", "public"))
     conn = _conn()
     try:
@@ -3269,10 +3567,90 @@ async def list_documents(request: Request) -> Dict[str, Any]:
         conn.close()
 
 
+
+
+def _unlink_quiet(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@app.get("/documents/{doc_id}/original")
+async def download_document_original(doc_id: int, request: Request) -> Any:
+    identity = _ingest_identity_or_raise(request)
+    _require_permission(identity, "tenant.documents.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        raise HTTPException(status_code=404, detail="文档不存在")
+    tenant_id = str(identity.get("tenant_id", "public"))
+    conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT file_path, filename FROM upload_tasks
+            WHERE tenant_id = ? AND document_id = ? AND IFNULL(status, '') != 'failed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (tenant_id, doc_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="未找到与该文档关联的上传任务原件（可能为旧版同步上传路径，仅云端无副本）",
+        )
+    fp = str(row["file_path"] or "").strip()
+    filename = str(row["filename"] or "document").strip() or "document"
+    if not fp:
+        raise HTTPException(status_code=404, detail="原件路径为空")
+    if fp.startswith("r2://"):
+        r2_cfg = R2StorageConfig.from_env()
+        if not r2_cfg:
+            raise HTTPException(status_code=503, detail="未配置 R2，无法下载远端原件")
+        parsed = parse_r2_uri(fp)
+        if not parsed:
+            raise HTTPException(status_code=500, detail="无效的 r2:// 路径")
+        bucket, key = parsed
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        try:
+            r2_download_to_file(r2_cfg, bucket=bucket, key=key, dest_path=tmp_path)
+        except Exception as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(status_code=502, detail=f"从对象存储下载失败: {exc}") from exc
+        return FileResponse(
+            str(tmp_path),
+            filename=filename,
+            media_type="application/octet-stream",
+            background=BackgroundTask(_unlink_quiet, str(tmp_path)),
+        )
+    if fp.startswith("supabase://"):
+        raise HTTPException(status_code=501, detail="Supabase 原件下载未实现")
+    p = Path(fp)
+    if not p.is_absolute():
+        p = UPLOAD_DIR / p.name
+    try:
+        p = p.resolve()
+        p.relative_to(UPLOAD_DIR.resolve())
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="禁止访问该路径") from None
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="原件文件不存在或已清理")
+    return FileResponse(p, filename=filename, media_type="application/octet-stream")
+
+
 @app.get("/documents/{doc_id}/summary")
 async def get_document_summary(doc_id: int, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.documents.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        raise HTTPException(status_code=404, detail="文档不存在")
     tenant_id = str(identity.get("tenant_id", "public"))
     conn = _conn()
     try:
@@ -3304,7 +3682,7 @@ def _try_remove_upload_file(path_str: str) -> None:
 
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: int, request: Request) -> Dict[str, Any]:
-    identity = _get_request_identity(request)
+    identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.documents.delete")
     tenant_id = str(identity.get("tenant_id", "public"))
     conn = _conn()
@@ -3362,6 +3740,8 @@ async def delete_document(doc_id: int, request: Request) -> Dict[str, Any]:
 async def knowledge_graph(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.knowledge.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        return {"nodes": [], "links": [], "insights": []}
     tenant_id = str(identity.get("tenant_id", "public"))
     docs = _load_documents_with_meta(tenant_id=tenant_id)
     chunks = _load_chunks_by_doc(tenant_id=tenant_id)

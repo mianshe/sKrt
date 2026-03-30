@@ -6,6 +6,7 @@ import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
 import { useDocuments, withTenantHeaders } from "./hooks/useDocuments";
+import AuthPanel from "./components/AuthPanel";
 import { formatApiFetchError } from "./lib/fetchErrors";
 
 export type AppTab = "upload" | "knowledge" | "chat";
@@ -18,6 +19,9 @@ function App() {
     useDocuments();
 
   const [noticeOpen, setNoticeOpen] = useState(false);
+  /** 默认 true：避免 /health 失败时整站不显示登录/注册；拉取成功后再以服务端为准 */
+  const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
+  const [authSession, setAuthSession] = useState(0);
 
   const [capacityWarn, setCapacityWarn] = useState<"soft" | "hard" | null>(null);
   const [tapCount, setTapCount] = useState(0);
@@ -31,6 +35,9 @@ function App() {
         const res = await fetch(`${API_BASE}/health`);
         if (!res.ok) return;
         const data = await res.json();
+        if (typeof data?.auth_local_jwt_enabled === "boolean") {
+          setAuthLocalEnabled(data.auth_local_jwt_enabled);
+        }
         const cap = data?.capacity;
         if (cap?.hard_exceeded) setCapacityWarn("hard");
         else if (cap?.soft_exceeded) setCapacityWarn("soft");
@@ -56,7 +63,7 @@ function App() {
       const next = n + 1;
       if (next >= 6) {
         setUnlockOpen(true);
-        setUnlockMsg("正在发送随机码到邮箱...");
+        setUnlockMsg("正在发送验证码到邮箱…");
         void (async () => {
           try {
             const res = await fetch(`${API_BASE}/auth/special-ocr/send-code`, {
@@ -68,9 +75,9 @@ function App() {
               const t = await res.text();
               throw new Error(t || "发送失败");
             }
-            setUnlockMsg("随机码已发送到邮箱，请输入后确认");
+            setUnlockMsg("验证码已发送至邮箱，请查收并填写下方");
           } catch (e) {
-            setUnlockMsg(formatApiFetchError(e, "随机码发送失败"));
+            setUnlockMsg(formatApiFetchError(e, "发送失败"));
           }
         })();
         return 0;
@@ -111,8 +118,9 @@ function App() {
               何芯求职专用测试项目
             </p>
           </div>
-          <div className="mt-0.5 hidden max-w-[320px] justify-end md:flex">
-            <GpuQuotaWidget />
+          <div className="mt-0.5 hidden max-w-[380px] flex-col items-end gap-2 md:flex">
+            {authLocalEnabled && <AuthPanel onAuthed={() => { void refreshDocuments(); setAuthSession((n) => n + 1); }} />}
+            <GpuQuotaWidget authSession={authSession} />
           </div>
         </div>
       </header>
@@ -121,12 +129,12 @@ function App() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
           <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
             <p className="text-sm font-semibold text-slate-800">特殊用户解锁</p>
-            <p className="mt-1 text-xs text-slate-500">隐藏入口触发后会发送随机码到邮箱，输入后可解锁特殊用户。</p>
+            <p className="mt-1 text-xs text-slate-500">连点副标题触发本窗口后，已向你的注册邮箱自动发送验证码；填写后即可解锁特殊用户（外部 OCR 等）。</p>
             <input
               className="input mt-3 w-full"
               value={unlockKey}
               onChange={(e) => setUnlockKey(e.target.value)}
-              placeholder="请输入邮箱随机码"
+              placeholder="邮件中的验证码"
             />
             {unlockMsg && <p className="mt-2 text-xs text-slate-600">{unlockMsg}</p>}
             <div className="mt-3 flex gap-2">
@@ -175,7 +183,12 @@ function App() {
         }`}
       >
         <div className="mb-2 md:hidden">
-          <GpuQuotaWidget />
+          {authLocalEnabled && (
+            <div className="mb-2">
+              <AuthPanel onAuthed={() => { void refreshDocuments(); setAuthSession((n) => n + 1); }} />
+            </div>
+          )}
+          <GpuQuotaWidget authSession={authSession} />
           <div className="mt-2 flex justify-end">
             <button
               type="button"
@@ -195,6 +208,8 @@ function App() {
             onGetTask={getUploadTask}
             onDelete={deleteDocument}
             onRefresh={refreshDocuments}
+            authLocalEnabled={authLocalEnabled}
+            authSession={authSession}
           />
         </div>
         <div className={tab === "knowledge" ? "block" : "hidden"}>

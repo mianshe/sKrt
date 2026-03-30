@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { GPU_OCR_PAGE_PACKS, GPU_OCR_REDEEM_PAGES } from "../config/gpuOcrPricing";
+import { GPU_OCR_PAGE_PACKS, GPU_OCR_REDEEM_PAGES, GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 import { formatApiFetchError } from "../lib/fetchErrors";
+import { getAccessToken } from "../hooks/useDocuments";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
@@ -9,7 +10,10 @@ type DeferredInstallPrompt = Event & {
   userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
 };
 
-type GpuQuota = { used: number; limit: number; paid_balance?: number };
+type GpuQuota = { used: number; limit: number; paid_balance?: number; special?: boolean };
+
+const modalBackdropClass = "fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4";
+const modalPanelClass = "w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200";
 
 function quotaHeaders() {
   try {
@@ -28,7 +32,9 @@ function quotaHeaders() {
   }
 }
 
-export default function GpuQuotaWidget() {
+type GpuQuotaWidgetProps = { authSession?: number };
+
+export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
   /** 额度接口失败时仍展示安装/购买/兑换，避免整栏空白 */
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
   const [quotaLoadError, setQuotaLoadError] = useState(false);
@@ -54,7 +60,7 @@ export default function GpuQuotaWidget() {
 
   const pricingText = useMemo(() => {
     return GPU_OCR_PAGE_PACKS.map(
-      (p) => `${p.name}：${p.pages}次，¥${p.priceCny}（约 ¥${p.pricePerPageCny.toFixed(4)}/次）`
+      (p) => `${p.name}：${p.calls}次，¥${p.priceCny}（约 ¥${p.pricePerCallCny.toFixed(4)}/次）`
     ).join("；");
   }, []);
   const selectedPack = useMemo(
@@ -86,15 +92,21 @@ export default function GpuQuotaWidget() {
       const used = typeof data?.used === "number" ? data.used : 0;
       const limit = typeof data?.limit === "number" ? data.limit : 20;
       const paid_balance = typeof data?.paid_balance === "number" ? data.paid_balance : undefined;
-      setGpuQuota({ used, limit, paid_balance });
+      const special = data?.special === true;
+      setGpuQuota({ used, limit, paid_balance, special });
     } catch {
       setQuotaLoadError(true);
     }
   };
 
   useEffect(() => {
+    if (!getAccessToken()) {
+      setGpuQuota({ used: 0, limit: 0, paid_balance: 0, special: false });
+      setQuotaLoadError(false);
+      return;
+    }
     void refreshQuota();
-  }, []);
+  }, [authSession]);
 
   useEffect(() => {
     const standalone = window.matchMedia("(display-mode: standalone)").matches;
@@ -151,9 +163,10 @@ export default function GpuQuotaWidget() {
       setTapStartMs(null);
       setTapCount(0);
       setRedeemStatus("idle");
-      setRedeemMessage("");
+      setRedeemMessage("正在发送验证码到邮箱…");
       setRedeemCode("");
       setRedeemOpen(true);
+      void sendRedeemCode();
       return;
     }
     setTapCount(next);
@@ -163,7 +176,7 @@ export default function GpuQuotaWidget() {
     const code = redeemCode.trim();
     if (!code) {
       setRedeemStatus("error");
-      setRedeemMessage("请输入手机随机码");
+      setRedeemMessage("请填写邮件中的验证码");
       return;
     }
     setRedeemStatus("loading");
@@ -177,7 +190,7 @@ export default function GpuQuotaWidget() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const detail = typeof data?.detail === "string" ? data.detail : "随机码错误或已过期";
+        const detail = typeof data?.detail === "string" ? data.detail : "验证码错误或已过期";
         setRedeemStatus("error");
         setRedeemMessage(detail);
         return;
@@ -192,8 +205,8 @@ export default function GpuQuotaWidget() {
   };
 
   const sendRedeemCode = async () => {
+    setRedeemMessage("正在发送验证码到邮箱…");
     setRedeemStatus("loading");
-    setRedeemMessage("");
     try {
       const res = await fetch(`${API_BASE}/gpu/ocr/redeem/send-code`, {
         method: "POST",
@@ -208,10 +221,10 @@ export default function GpuQuotaWidget() {
         return;
       }
       setRedeemStatus("success");
-      setRedeemMessage("随机码已发送到邮箱");
+      setRedeemMessage("验证码已发送至邮箱，请查收并填写下方");
     } catch (e) {
       setRedeemStatus("error");
-      setRedeemMessage(formatApiFetchError(e, "网络错误，请稍后重试"));
+      setRedeemMessage(formatApiFetchError(e, "发送失败"));
     }
   };
 
@@ -261,7 +274,7 @@ export default function GpuQuotaWidget() {
           stopped = true;
           window.clearInterval(timer);
           setPayStatus("paid");
-          setPayMessage(`已到账 ${selectedPack.pages} 次`);
+          setPayMessage(`已到账 ${selectedPack.calls} 次`);
           await refreshQuota();
         } else if (status === "refunded" || status === "failed") {
           stopped = true;
@@ -277,7 +290,7 @@ export default function GpuQuotaWidget() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [orderNo, payStatus, selectedPack.pages]);
+  }, [orderNo, payStatus, selectedPack.calls]);
 
   return (
     <>
@@ -287,7 +300,6 @@ export default function GpuQuotaWidget() {
             type="button"
             className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-indigo-600 ring-1 ring-indigo-200 transition hover:bg-indigo-50"
             onClick={onInstallClick}
-            title="安装到桌面/创建快捷方式"
           >
             安装到桌面
           </button>
@@ -303,7 +315,6 @@ export default function GpuQuotaWidget() {
             setOrderNo("");
             setOrderQrImage("");
           }}
-          title="购买外部 OCR 次数包"
         >
           购买次数包
         </button>
@@ -311,20 +322,26 @@ export default function GpuQuotaWidget() {
           type="button"
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-slate-600 ring-1 ring-slate-200 transition hover:bg-slate-50"
           onClick={onQuotaTap}
-          title="连续点击 6 次可兑换次数"
         >
-          外部 OCR 本月：{gpuQuota.used}/{gpuQuota.limit}
-          {quotaLoadError ? <span className="text-amber-600">（未加载）</span> : null}
+          {(() => {
+            const loggedIn = Boolean(getAccessToken());
+            if (!loggedIn) return <>外部 OCR 剩余：0 次（访客）</>;
+            if (gpuQuota.special) return <>外部 OCR：不限</>;
+            const n = typeof gpuQuota.paid_balance === "number" ? gpuQuota.paid_balance : null;
+            return (
+              <>
+                外部 OCR 剩余：{n !== null ? n : "—"}次
+                {quotaLoadError ? <span className="text-amber-600">（未加载）</span> : null}
+              </>
+            );
+          })()}
         </button>
-        {typeof gpuQuota.paid_balance === "number" && (
-          <span className="ml-1 text-[11px] text-slate-400">余额：{gpuQuota.paid_balance}次</span>
-        )}
         {installMessage && <span className="ml-1 text-[11px] text-slate-400">{installMessage}</span>}
       </div>
 
       {installHintOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-          <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+        <div className={modalBackdropClass}>
+          <div className={modalPanelClass}>
             <p className="text-sm font-semibold text-slate-800">添加到主屏幕</p>
             <p className="mt-1 text-xs text-slate-500">iOS Safari：点击底部“分享”按钮，然后选择“添加到主屏幕”。</p>
             <div className="mt-3 flex justify-end">
@@ -340,37 +357,39 @@ export default function GpuQuotaWidget() {
       )}
 
       {redeemOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-          <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">兑换次数</p>
-            <p className="mt-1 text-xs text-slate-500">点击发送随机码后，去邮箱获取并输入，可领取外部 OCR 次数。</p>
+        <div className={modalBackdropClass}>
+          <div className={modalPanelClass}>
+            <p className="text-sm font-semibold text-slate-800">兑换赠送次数</p>
+            <p className="mt-1 text-xs text-slate-500">
+              打开本窗口时已向你的<strong>注册邮箱</strong>自动发送验证码；若未收到请查垃圾邮件。填写后点确认即可领取{" "}
+              <strong>{GPU_OCR_REDEEM_PAGES} 次</strong>外部 OCR 额度。
+            </p>
             <input
-              className="input mt-3"
+              className="input mt-3 w-full"
               value={redeemCode}
-              placeholder="请输入手机随机码"
+              placeholder="邮件中的验证码"
               onChange={(e) => setRedeemCode(e.target.value)}
               disabled={redeemStatus === "loading"}
+              autoComplete="one-time-code"
             />
-            <p className="mt-2 text-[11px] text-slate-400">{pricingText}</p>
+            <p className="mt-2 text-[11px] text-slate-500">{pricingText}</p>
             {redeemMessage && (
-              <p className={`mt-2 text-xs ${redeemStatus === "success" ? "text-emerald-600" : "text-rose-600"}`}>
+              <p className={`mt-2 text-xs ${redeemStatus === "success" ? "text-emerald-600" : redeemStatus === "error" ? "text-rose-600" : "text-slate-600"}`}>
                 {redeemMessage}
               </p>
             )}
-            <div className="mt-3 flex gap-2">
-              <button
-                className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={sendRedeemCode}
-                disabled={redeemStatus === "loading"}
-              >
-                发送随机码
-              </button>
-              <button className="btn-primary" onClick={submitRedeem} disabled={redeemStatus === "loading"}>
-                {redeemStatus === "loading" ? "提交中..." : "提交"}
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button className="btn-primary" onClick={submitRedeem} disabled={!redeemCode.trim() || redeemStatus === "loading"}>
+                {redeemStatus === "loading" && redeemCode.trim() ? "提交中…" : "确认兑换"}
               </button>
               <button
                 className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                onClick={() => setRedeemOpen(false)}
+                onClick={() => {
+                  setRedeemOpen(false);
+                  setRedeemCode("");
+                  setRedeemMessage("");
+                  setRedeemStatus("idle");
+                }}
                 disabled={redeemStatus === "loading"}
               >
                 关闭
@@ -381,10 +400,21 @@ export default function GpuQuotaWidget() {
       )}
 
       {payOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+        <div className={modalBackdropClass}>
           <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包（微信/支付宝）</p>
-            <p className="mt-1 text-xs text-slate-500">支付完成后会自动到账并刷新余额。</p>
+            <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包（微信 / 支付宝）</p>
+            <p className="mt-1 text-xs text-slate-500">
+              外部 OCR 按<strong>接口成功调用次数</strong>扣减余额；以下为预付次数包（含税价以支付页为准）。
+            </p>
+            <ul className="mt-2 space-y-1 rounded-xl bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600 ring-1 ring-slate-100">
+              {GPU_OCR_CALL_PACKS.map((p) => (
+                <li key={p.key}>
+                  <span className="font-medium text-slate-700">{p.name}</span>：共 <strong>{p.calls}</strong> 次，总价{" "}
+                  <strong>¥{p.priceCny}</strong>，单次约合 <strong>¥{p.pricePerCallCny.toFixed(4)}</strong>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-xs text-slate-500">支付完成后会自动到账并刷新上方「余额」。</p>
             <div className="mt-3 flex gap-2">
               <button
                 className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
@@ -426,7 +456,7 @@ export default function GpuQuotaWidget() {
                 >
                   <div className="font-semibold">{pack.name}</div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
-                    {pack.pages}次 · ¥{pack.priceCny}
+                    {pack.calls}次 · ¥{pack.priceCny}
                   </div>
                 </button>
               ))}
