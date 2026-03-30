@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 from typing import Any, Dict, List
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 
 from .base import PaymentCreateResult, PaymentNotifyResult, PaymentProvider
+
+logger = logging.getLogger(__name__)
 
 
 class EasyPayProvider(PaymentProvider):
@@ -21,18 +24,23 @@ class EasyPayProvider(PaymentProvider):
         if not self.api_base or not self.pid or not self.key:
             raise RuntimeError("未配置 EASYPAY_API_BASE/EASYPAY_PID/EASYPAY_KEY")
 
+    def _masked_pid(self) -> str:
+        if len(self.pid) <= 4:
+            return self.pid
+        return f"{self.pid[:2]}***{self.pid[-2:]}"
+
     def _sign(self, payload: Dict[str, Any]) -> str:
         items: List[str] = []
-        for k in sorted(payload.keys()):
-            if k == "sign":
+        for key in sorted(payload.keys()):
+            if key == "sign":
                 continue
-            v = payload.get(k)
-            if v is None:
+            value = payload.get(key)
+            if value is None:
                 continue
-            sv = str(v).strip()
-            if not sv:
+            text = str(value).strip()
+            if not text:
                 continue
-            items.append(f"{k}={sv}")
+            items.append(f"{key}={text}")
         raw = "&".join(items) + self.key
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -41,17 +49,36 @@ class EasyPayProvider(PaymentProvider):
         body = urlencode({k: str(v) for k, v in form.items() if v is not None}).encode("utf-8")
         req = UrlRequest(url=url, data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("Accept", "application/json,text/plain,*/*")
         with urlopen(req, timeout=15) as resp:  # nosec B310
             raw = resp.read().decode("utf-8", errors="ignore")
         try:
             return json.loads(raw or "{}")
         except Exception:
-            return {"code": -1, "msg": "invalid_json", "raw": raw}
+            text = (raw or "").strip()
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    return json.loads(text[start : end + 1])
+                except Exception:
+                    pass
+            logger.warning("easypay returned non-json response: %s", text[:300])
+            return {"code": -1, "msg": "invalid_json", "raw": text[:1000]}
 
-    def create_order(self, *, order_no: str, amount_fen: int, channel: str, subject: str, notify_url: str) -> PaymentCreateResult:
+    def create_order(
+        self,
+        *,
+        order_no: str,
+        amount_fen: int,
+        channel: str,
+        subject: str,
+        notify_url: str,
+    ) -> PaymentCreateResult:
         self._ensure_enabled()
         amount_yuan = f"{max(1, int(amount_fen)) / 100:.2f}"
         pay_type = "wxpay" if channel == "wechat_native" else "alipay"
+        return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
         form: Dict[str, Any] = {
             "pid": self.pid,
             "type": pay_type,
@@ -59,18 +86,48 @@ class EasyPayProvider(PaymentProvider):
             "notify_url": notify_url,
             "name": subject,
             "money": amount_yuan,
+            "format": "json",
             "clientip": "127.0.0.1",
             "device": "pc",
         }
+        if return_url:
+            form["return_url"] = return_url
         form["sign"] = self._sign(form)
         form["sign_type"] = "MD5"
+        logger.info(
+            "easypay create order start order_no=%s api_base=%s pid=%s type=%s amount=%s notify_url=%s return_url=%s",
+            order_no,
+            self.api_base,
+            self._masked_pid(),
+            pay_type,
+            amount_yuan,
+            notify_url,
+            return_url,
+        )
         rsp = self._post_form("submit.php", form)
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or "")
         code_url = str(rsp.get("code_url") or rsp.get("qrcode") or rsp.get("payurl") or "")
         status_ok = str(rsp.get("code") or "") == "1" or str(rsp.get("msg") or "").lower() in {"success", "ok"}
         if not status_ok or not code_url:
-            msg = str(rsp.get("msg") or rsp.get("error") or "易支付下单失败")
+            msg = str(rsp.get("msg") or rsp.get("error") or "easypay_create_failed")
+            raw_preview = str(rsp.get("raw") or "").strip().replace("\r", " ").replace("\n", " ")
+            if msg == "invalid_json" and raw_preview:
+                msg = f"invalid_json: {raw_preview[:160]}"
+            logger.warning(
+                "easypay create order failed order_no=%s code=%s msg=%s trade_no=%s raw=%s",
+                order_no,
+                str(rsp.get("code") or ""),
+                msg,
+                trade_no,
+                raw_preview[:300],
+            )
             raise RuntimeError(msg)
+        logger.info(
+            "easypay create order ok order_no=%s trade_no=%s code_url_present=%s",
+            order_no,
+            trade_no,
+            bool(code_url),
+        )
         return PaymentCreateResult(provider_order_id=trade_no, code_url=code_url, raw=rsp)
 
     def verify_notify(self, payload: Dict[str, Any]) -> PaymentNotifyResult:
@@ -82,6 +139,13 @@ class EasyPayProvider(PaymentProvider):
             raise RuntimeError("invalid_sign")
         paid_status = str(payload.get("trade_status") or payload.get("status") or "").upper()
         paid = paid_status in {"TRADE_SUCCESS", "SUCCESS", "1"}
+        logger.info(
+            "easypay notify verified order_no=%s paid=%s trade_status=%s provider_order_id=%s",
+            order_no,
+            paid,
+            paid_status,
+            str(payload.get("trade_no") or ""),
+        )
         return PaymentNotifyResult(
             order_no=order_no,
             paid=paid,
@@ -92,6 +156,6 @@ class EasyPayProvider(PaymentProvider):
 
     def refund(self, *, order_no: str, provider_order_id: str = "") -> Dict[str, Any]:
         self._ensure_enabled()
-        # 许多易支付实现无统一退款接口，这里返回 no-op，由业务层做本地额度回退与人工退款。
+        # Many EasyPay deployments do not expose a unified refund API.
+        # Keep local balance settlement in the business layer.
         return {"ok": True, "order_no": order_no, "provider_order_id": provider_order_id, "noop": True}
-

@@ -24,7 +24,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -2241,6 +2241,7 @@ async def send_gpu_redeem_code(request: Request) -> Dict[str, Any]:
 async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) -> Dict[str, Any]:
     provider = _get_payment_provider()
     notify_url = (os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip()
+    return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
     if not notify_url:
         raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
     tenant_id, client_id = _ocr_billing_tenant_client(request)
@@ -2250,6 +2251,18 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     amount_cny = float(created["amount_cny"])
     channel = str(created["channel"])
     total_fee = _amount_to_fen(amount_cny)
+    logger.info(
+        "create payment order request order_no=%s tenant_id=%s client_id=%s pack_key=%s channel=%s amount_cny=%.2f notify_url=%s return_url=%s provider=%s",
+        order_no,
+        tenant_id,
+        client_id,
+        body.pack_key,
+        channel,
+        amount_cny,
+        notify_url,
+        return_url,
+        _pay_provider_name(),
+    )
     try:
         created_rsp = provider.create_order(
             order_no=order_no,
@@ -2259,7 +2272,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
             notify_url=notify_url,
         )
     except Exception as exc:
-        logger.exception("create payment order failed provider=%s", _pay_provider_name())
+        logger.exception("create payment order failed provider=%s order_no=%s channel=%s", _pay_provider_name(), order_no, channel)
         raise HTTPException(status_code=502, detail=f"支付下单失败: {exc}")
     payjs_order_id = str(created_rsp.provider_order_id or "")
     conn = _conn()
@@ -2312,7 +2325,7 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
 
 
 @app.post("/gpu/ocr/pay/notify")
-async def notify_gpu_pay_order(request: Request) -> Dict[str, Any]:
+async def notify_gpu_pay_order(request: Request) -> PlainTextResponse:
     provider = _get_payment_provider()
     payload: Dict[str, Any] = {}
     try:
@@ -2332,19 +2345,27 @@ async def notify_gpu_pay_order(request: Request) -> Dict[str, Any]:
     except Exception:
         order_no = str(payload.get("out_trade_no") or "")
         _log_pay_callback(order_no, payload, sign_ok=False, handled=False, result_text="bad_sign")
-        raise HTTPException(status_code=403, detail="invalid_sign")
+        logger.warning("payment notify invalid sign order_no=%s payload_keys=%s", order_no, ",".join(sorted(payload.keys())))
+        return PlainTextResponse("fail", status_code=403)
     order_no = notify_result.order_no
     if not notify_result.paid:
         status_val = str(payload.get("trade_status") or payload.get("status") or "")
         _log_pay_callback(order_no, payload, sign_ok=True, handled=False, result_text=f"ignore_status:{status_val}")
-        return {"ok": True, "ignored": True}
-    order = _mark_order_paid_if_needed(
+        logger.info("payment notify ignored order_no=%s status=%s", order_no, status_val)
+        return PlainTextResponse("success")
+    _mark_order_paid_if_needed(
         order_no=order_no,
         transaction_id=notify_result.transaction_id,
         provider_order_id=notify_result.provider_order_id,
     )
     _log_pay_callback(order_no, payload, sign_ok=True, handled=True, result_text="credited")
-    return {"ok": True, "order_no": order_no, "status": str(order.get("status") or "paid")}
+    logger.info(
+        "payment notify credited order_no=%s transaction_id=%s provider_order_id=%s",
+        order_no,
+        notify_result.transaction_id,
+        notify_result.provider_order_id,
+    )
+    return PlainTextResponse("success")
 
 
 @app.post("/gpu/ocr/pay/order/{order_no}/refund")
