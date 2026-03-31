@@ -21,6 +21,11 @@ type GpuQuota = {
   special?: boolean;
 };
 
+type ComplexOcrQuota = {
+  paid_tokens?: number;
+  special?: boolean;
+};
+
 type PendingPayOrder = {
   orderNo: string;
   qrImageUrl: string;
@@ -69,6 +74,7 @@ function broadcastQuotaRefresh() {
 
 export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
+  const [complexOcrQuota, setComplexOcrQuota] = useState<ComplexOcrQuota>({ paid_tokens: 0, special: false });
   const [quotaLoadError, setQuotaLoadError] = useState(false);
 
   const [redeemOpen, setRedeemOpen] = useState(false);
@@ -161,6 +167,23 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
   };
 
+  const refreshComplexOcrQuota = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/ocr/token/quota`, {
+        headers: withTenantHeaders(),
+        credentials: "include",
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      setComplexOcrQuota({
+        paid_tokens: typeof data?.paid_tokens === "number" ? data.paid_tokens : 0,
+        special: data?.special === true,
+      });
+    } catch {
+      // ignore
+    }
+  };
+
   const checkPayOrderStatus = async (currentOrderNo: string, expectedCalls: number) => {
     const response = await fetch(`${API_BASE}/gpu/ocr/pay/order/${currentOrderNo}`, {
       headers: withTenantHeaders(),
@@ -216,11 +239,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   useEffect(() => {
     if (!loggedIn) {
       setGpuQuota({ used: 0, limit: 0, paid_balance: 0, special: false });
+      setComplexOcrQuota({ paid_tokens: 0, special: false });
       setQuotaLoadError(false);
       clearPendingPayOrder();
       return;
     }
     void refreshQuota();
+    void refreshComplexOcrQuota();
   }, [authSession, loggedIn]);
 
   useEffect(() => {
@@ -562,6 +587,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
             </>
           )}
         </button>
+
+        {loggedIn && (
+          <span className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-amber-700 ring-1 ring-amber-200">
+            {complexOcrQuota.special
+              ? "复杂 OCR：不限"
+              : `复杂 OCR token：${typeof complexOcrQuota.paid_tokens === "number" ? complexOcrQuota.paid_tokens : "..."}`}
+          </span>
+        )}
 
         {installMessage && <span className="ml-1 text-[11px] text-slate-400">{installMessage}</span>}
         {statusNotice && <span className="ml-1 text-[11px] text-emerald-600">{statusNotice}</span>}

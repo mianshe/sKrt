@@ -47,6 +47,8 @@ export type TenantQuotaStatus = {
   max_vectors: number;
 };
 
+export type OcrMode = "standard" | "complex_layout";
+
 /** GET /tenant/quota/status；无权限或失败时返回 null */
 export async function fetchTenantQuotaStatus(): Promise<TenantQuotaStatus | null> {
   try {
@@ -330,7 +332,7 @@ async function createSingleFileTask(
   file: File,
   discipline: string,
   documentType: string,
-  useGpuOcr: boolean,
+  ocrMode: OcrMode,
   externalOcrConfirmed: boolean
 ): Promise<UploadTaskItem> {
   const form = new FormData();
@@ -338,7 +340,7 @@ async function createSingleFileTask(
   const url = new URL(`${API_BASE}/upload/tasks`);
   url.searchParams.set("discipline", discipline);
   url.searchParams.set("document_type", documentType);
-  url.searchParams.set("use_gpu_ocr", useGpuOcr ? "1" : "0");
+  url.searchParams.set("ocr_mode", ocrMode);
   url.searchParams.set("external_ocr_confirmed", externalOcrConfirmed ? "1" : "0");
   let resp: Response;
   try {
@@ -376,7 +378,7 @@ async function postChunkComplete(
   uploadId: string,
   discipline: string,
   documentType: string,
-  useGpuOcr: boolean,
+  ocrMode: OcrMode,
   externalOcrConfirmed: boolean
 ): Promise<Response> {
   return fetch(`${API_BASE}/upload/chunks/${uploadId}/complete`, {
@@ -386,7 +388,7 @@ async function postChunkComplete(
       discipline,
       document_type: documentType,
       purpose: "docs",
-      use_gpu_ocr: useGpuOcr,
+      ocr_mode: ocrMode,
       external_ocr_confirmed: externalOcrConfirmed,
     }),
   });
@@ -397,9 +399,9 @@ export async function resumeChunkUploadAfterExternalOcrConfirm(
   uploadId: string,
   discipline: string,
   documentType: string,
-  useGpuOcr: boolean
+  ocrMode: OcrMode
 ): Promise<UploadTaskItem> {
-  const completeResp = await postChunkComplete(uploadId, discipline, documentType, useGpuOcr, true);
+  const completeResp = await postChunkComplete(uploadId, discipline, documentType, ocrMode, true);
   if (!completeResp.ok) {
     const t = await completeResp.text();
     throw new Error(t || "分片合并失败");
@@ -416,7 +418,7 @@ async function createSingleFileChunkTask(
   file: File,
   discipline: string,
   documentType: string,
-  useGpuOcr: boolean,
+  ocrMode: OcrMode,
   externalOcrConfirmed: boolean,
   onUploadPercent?: (n: number) => void
 ): Promise<UploadTaskItem> {
@@ -428,7 +430,7 @@ async function createSingleFileChunkTask(
     discipline,
     document_type: documentType,
     purpose: "docs" as const,
-    use_gpu_ocr: useGpuOcr,
+    ocr_mode: ocrMode,
   };
   let initResp: Response;
   try {
@@ -473,7 +475,7 @@ async function createSingleFileChunkTask(
 
   let completeResp: Response;
   try {
-    completeResp = await postChunkComplete(upload_id, discipline, documentType, useGpuOcr, externalOcrConfirmed);
+    completeResp = await postChunkComplete(upload_id, discipline, documentType, ocrMode, externalOcrConfirmed);
   } catch {
     throw new Error(`无法连接后端（${API_BASE}/upload/chunks/.../complete）。${backendHint()}`);
   }
@@ -491,7 +493,7 @@ async function createSingleFileChunkTask(
         {
           discipline,
           documentType,
-          useGpuOcr,
+          useGpuOcr: ocrMode === "complex_layout",
           onUploadPercent,
         },
         fileKeyForUpload(file)
@@ -622,11 +624,11 @@ export function useDocuments() {
       discipline: string,
       documentType: string,
       onUploadProgress?: (percent: number) => void,
-      options?: { use_gpu_ocr?: boolean; external_ocr_confirmed?: boolean }
+      options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean }
     ): Promise<UploadTaskItem[]> => {
       if (!files.length) return [];
       const normalizedDiscipline = discipline.trim().toLowerCase() || "all";
-      const useGpuOcr = Boolean(options?.use_gpu_ocr);
+      const ocrMode: OcrMode = options?.ocr_mode === "complex_layout" ? "complex_layout" : "standard";
       const externalOcrConfirmed = Boolean(options?.external_ocr_confirmed);
       const all: UploadTaskItem[] = [];
       let completed = 0;
@@ -637,7 +639,7 @@ export function useDocuments() {
                 file,
                 normalizedDiscipline,
                 documentType,
-                useGpuOcr,
+                ocrMode,
                 externalOcrConfirmed,
                 (p) => {
                   const base = Math.round((completed / files.length) * 100);
@@ -645,7 +647,7 @@ export function useDocuments() {
                   onUploadProgress?.(Math.min(99, base + local));
                 }
               )
-            : await createSingleFileTask(file, normalizedDiscipline, documentType, useGpuOcr, externalOcrConfirmed);
+            : await createSingleFileTask(file, normalizedDiscipline, documentType, ocrMode, externalOcrConfirmed);
         completed += 1;
         onUploadProgress?.(Math.round((completed / files.length) * 100));
         all.push(task);

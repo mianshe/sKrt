@@ -54,6 +54,7 @@ from backend.services.client_ip import normalized_signup_ip
 from backend.services import local_auth_service
 from backend.services import knowledge_store
 from backend.services import gpu_ocr_billing
+from backend.services import ocr_token_billing
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
 from backend.services.payments.easypay_provider import EasyPayProvider
@@ -174,6 +175,7 @@ class ChunkInitRequest(BaseModel):
     document_type: str = "academic"
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
+    ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
 
 
 class ChunkCompleteRequest(BaseModel):
@@ -181,6 +183,7 @@ class ChunkCompleteRequest(BaseModel):
     document_type: str = "academic"
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
+    ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
     external_ocr_confirmed: bool = False
 
 
@@ -189,11 +192,13 @@ class UploadPresignInitRequest(BaseModel):
     discipline: str = "general"
     document_type: Optional[str] = None
     use_gpu_ocr: bool = False
+    ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
 
 
 class UploadPresignCompleteRequest(BaseModel):
     object_key: str = Field(min_length=1, max_length=1024)
     use_gpu_ocr: bool = False
+    ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
     external_ocr_confirmed: bool = False
 
 
@@ -206,6 +211,7 @@ class ChunkUploadMeta(TypedDict):
     discipline: str
     document_type: str
     use_gpu_ocr: bool
+    ocr_mode: str
     received_chunks: int
     temp_dir: str
     tenant_id: str
@@ -256,6 +262,15 @@ def _normalize_user_id(value: str) -> str:
         return ""
     normalized = re.sub(r"[^0-9A-Za-z_\-\.@]+", "-", raw).strip("-")
     return normalized[:128]
+
+
+def _normalize_ocr_mode(value: Optional[str], *, use_gpu_ocr: Optional[bool] = None) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"standard", "complex_layout"}:
+        return mode
+    if bool(use_gpu_ocr):
+        return "complex_layout"
+    return "standard"
 
 
 _jwt_validator: Optional[JwtValidator] = None
@@ -962,6 +977,37 @@ def _init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_gpu_ocr_paid_pages_ledger_lookup ON gpu_ocr_paid_pages_ledger(tenant_id, client_id, created_at)"
         )
+        # 复杂版式 OCR token 余额与流水
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_token_balance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL DEFAULT 'public',
+                client_id TEXT NOT NULL,
+                tokens_balance INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, client_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocr_token_balance_lookup ON ocr_token_balance(tenant_id, client_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_token_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL DEFAULT 'public',
+                client_id TEXT NOT NULL,
+                delta_tokens INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocr_token_ledger_lookup ON ocr_token_ledger(tenant_id, client_id, created_at)"
+        )
         # PayJS 订单表
         conn.execute(
             """
@@ -1459,6 +1505,14 @@ def _gpu_ocr_initial_free_calls() -> int:
     return max(0, min(v, 1_000_000))
 
 
+def _complex_ocr_initial_free_tokens() -> int:
+    try:
+        v = int((os.getenv("COMPLEX_OCR_INITIAL_FREE_TOKENS") or "1000000").strip() or "1000000")
+    except ValueError:
+        v = 1_000_000
+    return max(0, min(v, 1_000_000_000))
+
+
 def _gpu_scan_text_char_threshold() -> int:
     try:
         v = int((os.getenv("GPU_OCR_SCAN_TEXT_CHAR_THRESHOLD") or "200").strip() or "200")
@@ -1798,6 +1852,10 @@ def _get_gpu_paid_calls_balance(tenant_id: str, client_id: str) -> int:
     return gpu_ocr_billing.get_paid_calls_balance(tenant_id, client_id)
 
 
+def _get_complex_ocr_token_balance(tenant_id: str, client_id: str) -> int:
+    return ocr_token_billing.get_token_balance(tenant_id, client_id)
+
+
 def _ensure_gpu_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
     grant = _gpu_ocr_initial_free_calls()
     if grant <= 0:
@@ -1825,6 +1883,35 @@ def _ensure_gpu_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
 
 def _add_gpu_paid_calls(tenant_id: str, client_id: str, delta_calls: int, reason: str) -> int:
     return gpu_ocr_billing.add_paid_calls(tenant_id, client_id, delta_calls, reason)
+
+
+def _ensure_complex_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
+    grant = _complex_ocr_initial_free_tokens()
+    if grant <= 0:
+        return
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM ocr_token_balance WHERE tenant_id=? AND client_id=?",
+            (tenant_id, client_id),
+        ).fetchone()
+        if row is not None:
+            return
+        conn.execute(
+            "INSERT INTO ocr_token_balance(tenant_id, client_id, tokens_balance) VALUES(?,?,?)",
+            (tenant_id, client_id, grant),
+        )
+        conn.execute(
+            "INSERT INTO ocr_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
+            (tenant_id, client_id, grant, "initial_free_grant"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _add_complex_ocr_tokens(tenant_id: str, client_id: str, delta_tokens: int, reason: str) -> int:
+    return ocr_token_billing.add_tokens(tenant_id, client_id, delta_tokens, reason)
 
 
 def _ensure_gpu_calls_balance_covers_or_raise(request: Request, page_count: int) -> None:
@@ -2126,6 +2213,7 @@ async def auth_register_complete(request: Request, body: Dict[str, Any] = Body(.
         if not local_auth_service.verify_registration_code(conn, email, code):
             raise HTTPException(status_code=400, detail="验证码错误或已过期")
         free_calls = local_auth_service.decide_signup_free_calls(conn, ip, email)
+        free_complex_tokens = _complex_ocr_initial_free_tokens()
         uid = str(uuid.uuid4())
         conn.execute(
             "INSERT INTO app_users(id, email, password_hash) VALUES(?,?,?)",
@@ -2146,6 +2234,15 @@ async def auth_register_complete(request: Request, body: Dict[str, Any] = Body(.
                 "INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance) VALUES(?,?,?)",
                 (uid, uid, 0),
             )
+        conn.execute(
+            "INSERT INTO ocr_token_balance(tenant_id, client_id, tokens_balance) VALUES(?,?,?)",
+            (uid, uid, max(0, int(free_complex_tokens))),
+        )
+        if free_complex_tokens > 0:
+            conn.execute(
+                "INSERT INTO ocr_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
+                (uid, uid, int(free_complex_tokens), "signup_free_grant"),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -2156,6 +2253,7 @@ async def auth_register_complete(request: Request, body: Dict[str, Any] = Body(.
         "token_type": "Bearer",
         "free_ocr_calls_granted": int(free_calls),
         "free_ocr_pages_granted": int(free_calls),
+        "free_complex_ocr_tokens_granted": int(max(0, free_complex_tokens)),
     }
 
 
@@ -2206,6 +2304,22 @@ async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
         "remaining": 0,
         "daily_used": 0,
         "daily_limit": 0,
+    }
+
+
+@app.get("/ocr/token/quota")
+async def get_complex_ocr_token_quota(request: Request) -> Dict[str, Any]:
+    tenant_id, client_id = _ocr_billing_tenant_client(request)
+    special = bool(_is_special_user(request))
+    if not special:
+        _ensure_complex_ocr_initial_balance(tenant_id, client_id)
+    balance = _get_complex_ocr_token_balance(tenant_id, client_id)
+    ledger = ocr_token_billing.recent_ledger(tenant_id, client_id, limit=12)
+    return {
+        "paid_balance": int(max(0, balance)),
+        "paid_tokens": int(max(0, balance)),
+        "special": special,
+        "ledger": ledger,
     }
 
 
@@ -2591,6 +2705,10 @@ def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": task.get("updated_at"),
         "file_size_bytes": int(task.get("file_size_bytes", 0) or 0),
         "use_gpu_ocr": bool(int(task.get("use_gpu_ocr", 0) or 0) == 1),
+        "ocr_mode": str(task.get("ocr_mode", "standard") or "standard"),
+        "ocr_provider": str(task.get("ocr_provider", "") or ""),
+        "ocr_call_units": int(task.get("ocr_call_units", 0) or 0),
+        "ocr_billable_tokens": int(task.get("ocr_billable_tokens", 0) or 0),
         **timing,
         "rollup_task_count": rollup.get("rollup_task_count"),
         "rollup_avg_sec_per_mb_extract": rollup.get("avg_extract_sec_per_mb"),
@@ -2762,6 +2880,7 @@ async def _handle_completed_chunked_upload(
     purpose: str,
     tenant_id: str,
     use_gpu_ocr: bool,
+    ocr_mode: str,
     *,
     ocr_billing_client_id: Optional[str] = None,
     ocr_billing_exempt: bool = False,
@@ -2773,10 +2892,12 @@ async def _handle_completed_chunked_upload(
             document_type=document_type or _guess_doc_type(filename),
             storage_basename=target_path.name,
             tenant_id=tenant_id,
+            ocr_mode=ocr_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(use_gpu_ocr))
+        upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
         _spawn_ingestion_worker(int(task.get("id", 0)), tenant_id=tenant_id)
         return {"tasks": [_normalize_task(task)]}
 
@@ -2900,6 +3021,7 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
     if req.total_chunks > 10000:
         raise HTTPException(status_code=400, detail="分片数量过大，请增大分片大小")
 
+    ocr_mode = _normalize_ocr_mode(req.ocr_mode, use_gpu_ocr=req.use_gpu_ocr)
     upload_id = uuid.uuid4().hex
     temp_dir = CHUNK_TEMP_DIR / upload_id
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -2912,6 +3034,7 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
         "discipline": req.discipline,
         "document_type": req.document_type,
         "use_gpu_ocr": bool(req.use_gpu_ocr),
+        "ocr_mode": ocr_mode,
         "received_chunks": 0,
         "temp_dir": str(temp_dir),
         "tenant_id": tenant_id,
@@ -2955,6 +3078,7 @@ async def complete_chunk_upload(
     purpose = (req.purpose if req else meta["purpose"]) if req else meta["purpose"]
     discipline = (req.discipline if req else meta["discipline"]) if req else meta["discipline"]
     document_type = (req.document_type if req else meta["document_type"]) if req else meta["document_type"]
+    ocr_mode = _normalize_ocr_mode((req.ocr_mode if req else meta.get("ocr_mode")), use_gpu_ocr=(req.use_gpu_ocr if req else None))
     external_ocr_confirmed = bool(req.external_ocr_confirmed) if req else False
 
     temp_dir = Path(meta["temp_dir"])
@@ -2971,7 +3095,7 @@ async def complete_chunk_upload(
         storage_name = str(meta["pending_storage_basename"])
         target_filename = str(meta["pending_target_filename"])
         actual_size = final_path.stat().st_size
-        use_gpu_ocr = bool(actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES)
+        use_gpu_ocr = bool(ocr_mode == "complex_layout")
     else:
         missing = [idx for idx in range(total_chunks) if not _chunk_path(upload_id, idx).exists()]
         if missing:
@@ -2995,41 +3119,11 @@ async def complete_chunk_upload(
         if expected_size > 0 and actual_size != expected_size:
             raise HTTPException(status_code=400, detail=f"文件大小校验失败 expected={expected_size} actual={actual_size}")
 
-        use_gpu_ocr = bool((req.use_gpu_ocr if req and req.use_gpu_ocr is not None else meta.get("use_gpu_ocr")) or False)
-        if actual_size > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES:
-            use_gpu_ocr = True
+        use_gpu_ocr = bool(ocr_mode == "complex_layout")
 
     _enforce_tenant_quota(identity, additional_bytes=int(actual_size))
 
     merged_sha256 = _calc_sha256(final_path) if final_path.exists() else ""
-
-    use_task_gpu, ocr_resp = _external_ocr_scan_quota_result(
-        final_path=final_path,
-        target_filename=target_filename,
-        actual_size=actual_size,
-        use_gpu_ocr_req=use_gpu_ocr,
-        external_ocr_confirmed=external_ocr_confirmed,
-        request=request,
-        upload_id=upload_id,
-    )
-    if ocr_resp is not None:
-        if not resuming:
-            meta["awaiting_external_ocr_confirm"] = True
-            meta["pending_final_path"] = str(final_path)
-            meta["pending_storage_basename"] = storage_name
-            meta["pending_target_filename"] = target_filename
-            for idx in range(total_chunks):
-                try:
-                    _chunk_path(upload_id, idx).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            try:
-                temp_dir.rmdir()
-            except Exception:
-                pass
-        return ocr_resp
-
-    use_gpu_ocr = use_task_gpu
 
     # 先持久化到对象存储（优先 R2），并把 upload_tasks.file_path 指向远端 URI（保证后续解析不依赖本地磁盘）
     r2_cfg = R2StorageConfig.from_env()
@@ -3066,6 +3160,8 @@ async def complete_chunk_upload(
             conn_th.close()
 
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
+    if ocr_mode == "complex_layout" and ocr_cid:
+        _ensure_complex_ocr_initial_balance(tenant_id, ocr_cid)
     result = await _handle_completed_chunked_upload(
         target_path=final_path,
         filename=target_filename,
@@ -3074,6 +3170,7 @@ async def complete_chunk_upload(
         purpose=purpose,
         tenant_id=tenant_id,
         use_gpu_ocr=use_gpu_ocr,
+        ocr_mode=ocr_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
     )
@@ -3198,6 +3295,7 @@ async def create_upload_tasks(
     discipline: str = "general",
     document_type: Optional[str] = None,
     use_gpu_ocr: bool = False,
+    ocr_mode: str = "standard",
     external_ocr_confirmed: bool = False,
 ) -> Any:
     _ensure_capacity_for_write()
@@ -3231,7 +3329,10 @@ async def create_upload_tasks(
     finally:
         conn_th.close()
 
+    normalized_ocr_mode = _normalize_ocr_mode(ocr_mode, use_gpu_ocr=use_gpu_ocr)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
+    if normalized_ocr_mode == "complex_layout" and ocr_cid:
+        _ensure_complex_ocr_initial_balance(tenant_id, ocr_cid)
     tasks: List[Dict[str, Any]] = []
     r2_cfg = R2StorageConfig.from_env()
     r2_prefix = (os.getenv("R2_STORAGE_PREFIX") or "").strip().strip("/")
@@ -3240,7 +3341,6 @@ async def create_upload_tasks(
     sb_cfg = SupabaseStorageConfig.from_env()
     sb_prefix = (os.getenv("SUPABASE_STORAGE_PREFIX") or "").strip().strip("/")
     sb_delete_local = _env_bool("SUPABASE_DELETE_LOCAL_AFTER_UPLOAD", False)
-    req_use_gpu_ocr = bool(use_gpu_ocr)
     for f in files:
         if not f.filename:
             continue
@@ -3253,23 +3353,7 @@ async def create_upload_tasks(
         await _save_upload_file_stream(f, target)
 
         sz = target.stat().st_size if target.exists() else 0
-        auto_large = bool(sz > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES)
-        try_ocr = bool(req_use_gpu_ocr or auto_large)
-        task_use_gpu, ocr_resp = _external_ocr_scan_quota_result(
-            final_path=target,
-            target_filename=f.filename,
-            actual_size=sz,
-            use_gpu_ocr_req=try_ocr,
-            external_ocr_confirmed=external_ocr_confirmed,
-            request=request,
-            upload_id=None,
-        )
-        if ocr_resp is not None:
-            try:
-                target.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return ocr_resp
+        task_use_gpu = bool(normalized_ocr_mode == "complex_layout")
 
         _enforce_tenant_quota(identity, additional_bytes=int(sz))
 
@@ -3280,10 +3364,12 @@ async def create_upload_tasks(
             document_type=dtype,
             storage_basename=storage,
             tenant_id=tenant_id,
+            ocr_mode=normalized_ocr_mode,
             ocr_billing_client_id=ocr_cid,
             ocr_billing_exempt=ocr_ex,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
+        upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), normalized_ocr_mode)
         # 优先：R2（S3 兼容）持久化，并把 upload_tasks.file_path 指向 r2://bucket/key
         if r2_cfg:
             object_key = f"{r2_prefix}/{tenant_id}/{storage}".strip("/")
@@ -3337,6 +3423,7 @@ async def create_upload_task_single_file(
     file: UploadFile = File(..., description="单个 PDF / DOCX / TXT / MD"),
     discipline: str = "general",
     document_type: Optional[str] = None,
+    ocr_mode: str = "standard",
     external_ocr_confirmed: bool = False,
 ) -> Any:
     """与 POST /upload/tasks 相同，仅上传一个文件；在 /docs 里应出现标准 file 控件。若看不到：重启后端并强制刷新 /docs（Ctrl+F5）。"""
@@ -3345,6 +3432,7 @@ async def create_upload_task_single_file(
         files=[file],
         discipline=discipline,
         document_type=document_type,
+        ocr_mode=ocr_mode,
         external_ocr_confirmed=external_ocr_confirmed,
     )
 
@@ -3382,17 +3470,22 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     storage = _unique_upload_basename(filename)
     dtype = body.document_type or _guess_doc_type(filename)
     disc = body.discipline if body.discipline != "auto" else "all"
+    ocr_mode = _normalize_ocr_mode(body.ocr_mode, use_gpu_ocr=body.use_gpu_ocr)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
+    if ocr_mode == "complex_layout" and ocr_cid:
+        _ensure_complex_ocr_initial_balance(tenant_id, ocr_cid)
     task = upload_ingestion_service.create_task_placeholder(
         filename=filename,
         discipline=disc,
         document_type=dtype,
         tenant_id=tenant_id,
         storage_basename=storage,
+        ocr_mode=ocr_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
     )
     upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), False)
+    upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
 
     conn_rec = _conn()
     try:
@@ -3478,44 +3571,10 @@ async def upload_tasks_presign_complete(
         except Exception:
             pass
 
-    use_gpu = bool(body.use_gpu_ocr)
-    if sz > _EXTERNAL_OCR_SIZE_THRESHOLD_BYTES:
-        use_gpu = True
-    task_fn = str(task.get("filename") or "")
-    is_pdf = Path(task_fn).suffix.lower() == ".pdf"
+    ocr_mode = _normalize_ocr_mode(body.ocr_mode, use_gpu_ocr=body.use_gpu_ocr)
+    upload_ingestion_service.update_task_ocr_mode(task_id, ocr_mode)
+    upload_ingestion_service.update_task_use_gpu_ocr(task_id, bool(ocr_mode == "complex_layout"))
     spawn_worker = True
-    if use_gpu and _external_ocr_billing_enabled() and is_pdf:
-        parsed_uri = parse_r2_uri(uri)
-        if parsed_uri:
-            bucket, key = parsed_uri
-            cache_dir = UPLOAD_DIR / "_cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            dest = cache_dir / f"presign_gpu_{task_id}_{Path(key).name}"
-            try:
-                r2_download_to_file(r2_cfg, bucket=bucket, key=key, dest_path=dest)
-                task_use, ocr_resp = _external_ocr_scan_quota_result(
-                    final_path=dest,
-                    target_filename=task_fn,
-                    actual_size=sz,
-                    use_gpu_ocr_req=True,
-                    external_ocr_confirmed=bool(body.external_ocr_confirmed),
-                    request=request,
-                    upload_id=None,
-                )
-                if ocr_resp is not None:
-                    upload_ingestion_service.update_task_use_gpu_ocr(task_id, False)
-                    spawn_worker = False
-                    return ocr_resp
-                upload_ingestion_service.update_task_use_gpu_ocr(task_id, bool(task_use))
-            finally:
-                try:
-                    dest.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        else:
-            upload_ingestion_service.update_task_use_gpu_ocr(task_id, False)
-    else:
-        upload_ingestion_service.update_task_use_gpu_ocr(task_id, False)
 
     if spawn_worker:
         _spawn_ingestion_worker(task_id, tenant_id)

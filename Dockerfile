@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY backend /app/backend
 COPY frontend /app/frontend
+COPY .env* /app/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port 8000 $(test -f .env && echo '--env-file .env' || echo '')"]

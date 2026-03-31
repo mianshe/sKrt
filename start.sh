@@ -23,7 +23,9 @@ echo "[2/4] Installing frontend dependencies..."
 npm --prefix frontend install >/dev/null
 
 echo "[3/4] Starting backend on :8000 ..."
-"$VENV_PY" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
+_ENV_FILE_ARG=""
+if [ -f "$ROOT_DIR/.env" ]; then _ENV_FILE_ARG="--env-file $ROOT_DIR/.env"; fi
+"$VENV_PY" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 $_ENV_FILE_ARG &
 BACKEND_PID=$!
 
 cleanup() {

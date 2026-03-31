@@ -43,7 +43,10 @@ try {
 }
 
 Write-Host '[3/4] Starting backend on :8000 ...'
-$backendProc = Start-Process -FilePath $VenvPython -WorkingDirectory $RootDir -ArgumentList @("-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000") -PassThru
+$UvicornArgs = @("-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000")
+$EnvFile = Join-Path $RootDir ".env"
+if (Test-Path $EnvFile) { $UvicornArgs += @("--env-file", $EnvFile) }
+$backendProc = Start-Process -FilePath $VenvPython -WorkingDirectory $RootDir -ArgumentList $UvicornArgs -PassThru
 
 try {
   Write-Host '[4/4] Starting frontend on :5173 ...'

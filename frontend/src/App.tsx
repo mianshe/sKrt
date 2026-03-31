@@ -152,7 +152,7 @@ function App() {
               资料解析
             </h1>
             <p className="mt-0.5 text-sm font-medium text-slate-500" onClick={handleSubtitleTap} role="button" tabIndex={0}>
-              何芷求职专用测试项目
+              何芯求职专用测试项目
             </p>
           </div>
 

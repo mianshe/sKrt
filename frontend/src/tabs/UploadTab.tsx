@@ -1,19 +1,16 @@
-import { DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DragEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   DocumentItem,
   UploadTaskItem,
-  EXTERNAL_OCR_SIZE_THRESHOLD_BYTES,
-  ExternalOcrConfirmRequiredError,
-  resumeChunkUploadAfterExternalOcrConfirm,
   fetchTenantQuotaStatus,
   buildLocalProcessSnapshot,
   CHUNK_UPLOAD_THRESHOLD,
   downloadCloudDocumentOriginal,
   fileKeyForUpload,
+  type OcrMode,
   type TenantQuotaStatus,
 } from "../hooks/useDocuments";
 import { getAccessToken, useAccessToken } from "../lib/auth";
-import Portal from "../components/Portal";
 import {
   listLocalGuestDocuments,
   putLocalGuestDocument,
@@ -27,7 +24,6 @@ import {
   localDraftProcessJson,
   type LocalUserBackupRecord,
 } from "../lib/localUserBackup";
-import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 
 type Props = {
   documents: DocumentItem[];
@@ -38,7 +34,7 @@ type Props = {
     discipline: string,
     documentType: string,
     onUploadProgress?: (percent: number) => void,
-    options?: { use_gpu_ocr?: boolean; external_ocr_confirmed?: boolean }
+    options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean }
   ) => Promise<UploadTaskItem[]>;
   onGetTask: (taskId: number) => Promise<UploadTaskItem>;
   onDelete: (id: number) => Promise<void>;
@@ -93,10 +89,7 @@ function UploadTab({
   const [localError, setLocalError] = useState("");
   const [localInfo, setLocalInfo] = useState("");
   const [dragging, setDragging] = useState(false);
-  const [preUploadLargePdfApproved, setPreUploadLargePdfApproved] = useState(false);
-  const [externalOcrModalOpen, setExternalOcrModalOpen] = useState(false);
-  const [externalOcrModalMode, setExternalOcrModalMode] = useState<"pre_upload" | "after_chunk" | null>(null);
-  const [pendingChunkOcr, setPendingChunkOcr] = useState<ExternalOcrConfirmRequiredError | null>(null);
+  const [ocrMode, setOcrMode] = useState<OcrMode>("standard");
   const [uploadToCloud, setUploadToCloud] = useState(false);
   const [guestLocalDocs, setGuestLocalDocs] = useState<LocalGuestDoc[]>([]);
   const [userBackups, setUserBackups] = useState<LocalUserBackupRecord[]>([]);
@@ -105,7 +98,6 @@ function UploadTab({
   const loggedIn = Boolean(accessToken);
 
   const localIdMapRef = useRef<Map<string, string>>(new Map());
-  const filesBackupRef = useRef<File[]>([]);
 
   const refreshLocalLists = useCallback(async () => {
     const [g, u] = await Promise.all([listLocalGuestDocuments(), listLocalUserBackups()]);
@@ -124,16 +116,6 @@ function UploadTab({
     }
     void fetchTenantQuotaStatus().then(setQuota);
   }, [authSession, loggedIn]);
-
-  useEffect(() => {
-    setPreUploadLargePdfApproved(false);
-  }, [selectedFiles, uploadToCloud]);
-
-  const pricingText = useMemo(() => {
-    return GPU_OCR_CALL_PACKS.map(
-      (p) => `${p.name}（${p.calls} 次，¥${p.priceCny}，约 ¥${p.pricePerCallCny.toFixed(4)}/次）`
-    ).join("；");
-  }, []);
 
   const pollTaskIds = useCallback(
     async (taskIds: number[]) => {
@@ -229,27 +211,16 @@ function UploadTab({
       return;
     }
 
-    const hasLargeInQueue = filesToUpload.some(
-      (f) => f.name.toLowerCase().endsWith(".pdf") && f.size > EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
-    );
-    if (hasLargeInQueue && !preUploadLargePdfApproved) {
-      setExternalOcrModalMode("pre_upload");
-      setExternalOcrModalOpen(true);
-      return;
-    }
-
     setUploading(true);
     setUploadProgress(0);
     setParseProgress(0);
     setPhaseText("正在上传文件…");
     setSlowHint(false);
-    filesBackupRef.current = filesToUpload.slice();
 
     try {
-      const externalOcrConfirmed = !hasLargeInQueue || preUploadLargePdfApproved;
       const tasks = await onCreateUploadTasks(filesToUpload, "all", "academic", setUploadProgress, {
-        use_gpu_ocr: false,
-        external_ocr_confirmed: externalOcrConfirmed,
+        ocr_mode: ocrMode,
+        external_ocr_confirmed: false,
       });
       if (!tasks.length) {
         throw new Error("未创建上传任务");
@@ -262,67 +233,12 @@ function UploadTab({
       await onRefresh();
       await refreshLocalLists();
       setSelectedFiles([]);
-      setPreUploadLargePdfApproved(false);
       setLocalInfo(uploadToCloud ? "云端解析已完成，本机备份已更新。" : "本机保存失败部分已上传云端并完成解析。");
     } catch (e) {
-      if (e instanceof ExternalOcrConfirmRequiredError) {
-        setPendingChunkOcr(e);
-        setExternalOcrModalMode("after_chunk");
-        setExternalOcrModalOpen(true);
-      } else {
-        setLocalError(e instanceof Error ? e.message : "上传失败");
-      }
+      setLocalError(e instanceof Error ? e.message : "上传失败");
     } finally {
       setUploading(false);
     }
-  };
-
-  const handleExternalOcrModalContinue = async () => {
-    if (externalOcrModalMode === "pre_upload") {
-      setPreUploadLargePdfApproved(true);
-      setExternalOcrModalOpen(false);
-      setExternalOcrModalMode(null);
-      await handleUpload();
-      return;
-    }
-    if (externalOcrModalMode === "after_chunk" && pendingChunkOcr) {
-      const p = pendingChunkOcr;
-      setPendingChunkOcr(null);
-      setExternalOcrModalOpen(false);
-      setExternalOcrModalMode(null);
-      setUploading(true);
-      setUploadProgress(90);
-      setPhaseText("正在完成上传并解析文档…");
-      try {
-        const task = await resumeChunkUploadAfterExternalOcrConfirm(
-          p.uploadId,
-          p.resumeContext.discipline,
-          p.resumeContext.documentType,
-          p.resumeContext.useGpuOcr
-        );
-        setUploadProgress(100);
-        await pollTaskIds([task.task_id]);
-        const file = filesBackupRef.current.find((f) => fileKeyForUpload(f) === p.fileKey);
-        if (file) {
-          await mergeCloudIntoLocalBackups([task], [file], localIdMapRef.current);
-        }
-        await onRefresh();
-        await refreshLocalLists();
-        setSelectedFiles([]);
-        setPreUploadLargePdfApproved(false);
-        setLocalInfo("云端解析已完成，本机备份已更新。");
-      } catch (err) {
-        setLocalError(err instanceof Error ? err.message : "上传失败");
-      } finally {
-        setUploading(false);
-      }
-    }
-  };
-
-  const handleExternalOcrModalCancel = () => {
-    setExternalOcrModalOpen(false);
-    setExternalOcrModalMode(null);
-    setPendingChunkOcr(null);
   };
 
   const mergeFiles = (incoming: File[]) => {
@@ -377,6 +293,41 @@ function UploadTab({
             <span className="block text-xs text-slate-500">勾选后全部所选文件上传并解析；不勾选则仅本机失败时自动上传。</span>
           </span>
         </label>
+        <div className="mb-3 rounded-2xl bg-white/75 p-3 ring-1 ring-slate-200">
+          <p className="text-sm font-semibold text-slate-800">OCR 模式</p>
+          <div className="mt-2 space-y-2 text-sm">
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="ocr-mode"
+                className="mt-0.5"
+                checked={ocrMode === "standard"}
+                onChange={() => setOcrMode("standard")}
+              />
+              <span>
+                <span className="font-medium text-slate-800">默认文字处理</span>
+                <span className="block text-xs text-slate-500">
+                  优先直接抽取文本；扫描件再走 PaddleOCR，按普通 OCR 次数结算。
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="ocr-mode"
+                className="mt-0.5"
+                checked={ocrMode === "complex_layout"}
+                onChange={() => setOcrMode("complex_layout")}
+              />
+              <span>
+                <span className="font-medium text-slate-800">复杂版式（付费，消耗 OCR token）</span>
+                <span className="block text-xs text-slate-500">
+                  适合图表多、分栏多、版式复杂的 PDF，直接走外部 GLM-OCR。
+                </span>
+              </span>
+            </label>
+          </div>
+        </div>
         {quota && (
           <p className="mb-2 text-xs text-slate-500">
             配额：文档 {quota.doc_count}/{quota.max_documents} · 存储{" "}
@@ -415,41 +366,10 @@ function UploadTab({
             </p>
           )}
           {slowHint && <p className="mt-1 text-xs text-slate-500">长文档解析可能较久，可先处理其他任务。</p>}
-          {selectedFiles.some(
-            (f) => f.name.toLowerCase().endsWith(".pdf") && f.size > EXTERNAL_OCR_SIZE_THRESHOLD_BYTES
-          ) && (
-            <p className="mt-1 text-xs text-slate-500">
-              已选择超过 10MB 的 PDF；若为扫描件将提示是否调用外部 OCR（消耗额度）。套餐参考：{pricingText}
-            </p>
+          {ocrMode === "complex_layout" && (
+            <p className="mt-1 text-xs text-amber-700">复杂版式将进入付费通道，并按 OCR token 计费。</p>
           )}
         </div>
-
-        {externalOcrModalOpen && (
-          <Portal>
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-              <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-                <p className="text-sm font-semibold text-slate-800">
-                  此为扫描件或超大 PDF，因处理器受限，超过 10MB 的需要调用外部 OCR，是否继续？
-                </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  继续将按扫描页数扣减外部 OCR 次数余额（特殊用户可能不限）。套餐参考：{pricingText}
-                </p>
-                <div className="mt-3 flex gap-2">
-                  <button className="btn-primary" onClick={() => void handleExternalOcrModalContinue()} disabled={uploading}>
-                    继续
-                  </button>
-                  <button
-                    className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                    onClick={handleExternalOcrModalCancel}
-                    disabled={uploading}
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
-            </div>
-          </Portal>
-        )}
 
         {(uploading || uploadProgress > 0 || parseProgress > 0) && (
           <div className="mt-3 space-y-2">

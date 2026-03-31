@@ -24,6 +24,7 @@ from backend.services.supabase_storage import SupabaseStorageConfig, download_to
 from backend.services.r2_storage import R2StorageConfig, download_to_file as r2_download_to_file, parse_r2_uri
 from backend.services.upload_load_control import log_ingestion_event
 from backend.services import gpu_ocr_billing
+from backend.services import ocr_token_billing
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -162,8 +163,12 @@ class UploadIngestionService:
                 ("file_size_bytes", "ALTER TABLE upload_tasks ADD COLUMN file_size_bytes INTEGER NOT NULL DEFAULT 0"),
                 ("page_count", "ALTER TABLE upload_tasks ADD COLUMN page_count INTEGER NOT NULL DEFAULT 0"),
                 ("use_gpu_ocr", "ALTER TABLE upload_tasks ADD COLUMN use_gpu_ocr INTEGER NOT NULL DEFAULT 0"),
+                ("ocr_mode", "ALTER TABLE upload_tasks ADD COLUMN ocr_mode TEXT NOT NULL DEFAULT 'standard'"),
                 ("ocr_billing_client_id", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_client_id TEXT"),
                 ("ocr_billing_exempt", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_exempt INTEGER NOT NULL DEFAULT 0"),
+                ("ocr_provider", "ALTER TABLE upload_tasks ADD COLUMN ocr_provider TEXT"),
+                ("ocr_call_units", "ALTER TABLE upload_tasks ADD COLUMN ocr_call_units INTEGER NOT NULL DEFAULT 0"),
+                ("ocr_billable_tokens", "ALTER TABLE upload_tasks ADD COLUMN ocr_billable_tokens INTEGER NOT NULL DEFAULT 0"),
                 ("extract_started_at", "ALTER TABLE upload_tasks ADD COLUMN extract_started_at TEXT"),
                 ("extract_finished_at", "ALTER TABLE upload_tasks ADD COLUMN extract_finished_at TEXT"),
                 ("index_started_at", "ALTER TABLE upload_tasks ADD COLUMN index_started_at TEXT"),
@@ -263,6 +268,7 @@ class UploadIngestionService:
         tenant_id: str,
         *,
         storage_basename: Optional[str] = None,
+        ocr_mode: str = "standard",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
@@ -282,8 +288,8 @@ class UploadIngestionService:
                 conn,
                 """
                 INSERT INTO upload_tasks (tenant_id, filename, file_path, discipline, document_type, status, phase, file_size_bytes,
-                    ocr_billing_client_id, ocr_billing_exempt)
-                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?)
+                    ocr_mode, ocr_billing_client_id, ocr_billing_exempt)
+                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)
                 """,
                 (
                     tenant_id,
@@ -292,6 +298,7 @@ class UploadIngestionService:
                     discipline,
                     document_type,
                     file_size_bytes,
+                    str(ocr_mode or "standard"),
                     ocr_billing_client_id,
                     1 if ocr_billing_exempt else 0,
                 ),
@@ -309,6 +316,7 @@ class UploadIngestionService:
         tenant_id: str,
         *,
         storage_basename: str,
+        ocr_mode: str = "standard",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
@@ -323,6 +331,7 @@ class UploadIngestionService:
             document_type=document_type,
             tenant_id=tenant_id,
             storage_basename=storage_basename,
+            ocr_mode=ocr_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
         )
@@ -334,7 +343,8 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_billing_client_id, ocr_billing_exempt,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
+                       ocr_provider, ocr_call_units, ocr_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -355,7 +365,8 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_billing_client_id, ocr_billing_exempt,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
+                       ocr_provider, ocr_call_units, ocr_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -377,7 +388,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_provider, ocr_call_units, ocr_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -503,6 +514,32 @@ class UploadIngestionService:
             conn.execute(
                 "UPDATE upload_tasks SET use_gpu_ocr = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (1 if use_gpu_ocr else 0, int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_task_ocr_mode(self, task_id: int, ocr_mode: str) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE upload_tasks SET ocr_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (str(ocr_mode or "standard"), int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_task_ocr_usage(self, task_id: int, provider: str, call_units: int, billable_tokens: int) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                """
+                UPDATE upload_tasks
+                SET ocr_provider = ?, ocr_call_units = ?, ocr_billable_tokens = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (str(provider or ""), max(0, int(call_units)), max(0, int(billable_tokens)), int(task_id)),
             )
             conn.commit()
         finally:
@@ -767,8 +804,13 @@ class UploadIngestionService:
             local_fp = await self._resolve_local_file_for_task(task_id, task)
             fs = int(task.get("file_size_bytes") or 0)
             _ = fs  # file_size_bytes kept for stats/debug; 外部 OCR 额度由上游扫描判定与扣减
-            # use_gpu_ocr 仅表示「计费/扫描 heavy 路径」，解析走 auto（百度/本地），不再强制 RunPod
-            ocr_override = None
+            ocr_mode = str(task.get("ocr_mode") or "standard").strip().lower() or "standard"
+            if ocr_mode == "complex_layout":
+                ocr_override = "glm-ocr"
+            elif ocr_mode == "standard":
+                ocr_override = "local"
+            else:
+                ocr_override = None
             parse_fn = functools.partial(
                 self.parser.parse, local_fp, task["document_type"], ocr_engine_override=ocr_override
             )
@@ -778,6 +820,17 @@ class UploadIngestionService:
                 bill = int(parsed.metadata.get("ocr_billable_api_calls") or 0)
             except (TypeError, ValueError):
                 bill = 0
+            try:
+                bill_tokens = int(parsed.metadata.get("ocr_billable_tokens") or 0)
+            except (TypeError, ValueError):
+                bill_tokens = 0
+            try:
+                call_units = int(parsed.metadata.get("ocr_call_billing_units") or 0)
+            except (TypeError, ValueError):
+                call_units = 0
+            provider = str(parsed.metadata.get("ocr_provider") or parsed.metadata.get("ocr_engine") or "").strip()
+            self.update_task_ocr_usage(task_id, provider=provider, call_units=call_units + bill, billable_tokens=bill_tokens)
+
             use_gpu_flag = bool(int(task.get("use_gpu_ocr") or 0))
             exempt = bool(int(task.get("ocr_billing_exempt") or 0))
             bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
@@ -786,6 +839,20 @@ class UploadIngestionService:
                 if bal < bill:
                     raise RuntimeError(f"外部 OCR 次数不足（解析需扣 {bill} 次，当前余额 {bal}）")
                 gpu_ocr_billing.add_paid_calls(str(tenant_id), bill_cid, -bill, "consume_ocr_actual_api_calls")
+            if ocr_mode == "standard" and not exempt and call_units > 0:
+                bal = gpu_ocr_billing.get_paid_calls_balance(str(tenant_id), bill_cid)
+                if bal < call_units:
+                    raise RuntimeError(f"普通 OCR 次数不足（解析需扣 {call_units} 次，当前余额 {bal}）")
+                gpu_ocr_billing.add_paid_calls(
+                    str(tenant_id), bill_cid, -call_units, f"consume_standard_ocr_calls:{Path(local_fp).name}"
+                )
+            if ocr_mode == "complex_layout" and not exempt and bill_tokens > 0:
+                bal = ocr_token_billing.get_token_balance(str(tenant_id), bill_cid)
+                if bal < bill_tokens:
+                    raise RuntimeError(f"复杂版式 OCR token 不足（解析需扣 {bill_tokens}，当前余额 {bal}）")
+                ocr_token_billing.add_tokens(
+                    str(tenant_id), bill_cid, -bill_tokens, f"consume_glm_ocr_tokens:{Path(local_fp).name}"
+                )
 
             self._update_task_page_count_from_parsed(task_id, parsed)
 

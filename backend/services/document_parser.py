@@ -13,6 +13,7 @@ import httpx
 
 from PyPDF2 import PdfReader
 from docx import Document
+from backend.services.glm_ocr import glm_ocr_enabled, run_glm_layout_parsing
 
 try:
     import pdfplumber  # type: ignore
@@ -78,6 +79,7 @@ class DocumentParser:
         self._paddle_init_error: Optional[str] = None
         self._baidu_token: Optional[str] = None
         self._baidu_token_deadline: float = 0.0
+        self._ocr_runtime_metadata: Dict[str, Any] = {}
         # OCR 逐页缓存（由 upload_ingestion_service 注入 task_id；读写走 knowledge_store）
         self._ocr_cache_task_id: int = 0
         # 与供应商计费对齐：百度/HTTP OCR 成功 API 调用次数（入库后扣减余额）
@@ -139,6 +141,7 @@ class DocumentParser:
 
     def parse(self, file_path: str, document_type: str, *, ocr_engine_override: Optional[str] = None) -> ParsedDocument:
         self._ocr_billable_api_calls = 0
+        self._ocr_runtime_metadata = {}
         ext = os.path.splitext(file_path)[1].lower()
         pdf_page_count: Optional[int] = None
         if ext == ".pdf":
@@ -162,6 +165,7 @@ class DocumentParser:
         if ext == ".pdf":
             metadata["ocr_billable_api_calls"] = int(max(0, self._ocr_billable_api_calls))
             metadata["toc"] = self._extract_pdf_toc(file_path)
+        metadata.update(self._ocr_runtime_metadata)
 
         # 自动检测文档形态、图片、编码质量
         metadata["document_form"] = self._infer_document_form(
@@ -177,14 +181,12 @@ class DocumentParser:
         return ParsedDocument(text=text, metadata=metadata)
 
     def _parse_pdf(self, file_path: str, *, ocr_engine_override: Optional[str] = None) -> str:
+        override = (ocr_engine_override or "").strip().lower()
+        if override in {"glm-ocr", "glm_ocr", "complex_layout"}:
+            return self._parse_pdf_with_glm_ocr(file_path)
+
         candidates: List[str] = []
         errors: List[str] = []
-
-        ocr_text, ocr_error = self._ocr_pdf(file_path, ocr_engine_override=ocr_engine_override)
-        if ocr_text:
-            return ocr_text
-        if ocr_error:
-            errors.append(f"ocr={ocr_error}")
 
         if pdfplumber is not None:
             try:
@@ -219,12 +221,38 @@ class DocumentParser:
         except Exception as exc:
             errors.append(f"pypdf2={exc}")
 
-        if not candidates:
-            _err_msg = "; ".join(errors) if errors else "unknown"
-            raise ValueError(f"PDF解析失败: {_err_msg}")
+        if candidates:
+            candidates.sort(key=lambda x: self._text_quality_score(x), reverse=True)
+            best = candidates[0]
+            if self._prefer_direct_pdf_text(best):
+                return best
 
-        candidates.sort(key=lambda x: self._text_quality_score(x), reverse=True)
-        return candidates[0]
+        ocr_text, ocr_error = self._ocr_pdf(file_path, ocr_engine_override=ocr_engine_override)
+        if ocr_text:
+            return ocr_text
+        if ocr_error:
+            errors.append(f"ocr={ocr_error}")
+
+        _err_msg = "; ".join(errors) if errors else "unknown"
+        raise ValueError(f"PDF解析失败: {_err_msg}")
+
+    def _parse_pdf_with_glm_ocr(self, file_path: str) -> str:
+        if not glm_ocr_enabled():
+            raise ValueError("GLM-OCR 未配置 ZHIPU_API_KEY")
+        result = run_glm_layout_parsing(file_path)
+        self._ocr_runtime_metadata.update(
+            {
+                "ocr_used": True,
+                "ocr_engine": "glm-ocr",
+                "ocr_provider": "zhipu",
+                "ocr_billable_tokens": int(max(0, result.total_tokens)),
+                "ocr_prompt_tokens": int(max(0, result.prompt_tokens)),
+                "ocr_completion_tokens": int(max(0, result.completion_tokens)),
+                "ocr_request_id": result.request_id,
+                "ocr_complex_layout": True,
+            }
+        )
+        return result.text
 
     def _ocr_pdf(self, file_path: str, *, ocr_engine_override: Optional[str] = None) -> Tuple[str, str]:
         ocr_engine = (ocr_engine_override or os.getenv("PDF_OCR_ENGINE", "auto")).strip().lower() or "auto"
@@ -240,6 +268,8 @@ class DocumentParser:
             engines = ["paddle"]
         elif ocr_engine == "tesseract":
             engines = ["tesseract"]
+        elif ocr_engine in {"local", "local-standard", "paddle-local"}:
+            engines = ["paddle", "tesseract"]
         elif ocr_engine == "baidu":
             engines = ["baidu"]
         elif ocr_engine in {"runpod", "gpu", "remote", "ocr_api", "api"}:
@@ -261,12 +291,21 @@ class DocumentParser:
         for engine in engines:
             if engine == "paddle":
                 txt, err = self._ocr_pdf_pages_paddle(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                if txt:
+                    self._ocr_runtime_metadata.update(
+                        {"ocr_used": True, "ocr_engine": "paddle", "ocr_provider": "local", "ocr_call_billing_units": 1}
+                    )
             elif engine == "tesseract":
                 txt, err = self._ocr_pdf_pages_tesseract(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
+                if txt:
+                    self._ocr_runtime_metadata.update(
+                        {"ocr_used": True, "ocr_engine": "tesseract", "ocr_provider": "local", "ocr_call_billing_units": 1}
+                    )
             elif engine == "remote":
                 txt, err, ncalls = self._ocr_pdf_pages_http_api(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
                 if txt:
                     self._ocr_billable_api_calls = ncalls
+                    self._ocr_runtime_metadata.update({"ocr_used": True, "ocr_engine": "remote-http", "ocr_provider": "remote"})
                     return txt, ""
                 engine_errors.append(f"{engine}:{err or 'empty'}")
                 continue
@@ -274,6 +313,7 @@ class DocumentParser:
                 txt, err, ncalls = self._ocr_pdf_pages_baidu(file_path=file_path, dpi=ocr_dpi, max_pages=ocr_max_pages)
                 if txt:
                     self._ocr_billable_api_calls = ncalls
+                    self._ocr_runtime_metadata.update({"ocr_used": True, "ocr_engine": "baidu", "ocr_provider": "baidu"})
                     return txt, ""
                 engine_errors.append(f"{engine}:{err or 'empty'}")
                 continue
@@ -917,6 +957,16 @@ class DocumentParser:
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
+    def _prefer_direct_pdf_text(self, text: str) -> bool:
+        normalized = (text or "").strip()
+        if not normalized:
+            return False
+        signal_chars = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", normalized))
+        score = self._text_quality_score(normalized)
+        if signal_chars >= 120:
+            return True
+        return signal_chars >= 30 and score >= 0.45
+
     def _text_quality_score(self, text: str) -> float:
         if not text:
             return 0.0
@@ -1192,4 +1242,3 @@ class DocumentParser:
             issues.append(f"high_non_cjk_ratio={non_cjk_high / total:.2%}")
         garble_ratio = max(replacement_ratio, ctrl_ratio)
         return {"ok": len(issues) == 0, "issues": issues, "garble_ratio": round(garble_ratio, 4)}
-
