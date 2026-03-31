@@ -11,7 +11,7 @@ $AppModule = if ($env:APP_MODULE) { $env:APP_MODULE } else { "backend.main:app" 
 $BackendHost = if ($env:BACKEND_HOST) { $env:BACKEND_HOST } else { "0.0.0.0" }
 $BackendPort = if ($env:BACKEND_PORT) { $env:BACKEND_PORT } else { "8000" }
 $InstallDeps = if ($env:INSTALL_DEPS) { $env:INSTALL_DEPS } else { "0" }
-$BuildFrontend = if ($env:BUILD_FRONTEND) { $env:BUILD_FRONTEND } else { "0" }
+$BuildFrontend = if ($env:BUILD_FRONTEND) { $env:BUILD_FRONTEND } else { "auto" }
 $NpmBin = if ($env:NPM_BIN) { $env:NPM_BIN } else { "npm" }
 
 $VenvCandidates = @(
@@ -45,7 +45,18 @@ if ($InstallDeps -eq "1") {
     }
 }
 
-if ($BuildFrontend -eq "1") {
+switch ($BuildFrontend.ToLowerInvariant()) {
+    "1" { $ShouldBuildFrontend = $true }
+    "true" { $ShouldBuildFrontend = $true }
+    "yes" { $ShouldBuildFrontend = $true }
+    "0" { $ShouldBuildFrontend = $false }
+    "false" { $ShouldBuildFrontend = $false }
+    "no" { $ShouldBuildFrontend = $false }
+    "auto" { $ShouldBuildFrontend = (Test-Path $FrontendPkg) }
+    default { throw "BUILD_FRONTEND must be 0, 1, or auto" }
+}
+
+if ($ShouldBuildFrontend) {
     if (-not (Test-Path $FrontendPkg)) {
         throw "frontend/package.json not found: $FrontendDir"
     }

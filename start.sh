@@ -8,7 +8,7 @@ APP_MODULE="${APP_MODULE:-backend.main:app}"
 BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 INSTALL_DEPS="${INSTALL_DEPS:-0}"
-BUILD_FRONTEND="${BUILD_FRONTEND:-0}"
+BUILD_FRONTEND="${BUILD_FRONTEND:-auto}"
 NPM_BIN="${NPM_BIN:-npm}"
 
 if [ -x "$ROOT_DIR/backend/.venv/bin/python" ]; then
@@ -33,9 +33,33 @@ if [ "$INSTALL_DEPS" = "1" ]; then
   fi
 fi
 
-if [ "$BUILD_FRONTEND" = "1" ]; then
+SHOULD_BUILD_FRONTEND=0
+case "$BUILD_FRONTEND" in
+  1|true|TRUE|yes|YES)
+    SHOULD_BUILD_FRONTEND=1
+    ;;
+  0|false|FALSE|no|NO)
+    SHOULD_BUILD_FRONTEND=0
+    ;;
+  auto|AUTO)
+    if [ -f "$ROOT_DIR/frontend/package.json" ]; then
+      SHOULD_BUILD_FRONTEND=1
+    fi
+    ;;
+  *)
+    echo "ERROR: BUILD_FRONTEND must be 0, 1, or auto"
+    exit 1
+    ;;
+esac
+
+if [ "$SHOULD_BUILD_FRONTEND" = "1" ]; then
   if [ ! -d "$ROOT_DIR/frontend" ]; then
     echo "ERROR: frontend directory not found"
+    exit 1
+  fi
+  if ! command -v "$NPM_BIN" >/dev/null 2>&1; then
+    echo "ERROR: npm not found but frontend build is enabled"
+    echo "Set BUILD_FRONTEND=0 to skip frontend build if this host only runs backend"
     exit 1
   fi
   echo "[build] Building frontend..."
