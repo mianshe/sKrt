@@ -5,8 +5,9 @@ import hmac
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 from .base import PaymentCreateResult, PaymentNotifyResult, PaymentProvider
@@ -57,6 +58,33 @@ class EasyPayProvider(PaymentProvider):
             "parsed_type": type(parsed).__name__,
         }
 
+    def _extract_script_redirect_response(self, raw_text: str) -> Dict[str, Any] | None:
+        text = (raw_text or "").strip()
+        if not text:
+            return None
+        match = re.search(r"window\.location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        redirect_url = urljoin(f"{self.api_base}/", match.group(1).strip())
+        parsed = urlparse(redirect_url)
+        query = parse_qs(parsed.query)
+        trade_no = ""
+        for key in ("trade_no", "order_no", "out_trade_no"):
+            values = query.get(key)
+            if values and values[0]:
+                trade_no = values[0]
+                break
+        logger.info("easypay returned script redirect payment_url=%s trade_no=%s", redirect_url, trade_no)
+        return {
+            "code": 1,
+            "msg": "success",
+            "trade_no": trade_no,
+            "payurl": redirect_url,
+            "payment_url": redirect_url,
+            "response_mode": "script_redirect",
+            "raw": text[:1000],
+        }
+
     def _post_form(self, endpoint: str, form: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.api_base}/{endpoint.lstrip('/')}"
         body = urlencode({k: str(v) for k, v in form.items() if v is not None}).encode("utf-8")
@@ -76,6 +104,9 @@ class EasyPayProvider(PaymentProvider):
                     return self._normalize_response(json.loads(text[start : end + 1]), text)
                 except Exception:
                     pass
+            redirect_rsp = self._extract_script_redirect_response(text)
+            if redirect_rsp is not None:
+                return redirect_rsp
             logger.warning("easypay returned non-json response: %s", text[:300])
             return {"code": -1, "msg": "invalid_json", "raw": text[:1000]}
 
@@ -122,7 +153,8 @@ class EasyPayProvider(PaymentProvider):
             logger.warning("easypay create order normalized non-dict response order_no=%s type=%s", order_no, type(rsp).__name__)
             rsp = {"code": -1, "msg": "invalid_json", "raw": str(rsp)[:1000]}
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or "")
-        code_url = str(rsp.get("code_url") or rsp.get("qrcode") or rsp.get("payurl") or "")
+        payment_url = str(rsp.get("payment_url") or rsp.get("payurl") or "")
+        code_url = str(rsp.get("code_url") or rsp.get("qrcode") or payment_url or "")
         status_ok = str(rsp.get("code") or "") == "1" or str(rsp.get("msg") or "").lower() in {"success", "ok"}
         if not status_ok or not code_url:
             msg = str(rsp.get("msg") or rsp.get("error") or "easypay_create_failed")
@@ -139,12 +171,13 @@ class EasyPayProvider(PaymentProvider):
             )
             raise RuntimeError(msg)
         logger.info(
-            "easypay create order ok order_no=%s trade_no=%s code_url_present=%s",
+            "easypay create order ok order_no=%s trade_no=%s code_url_present=%s payment_url_present=%s",
             order_no,
             trade_no,
             bool(code_url),
+            bool(payment_url),
         )
-        return PaymentCreateResult(provider_order_id=trade_no, code_url=code_url, raw=rsp)
+        return PaymentCreateResult(provider_order_id=trade_no, code_url=code_url, payment_url=payment_url, raw=rsp)
 
     def verify_notify(self, payload: Dict[str, Any]) -> PaymentNotifyResult:
         self._ensure_enabled()

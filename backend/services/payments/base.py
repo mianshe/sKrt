@@ -9,6 +9,7 @@ class PaymentCreateResult:
     provider_order_id: str
     code_url: str
     raw: Dict[str, Any]
+    payment_url: str = ""
 
 
 @dataclass
@@ -29,4 +30,3 @@ class PaymentProvider:
 
     def refund(self, *, order_no: str, provider_order_id: str = "") -> Dict[str, Any]:
         raise NotImplementedError
-

@@ -29,6 +29,7 @@ type ComplexOcrQuota = {
 type PendingPayOrder = {
   orderNo: string;
   qrImageUrl: string;
+  payPageUrl?: string;
   packKey: "A" | "B" | "C";
   channel: "wechat_native" | "alipay_qr";
 };
@@ -46,6 +47,7 @@ function readPendingPayOrder(): PendingPayOrder | null {
     if (
       typeof parsed?.orderNo !== "string" ||
       typeof parsed?.qrImageUrl !== "string" ||
+      (parsed?.payPageUrl != null && typeof parsed.payPageUrl !== "string") ||
       (parsed?.packKey !== "A" && parsed?.packKey !== "B" && parsed?.packKey !== "C") ||
       (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr")
     ) {
@@ -102,6 +104,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [payChannel, setPayChannel] = useState<"wechat_native" | "alipay_qr">("wechat_native");
   const [orderNo, setOrderNo] = useState("");
   const [orderQrImage, setOrderQrImage] = useState("");
+  const [orderPayPageUrl, setOrderPayPageUrl] = useState("");
   const [statusNotice, setStatusNotice] = useState("");
 
   const accessToken = useAccessToken();
@@ -224,6 +227,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setPayChannel(pending.channel);
       setOrderNo(pending.orderNo);
       setOrderQrImage(pending.qrImageUrl);
+      setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? pending.payPageUrl : "");
       setPayStatus("pending");
       setPayMessage("检测到未完成订单，请继续扫码或等待到账");
       return;
@@ -234,6 +238,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setPayMessage("");
     setOrderNo("");
     setOrderQrImage("");
+    setOrderPayPageUrl("");
   };
 
   useEffect(() => {
@@ -293,6 +298,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     if (!loggedIn) {
       setOrderNo("");
       setOrderQrImage("");
+      setOrderPayPageUrl("");
       setPayStatus("idle");
       return;
     }
@@ -304,6 +310,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setPayChannel(pending.channel);
     setOrderNo(pending.orderNo);
     setOrderQrImage(pending.qrImageUrl);
+    setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? pending.payPageUrl : "");
     setPayStatus("pending");
     setPayMessage("检测到未完成订单，正在自动查询到账状态");
   }, [loggedIn, authSession]);
@@ -354,6 +361,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setPayOpen(false);
       setOrderNo("");
       setOrderQrImage("");
+      setOrderPayPageUrl("");
       setPayStatus("idle");
       setPayMessage("");
     }, 2200);
@@ -510,6 +518,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setStatusNotice("");
     setOrderNo("");
     setOrderQrImage("");
+    setOrderPayPageUrl("");
     clearPendingPayOrder();
 
     try {
@@ -531,14 +540,20 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
       const nextOrderNo = typeof data?.order_no === "string" ? data.order_no : "";
       const nextQrImage = typeof data?.qr_image_url === "string" ? data.qr_image_url : "";
+      const nextPayPageUrl = typeof data?.pay_page_url === "string" ? data.pay_page_url : "";
       setOrderNo(nextOrderNo);
       setOrderQrImage(nextQrImage);
+      setOrderPayPageUrl(nextPayPageUrl);
       setPayStatus("pending");
       setPayMessage(payChannel === "alipay_qr" ? "请使用支付宝扫码完成支付" : "请使用微信扫码完成支付");
-      if (nextOrderNo && nextQrImage) {
+      if (nextPayPageUrl) {
+        setPayMessage("支付页已生成，可直接打开支付页，也可以继续扫码");
+      }
+      if (nextOrderNo && (nextQrImage || nextPayPageUrl)) {
         writePendingPayOrder({
           orderNo: nextOrderNo,
           qrImageUrl: nextQrImage,
+          payPageUrl: nextPayPageUrl,
           packKey: selectedPack.key,
           channel: payChannel,
         });
@@ -728,6 +743,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
           <button className="btn-primary" onClick={createPayOrder} disabled={payStatus === "creating" || payStatus === "pending"}>
             {payStatus === "creating" ? "创建中..." : payStatus === "pending" ? "等待支付..." : "生成二维码"}
           </button>
+          {orderPayPageUrl && payStatus === "pending" && (
+            <button
+              className="rounded-2xl bg-emerald-50 px-3 py-2 text-sm text-emerald-700 ring-1 ring-emerald-200 transition hover:bg-emerald-100"
+              onClick={() => window.open(orderPayPageUrl, "_blank", "noopener,noreferrer")}
+            >
+              打开支付页
+            </button>
+          )}
           {orderNo && payStatus === "pending" && (
             <button
               className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
