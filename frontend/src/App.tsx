@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AuthPanel from "./components/AuthPanel";
 import BottomNav from "./components/BottomNav";
 import GpuQuotaWidget from "./components/GpuQuotaWidget";
@@ -24,6 +24,7 @@ function App() {
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
   const accessToken = useAccessToken();
+  const didInitAuthSyncRef = useRef(false);
 
   const [capacityWarn, setCapacityWarn] = useState<"soft" | "hard" | null>(null);
   const [tapCount, setTapCount] = useState(0);
@@ -64,26 +65,36 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const isInitialSync = !didInitAuthSyncRef.current;
+    didInitAuthSyncRef.current = true;
+
+    const refreshAfterAuthChange = () => {
+      if (cancelled) return;
+      setAuthSession((n) => n + 1);
+      void refreshDocuments();
+    };
 
     const syncAuthState = async () => {
       if (!accessToken) {
-        if (!cancelled) {
-          setAuthSession((n) => n + 1);
-          void refreshDocuments();
+        // 首次挂载时 useDocuments 已经拉过一次列表，这里不再重复请求。
+        if (!isInitialSync) {
+          refreshAfterAuthChange();
         }
         return;
       }
 
-      const verified = await verifyLocalAuthSession(accessToken);
-      if (cancelled) return;
-
-      if (!verified) {
-        setAccessToken(null);
-        return;
+      // 仅在首次加载且本地已存在 token 时做一次服务端校验。
+      // 刚登录成功的 token 不再额外打一遍 /auth/me，减少登录后的等待感。
+      if (isInitialSync) {
+        const verified = await verifyLocalAuthSession(accessToken);
+        if (cancelled) return;
+        if (!verified) {
+          setAccessToken(null);
+          return;
+        }
       }
 
-      setAuthSession((n) => n + 1);
-      void refreshDocuments();
+      refreshAfterAuthChange();
     };
 
     void syncAuthState();
