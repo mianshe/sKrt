@@ -9,14 +9,17 @@ type Props = {
   onAuthed: () => void;
 };
 
+type Mode = "login" | "register" | "reset";
+type Step = "email" | "code";
+
 export default function AuthPanel({ onAuthed }: Props) {
   const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const [mode, setMode] = useState<Mode>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [passwordConfirm, setPasswordConfirm] = useState("");
   const [code, setCode] = useState("");
-  const [step, setStep] = useState<"email" | "code">("email");
+  const [step, setStep] = useState<Step>("email");
   const [msg, setMsg] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -33,6 +36,16 @@ export default function AuthPanel({ onAuthed }: Props) {
   }, [authModalOpen]);
 
   const closeModal = () => setAuthModalOpen(false);
+
+  const switchMode = (next: Mode) => {
+    setMode(next);
+    setStep("email");
+    setCode("");
+    setMsg("");
+    if (next !== "register") {
+      setPasswordConfirm("");
+    }
+  };
 
   const logout = () => {
     setAccessToken(null);
@@ -82,7 +95,7 @@ export default function AuthPanel({ onAuthed }: Props) {
     return true;
   };
 
-  const requestCode = async () => {
+  const requestRegisterCode = async () => {
     if (!validateRegisterPasswords()) return;
 
     setLoading(true);
@@ -150,6 +163,67 @@ export default function AuthPanel({ onAuthed }: Props) {
     }
   };
 
+  const requestResetCode = async () => {
+    setLoading(true);
+    setMsg("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/password/request-reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...withTenantHeaders() },
+        body: JSON.stringify({ email }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "发送失败");
+      }
+      setStep("code");
+      if (data?.dev_code) setMsg(`开发模式验证码：${data.dev_code}`);
+      else setMsg("如果该邮箱已注册，验证码会发送到你的邮箱。");
+    } catch (error) {
+      setMsg(formatApiFetchError(error, "发送重置验证码失败"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const doResetPassword = async () => {
+    if (password.length < 8) {
+      setMsg("新密码至少 8 位");
+      return;
+    }
+    if (password !== passwordConfirm) {
+      setMsg("两次输入的新密码不一致");
+      return;
+    }
+
+    setLoading(true);
+    setMsg("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/password/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...withTenantHeaders() },
+        body: JSON.stringify({ email, password, code }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "重置密码失败");
+      }
+      const data = await response.json();
+      const token = String(data?.access_token || "").trim();
+      if (!token) throw new Error("响应缺少 access_token");
+
+      setAccessToken(token);
+      closeModal();
+      setMsg("密码已重置，并已自动登录");
+      onAuthed();
+    } catch (error) {
+      setMsg(formatApiFetchError(error, "重置密码失败"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (loggedIn) {
     return (
       <div className="rounded-xl border border-slate-200 bg-white/90 px-3 py-2 text-sm shadow-sm">
@@ -170,25 +244,23 @@ export default function AuthPanel({ onAuthed }: Props) {
           <button
             type="button"
             className={`rounded-lg px-2 py-1 ${mode === "login" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-            onClick={() => {
-              setMode("login");
-              setMsg("");
-              setPasswordConfirm("");
-            }}
+            onClick={() => switchMode("login")}
           >
             登录
           </button>
           <button
             type="button"
             className={`rounded-lg px-2 py-1 ${mode === "register" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-            onClick={() => {
-              setMode("register");
-              setStep("email");
-              setMsg("");
-              setPasswordConfirm("");
-            }}
+            onClick={() => switchMode("register")}
           >
             注册
+          </button>
+          <button
+            type="button"
+            className={`rounded-lg px-2 py-1 ${mode === "reset" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+            onClick={() => switchMode("reset")}
+          >
+            找回密码
           </button>
         </div>
         <button
@@ -204,7 +276,9 @@ export default function AuthPanel({ onAuthed }: Props) {
       <label className="block text-xs text-slate-500">邮箱</label>
       <input className="input mb-2 w-full" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" />
 
-      <label className="block text-xs text-slate-500">密码（至少 8 位）</label>
+      <label className="block text-xs text-slate-500">
+        {mode === "reset" ? "新密码（至少 8 位）" : "密码（至少 8 位）"}
+      </label>
       <input
         className="input mb-2 w-full"
         type="password"
@@ -213,9 +287,9 @@ export default function AuthPanel({ onAuthed }: Props) {
         autoComplete={mode === "login" ? "current-password" : "new-password"}
       />
 
-      {mode === "register" && (
+      {mode !== "login" && (
         <>
-          <label className="block text-xs text-slate-500">确认密码</label>
+          <label className="block text-xs text-slate-500">{mode === "reset" ? "确认新密码" : "确认密码"}</label>
           <input
             className="input mb-2 w-full"
             type="password"
@@ -226,7 +300,7 @@ export default function AuthPanel({ onAuthed }: Props) {
         </>
       )}
 
-      {mode === "register" && step === "code" && (
+      {(mode === "register" || mode === "reset") && step === "code" && (
         <>
           <label className="block text-xs text-slate-500">验证码</label>
           <input className="input mb-2 w-full" value={code} onChange={(e) => setCode(e.target.value)} inputMode="numeric" />
@@ -238,18 +312,38 @@ export default function AuthPanel({ onAuthed }: Props) {
       <div className="flex flex-wrap gap-2">
         {mode === "login" ? (
           <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={doLogin}>
-            {loading ? "..." : "登录"}
+            {loading ? "处理中..." : "登录"}
           </button>
+        ) : mode === "register" ? (
+          step === "email" ? (
+            <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={requestRegisterCode}>
+              {loading ? "处理中..." : "发送验证码"}
+            </button>
+          ) : (
+            <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={doRegister}>
+              {loading ? "处理中..." : "完成注册"}
+            </button>
+          )
         ) : step === "email" ? (
-          <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={requestCode}>
-            {loading ? "..." : "发送验证码"}
+          <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={requestResetCode}>
+            {loading ? "处理中..." : "发送重置验证码"}
           </button>
         ) : (
-          <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={doRegister}>
-            {loading ? "..." : "完成注册"}
+          <button type="button" disabled={loading} className="btn-primary disabled:opacity-50" onClick={doResetPassword}>
+            {loading ? "处理中..." : "重置密码"}
           </button>
         )}
       </div>
+
+      {mode === "login" && (
+        <button
+          type="button"
+          className="mt-3 text-xs text-violet-600 hover:text-violet-700"
+          onClick={() => switchMode("reset")}
+        >
+          忘记密码？
+        </button>
+      )}
     </>
   );
 
@@ -270,7 +364,7 @@ export default function AuthPanel({ onAuthed }: Props) {
       >
         <div role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
           <p id="auth-modal-title" className="sr-only">
-            登录或注册
+            登录、注册或找回密码
           </p>
           {formInner}
         </div>

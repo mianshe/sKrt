@@ -78,6 +78,14 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
+def _resolve_data_dir(root_dir: Path) -> Path:
+    raw = (os.getenv("APP_DATA_DIR") or os.getenv("XM_DATA_DIR") or "data").strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = root_dir / path
+    return path.resolve()
+
+
 def _load_project_env(root_dir: Path) -> None:
     env_path = root_dir / ".env"
     if not env_path.exists():
@@ -105,7 +113,7 @@ def _load_project_env(root_dir: Path) -> None:
 
 
 _load_project_env(ROOT_DIR)
-DATA_DIR = ROOT_DIR / "data"
+DATA_DIR = _resolve_data_dir(ROOT_DIR)
 UPLOAD_DIR = DATA_DIR / "uploads"
 CHUNK_TEMP_DIR = DATA_DIR / "chunk_uploads"
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -1334,6 +1342,15 @@ def _init_runtime_tables() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_password_reset_codes (
+                email TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                expires_at_unix REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS signup_ip_free_ocr_grants (
                 client_ip TEXT NOT NULL,
                 email TEXT NOT NULL,
@@ -2266,12 +2283,82 @@ async def auth_login(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     conn = _conn()
     try:
         row = conn.execute("SELECT id, password_hash FROM app_users WHERE email = ?", (email,)).fetchone()
+        if row and local_auth_service.verify_password(password, str(row["password_hash"])):
+            if local_auth_service.password_hash_needs_rehash(str(row["password_hash"])):
+                conn.execute(
+                    "UPDATE app_users SET password_hash = ? WHERE id = ?",
+                    (local_auth_service.hash_password(password), str(row["id"])),
+                )
+                conn.commit()
+        else:
+            row = None
     finally:
         conn.close()
-    if not row or not local_auth_service.verify_password(password, str(row["password_hash"])):
+    if not row:
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
     uid = str(row["id"])
     token = local_auth_service.issue_local_access_token(user_id=uid, email=email)
+    return {"ok": True, "access_token": token, "token_type": "Bearer"}
+
+
+@app.post("/auth/password/request-reset")
+async def auth_password_request_reset(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if not local_auth_service.local_jwt_enabled():
+        raise HTTPException(status_code=503, detail="未配置 AUTH_LOCAL_JWT_SECRET，无法使用密码重置")
+    email = local_auth_service.normalize_email(str(body.get("email") or ""))
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="邮箱无效")
+    code = f"{secrets.randbelow(900000) + 100000:06d}"
+    echo = (os.getenv("AUTH_PASSWORD_RESET_ECHO_CODE", "0") or "0").strip() in {"1", "true", "yes", "on"}
+    row = None
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT id FROM app_users WHERE email = ?", (email,)).fetchone()
+        if row:
+            local_auth_service.store_password_reset_code(conn, email, code)
+            conn.commit()
+    finally:
+        conn.close()
+    if row:
+        try:
+            local_auth_service.send_password_reset_code_email(email, code)
+        except Exception as exc:
+            if echo:
+                return {"ok": True, "expires_in_sec": 600, "dev_code": code, "warning": "SMTP 未配置，仅开发环境返回 dev_code"}
+            logger.exception("password reset email send failed")
+            raise HTTPException(status_code=502, detail=f"邮件发送失败: {exc}") from exc
+    out: Dict[str, Any] = {"ok": True, "expires_in_sec": 600}
+    if row and echo:
+        out["dev_code"] = code
+    return out
+
+
+@app.post("/auth/password/reset")
+async def auth_password_reset(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    if not local_auth_service.local_jwt_enabled():
+        raise HTTPException(status_code=503, detail="未配置 AUTH_LOCAL_JWT_SECRET")
+    email = local_auth_service.normalize_email(str(body.get("email") or ""))
+    password = str(body.get("password") or "")
+    code = str(body.get("code") or "").strip()
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="邮箱无效")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="密码至少 8 位")
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT id FROM app_users WHERE email = ?", (email,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="账号不存在")
+        if not local_auth_service.verify_password_reset_code(conn, email, code):
+            raise HTTPException(status_code=400, detail="验证码错误或已过期")
+        conn.execute(
+            "UPDATE app_users SET password_hash = ? WHERE id = ?",
+            (local_auth_service.hash_password(password), str(row["id"])),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    token = local_auth_service.issue_local_access_token(user_id=str(row["id"]), email=email)
     return {"ok": True, "access_token": token, "token_type": "Bearer"}
 
 

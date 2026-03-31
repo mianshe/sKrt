@@ -1,10 +1,11 @@
-"""邮箱注册、登录与本地 HS256 JWT（与外部 JWKS 可并存）。"""
+"""本地邮箱注册、登录、找回密码与 HS256 JWT。"""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import os
 import secrets
+import sqlite3
 import time
 from typing import Any, Dict
 
@@ -13,9 +14,17 @@ import jwt
 from backend.services.email_sender import send_plain_email
 
 
+def password_pbkdf2_iterations() -> int:
+    try:
+        return max(120_000, int((os.getenv("AUTH_PASSWORD_PBKDF2_ITERATIONS") or "200000").strip() or "200000"))
+    except ValueError:
+        return 200_000
+
+
 def _pbkdf2_hash(password: str, salt: bytes) -> str:
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
-    return salt.hex() + "$" + dk.hex()
+    iterations = password_pbkdf2_iterations()
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
 
 
 def hash_password(password: str) -> str:
@@ -23,14 +32,37 @@ def hash_password(password: str) -> str:
     return _pbkdf2_hash(password, salt)
 
 
+def _parse_password_hash(stored: str) -> tuple[int, bytes, str]:
+    parts = str(stored or "").split("$")
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+        try:
+            return int(parts[1]), bytes.fromhex(parts[2]), parts[3]
+        except Exception as exc:
+            raise ValueError("invalid password hash") from exc
+    if len(parts) == 2:
+        # 兼容旧格式：salt$dk，历史固定 310000 次。
+        try:
+            return 310_000, bytes.fromhex(parts[0]), parts[1]
+        except Exception as exc:
+            raise ValueError("invalid legacy password hash") from exc
+    raise ValueError("unsupported password hash format")
+
+
 def verify_password(password: str, stored: str) -> bool:
     try:
-        salt_hex, dk_hex = stored.split("$", 1)
-        salt = bytes.fromhex(salt_hex)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+        iterations, salt, dk_hex = _parse_password_hash(stored)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return hmac.compare_digest(dk.hex(), dk_hex)
     except Exception:
         return False
+
+
+def password_hash_needs_rehash(stored: str) -> bool:
+    try:
+        iterations, _, _ = _parse_password_hash(stored)
+        return iterations != password_pbkdf2_iterations() or not str(stored or "").startswith("pbkdf2_sha256$")
+    except Exception:
+        return True
 
 
 def local_jwt_secret() -> str:
@@ -92,7 +124,6 @@ def decode_local_access_token(token: str) -> Dict[str, Any]:
 
 
 def signup_free_calls_limit() -> int:
-    """注册赠送的外部 OCR 次数（与余额扣减单位一致）。兼容旧环境变量名 *_PAGES。"""
     try:
         return max(
             0,
@@ -142,6 +173,22 @@ def store_registration_code(conn: sqlite3.Connection, email: str, code: str, ttl
     )
 
 
+def store_password_reset_code(conn: sqlite3.Connection, email: str, code: str, ttl_sec: int = 600) -> None:
+    import hashlib as hl
+
+    em = normalize_email(email)
+    code_hash = hl.sha256(code.encode("utf-8")).hexdigest()
+    exp = time.time() + ttl_sec
+    conn.execute("DELETE FROM app_password_reset_codes WHERE email = ?", (em,))
+    conn.execute(
+        """
+        INSERT INTO app_password_reset_codes(email, code_hash, expires_at_unix)
+        VALUES(?,?,?)
+        """,
+        (em, code_hash, exp),
+    )
+
+
 def verify_registration_code(conn: sqlite3.Connection, email: str, code: str) -> bool:
     import hashlib as hl
 
@@ -159,6 +206,26 @@ def verify_registration_code(conn: sqlite3.Connection, email: str, code: str) ->
     if not hmac.compare_digest(expect, got):
         return False
     conn.execute("DELETE FROM app_registration_codes WHERE email = ?", (em,))
+    return True
+
+
+def verify_password_reset_code(conn: sqlite3.Connection, email: str, code: str) -> bool:
+    import hashlib as hl
+
+    em = normalize_email(email)
+    row = conn.execute(
+        "SELECT code_hash, expires_at_unix FROM app_password_reset_codes WHERE email = ?",
+        (em,),
+    ).fetchone()
+    if not row:
+        return False
+    if float(row[1]) < time.time():
+        return False
+    expect = row[0]
+    got = hl.sha256(code.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(expect, got):
+        return False
+    conn.execute("DELETE FROM app_password_reset_codes WHERE email = ?", (em,))
     return True
 
 
@@ -188,13 +255,12 @@ def record_signup_grant(conn: Any, client_ip: str, email: str) -> None:
 
 
 def decide_signup_free_calls(conn: sqlite3.Connection, client_ip: str, email: str) -> int:
-    """同一 IP 终身最多 SIGNUP_MAX_FREE_GRANTS_PER_IP_LIFETIME 个不同邮箱各送一份。"""
     limit_ip = signup_max_free_grants_per_ip()
     calls = signup_free_calls_limit()
     if calls <= 0:
         return 0
     if email_already_granted_on_ip(conn, client_ip, email):
-        return calls  # 同一邮箱重注册仍按「已有行」处理，见 register_user
+        return calls
     n = count_distinct_emails_granted_for_ip(conn, client_ip)
     if n >= limit_ip:
         return 0
@@ -203,8 +269,16 @@ def decide_signup_free_calls(conn: sqlite3.Connection, client_ip: str, email: st
 
 def send_register_code_email(to_email: str, code: str) -> None:
     send_plain_email(
-        subject="资料解析 — 注册验证码",
+        subject="资料解析 - 注册验证码",
         body=f"您的验证码是：{code}\n10 分钟内有效。\n如非本人操作请忽略。",
+        to_email=to_email,
+    )
+
+
+def send_password_reset_code_email(to_email: str, code: str) -> None:
+    send_plain_email(
+        subject="资料解析 - 重置密码验证码",
+        body=f"您的密码重置验证码是：{code}\n10 分钟内有效。\n如非本人操作请忽略。",
         to_email=to_email,
     )
 
