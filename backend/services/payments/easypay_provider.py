@@ -67,6 +67,35 @@ class EasyPayProvider(PaymentProvider):
             return text
         return urljoin(f"{self.api_base}/", text.lstrip("/"))
 
+    def _extract_intermediate_scheme(self, code_url: str) -> str:
+        resolved = self._resolve_url(code_url)
+        if not resolved:
+            return ""
+        parsed = urlparse(resolved)
+        if parsed.netloc.lower() not in {"www.ezfpy.cn", "ezfpy.cn"} or parsed.path != "/url.php":
+            return ""
+        try:
+            req = UrlRequest(url=resolved, method="GET")
+            req.add_header("User-Agent", "Mozilla/5.0")
+            with urlopen(req, timeout=15) as resp:  # nosec B310
+                html = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            logger.exception("easypay intermediate code fetch failed url=%s", resolved)
+            return ""
+        patterns = [
+            r"url_scheme\s*=\s*['\"]([^'\"]+)['\"]",
+            r"((?:alipayqr|alipay|wxp|weixin)://[^'\"<\s]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, flags=re.IGNORECASE)
+            if match:
+                scheme = match.group(1).strip()
+                if scheme:
+                    logger.info("easypay extracted intermediate scheme from url.php scheme_prefix=%s", scheme.split(':', 1)[0])
+                    return scheme
+        logger.warning("easypay intermediate code page had no extractable scheme url=%s", resolved)
+        return ""
+
     def _extract_script_redirect_response(self, raw_text: str) -> Dict[str, Any] | None:
         text = (raw_text or "").strip()
         if not text:
@@ -164,6 +193,10 @@ class EasyPayProvider(PaymentProvider):
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or rsp.get("out_trade_no") or "")
         qr_image_url = self._resolve_url(rsp.get("code_url") or "")
         qrcode = self._resolve_url(rsp.get("qrcode") or "")
+        extracted_scheme = self._extract_intermediate_scheme(qrcode or qr_image_url)
+        if extracted_scheme:
+            qrcode = extracted_scheme
+            qr_image_url = ""
         status_ok = self._api_response_ok(rsp)
         if not status_ok or (not qrcode and not qr_image_url):
             raw_preview = str(rsp.get("raw") or "").strip().replace("\r", " ").replace("\n", " ")
@@ -232,6 +265,10 @@ class EasyPayProvider(PaymentProvider):
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or "")
         payment_url = self._resolve_url(rsp.get("payment_url") or rsp.get("payurl") or "")
         code_url = self._resolve_url(rsp.get("code_url") or rsp.get("qrcode") or payment_url or "")
+        extracted_scheme = self._extract_intermediate_scheme(code_url)
+        if extracted_scheme:
+            code_url = extracted_scheme
+            payment_url = extracted_scheme
         status_ok = str(rsp.get("code") or "") == "1" or str(rsp.get("msg") or "").lower() in {"success", "ok"}
         if not status_ok or not code_url:
             msg = str(rsp.get("msg") or rsp.get("error") or "easypay_create_failed")
