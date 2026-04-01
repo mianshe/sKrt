@@ -58,6 +58,15 @@ class EasyPayProvider(PaymentProvider):
             "parsed_type": type(parsed).__name__,
         }
 
+    def _resolve_url(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        if lowered.startswith(("http://", "https://", "wxp://", "weixin://", "alipay://")):
+            return text
+        return urljoin(f"{self.api_base}/", text.lstrip("/"))
+
     def _extract_script_redirect_response(self, raw_text: str) -> Dict[str, Any] | None:
         text = (raw_text or "").strip()
         if not text:
@@ -110,19 +119,87 @@ class EasyPayProvider(PaymentProvider):
             logger.warning("easypay returned non-json response: %s", text[:300])
             return {"code": -1, "msg": "invalid_json", "raw": text[:1000]}
 
-    def create_order(
+    def _api_response_ok(self, rsp: Dict[str, Any]) -> bool:
+        code = str(rsp.get("code") or "").strip()
+        msg = str(rsp.get("msg") or "").strip().lower()
+        if code in {"200", "1"}:
+            return True
+        return "成功" in str(rsp.get("msg") or "") or msg in {"success", "ok"}
+
+    def _create_order_via_mapi(
         self,
         *,
         order_no: str,
-        amount_fen: int,
-        channel: str,
+        amount_yuan: str,
+        pay_type: str,
         subject: str,
         notify_url: str,
+        return_url: str,
     ) -> PaymentCreateResult:
-        self._ensure_enabled()
-        amount_yuan = f"{max(1, int(amount_fen)) / 100:.2f}"
-        pay_type = "wxpay" if channel == "wechat_native" else "alipay"
-        return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
+        form: Dict[str, Any] = {
+            "pid": self.pid,
+            "type": pay_type,
+            "out_trade_no": order_no,
+            "notify_url": notify_url,
+            "return_url": return_url,
+            "name": subject,
+            "money": amount_yuan,
+            "format": "json",
+        }
+        form["sign"] = self._sign(form)
+        form["sign_type"] = "MD5"
+        logger.info(
+            "easypay create order try mapi order_no=%s api_base=%s pid=%s type=%s amount=%s notify_url=%s return_url=%s",
+            order_no,
+            self.api_base,
+            self._masked_pid(),
+            pay_type,
+            amount_yuan,
+            notify_url,
+            return_url,
+        )
+        rsp = self._post_form("mapi.php", form)
+        if not isinstance(rsp, dict):
+            rsp = {"code": -1, "msg": "invalid_json", "raw": str(rsp)[:1000]}
+        trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or rsp.get("out_trade_no") or "")
+        qr_image_url = self._resolve_url(rsp.get("code_url") or "")
+        qrcode = self._resolve_url(rsp.get("qrcode") or "")
+        status_ok = self._api_response_ok(rsp)
+        if not status_ok or (not qrcode and not qr_image_url):
+            raw_preview = str(rsp.get("raw") or "").strip().replace("\r", " ").replace("\n", " ")
+            logger.warning(
+                "easypay mapi create order failed order_no=%s code=%s msg=%s trade_no=%s raw=%s",
+                order_no,
+                str(rsp.get("code") or ""),
+                str(rsp.get("msg") or rsp.get("error") or ""),
+                trade_no,
+                raw_preview[:300],
+            )
+            raise RuntimeError(str(rsp.get("msg") or rsp.get("error") or "easypay_mapi_create_failed"))
+        logger.info(
+            "easypay mapi create order ok order_no=%s trade_no=%s qrcode_present=%s qr_image_present=%s",
+            order_no,
+            trade_no,
+            bool(qrcode),
+            bool(qr_image_url),
+        )
+        return PaymentCreateResult(
+            provider_order_id=trade_no,
+            code_url=qrcode,
+            qr_image_url=qr_image_url,
+            raw=rsp,
+        )
+
+    def _create_order_via_submit(
+        self,
+        *,
+        order_no: str,
+        amount_yuan: str,
+        pay_type: str,
+        subject: str,
+        notify_url: str,
+        return_url: str,
+    ) -> PaymentCreateResult:
         form: Dict[str, Any] = {
             "pid": self.pid,
             "type": pay_type,
@@ -139,7 +216,7 @@ class EasyPayProvider(PaymentProvider):
         form["sign"] = self._sign(form)
         form["sign_type"] = "MD5"
         logger.info(
-            "easypay create order start order_no=%s api_base=%s pid=%s type=%s amount=%s notify_url=%s return_url=%s",
+            "easypay create order fallback submit order_no=%s api_base=%s pid=%s type=%s amount=%s notify_url=%s return_url=%s",
             order_no,
             self.api_base,
             self._masked_pid(),
@@ -153,8 +230,8 @@ class EasyPayProvider(PaymentProvider):
             logger.warning("easypay create order normalized non-dict response order_no=%s type=%s", order_no, type(rsp).__name__)
             rsp = {"code": -1, "msg": "invalid_json", "raw": str(rsp)[:1000]}
         trade_no = str(rsp.get("trade_no") or rsp.get("order_no") or "")
-        payment_url = str(rsp.get("payment_url") or rsp.get("payurl") or "")
-        code_url = str(rsp.get("code_url") or rsp.get("qrcode") or payment_url or "")
+        payment_url = self._resolve_url(rsp.get("payment_url") or rsp.get("payurl") or "")
+        code_url = self._resolve_url(rsp.get("code_url") or rsp.get("qrcode") or payment_url or "")
         status_ok = str(rsp.get("code") or "") == "1" or str(rsp.get("msg") or "").lower() in {"success", "ok"}
         if not status_ok or not code_url:
             msg = str(rsp.get("msg") or rsp.get("error") or "easypay_create_failed")
@@ -162,7 +239,7 @@ class EasyPayProvider(PaymentProvider):
             if msg == "invalid_json" and raw_preview:
                 msg = f"invalid_json: {raw_preview[:160]}"
             logger.warning(
-                "easypay create order failed order_no=%s code=%s msg=%s trade_no=%s raw=%s",
+                "easypay submit create order failed order_no=%s code=%s msg=%s trade_no=%s raw=%s",
                 order_no,
                 str(rsp.get("code") or ""),
                 msg,
@@ -171,13 +248,46 @@ class EasyPayProvider(PaymentProvider):
             )
             raise RuntimeError(msg)
         logger.info(
-            "easypay create order ok order_no=%s trade_no=%s code_url_present=%s payment_url_present=%s",
+            "easypay submit create order ok order_no=%s trade_no=%s code_url_present=%s payment_url_present=%s",
             order_no,
             trade_no,
             bool(code_url),
             bool(payment_url),
         )
         return PaymentCreateResult(provider_order_id=trade_no, code_url=code_url, payment_url=payment_url, raw=rsp)
+
+    def create_order(
+        self,
+        *,
+        order_no: str,
+        amount_fen: int,
+        channel: str,
+        subject: str,
+        notify_url: str,
+    ) -> PaymentCreateResult:
+        self._ensure_enabled()
+        amount_yuan = f"{max(1, int(amount_fen)) / 100:.2f}"
+        pay_type = "wxpay" if channel == "wechat_native" else "alipay"
+        return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
+        try:
+            return self._create_order_via_mapi(
+                order_no=order_no,
+                amount_yuan=amount_yuan,
+                pay_type=pay_type,
+                subject=subject,
+                notify_url=notify_url,
+                return_url=return_url,
+            )
+        except Exception as exc:
+            logger.warning("easypay mapi create order fallback to submit order_no=%s reason=%s", order_no, exc)
+        return self._create_order_via_submit(
+            order_no=order_no,
+            amount_yuan=amount_yuan,
+            pay_type=pay_type,
+            subject=subject,
+            notify_url=notify_url,
+            return_url=return_url,
+        )
 
     def verify_notify(self, payload: Dict[str, Any]) -> PaymentNotifyResult:
         self._ensure_enabled()

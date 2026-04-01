@@ -2515,8 +2515,10 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     finally:
         conn.close()
     code_url = str(created_rsp.code_url or "")
-    pay_page_url = str(created_rsp.payment_url or code_url or "")
-    qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}" if code_url else ""
+    pay_page_url = str(created_rsp.payment_url or "")
+    qr_image_url = str(created_rsp.qr_image_url or "")
+    if not qr_image_url and code_url:
+        qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}"
     return {
         "ok": True,
         "order_no": order_no,

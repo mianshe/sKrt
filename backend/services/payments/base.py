@@ -10,6 +10,7 @@ class PaymentCreateResult:
     code_url: str
     raw: Dict[str, Any]
     payment_url: str = ""
+    qr_image_url: str = ""
 
 
 @dataclass
