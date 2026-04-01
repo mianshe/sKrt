@@ -57,7 +57,8 @@ from backend.services import gpu_ocr_billing
 from backend.services import ocr_token_billing
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
-from backend.services.payments.easypay_provider import EasyPayProvider
+from backend.services.payments.base import PaymentProvider
+from backend.services.payments.factory import get_payment_provider
 from backend.services.runpod_client import runpod_enabled, submit_ingestion_job
 from backend.services.gpu_autostart_cloud import (
     gpu_autostart_enabled,
@@ -1028,8 +1029,10 @@ def _init_db() -> None:
                 pages INTEGER NOT NULL DEFAULT 0,
                 amount_cny REAL NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
-                provider TEXT NOT NULL DEFAULT 'payjs',
+                provider TEXT NOT NULL DEFAULT 'easypay',
                 channel TEXT NOT NULL DEFAULT 'wechat_native',
+                provider_order_id TEXT DEFAULT NULL,
+                provider_transaction_id TEXT DEFAULT NULL,
                 payjs_order_id TEXT DEFAULT NULL,
                 payjs_transaction_id TEXT DEFAULT NULL,
                 credited_pages INTEGER NOT NULL DEFAULT 0,
@@ -1042,6 +1045,11 @@ def _init_db() -> None:
             )
             """
         )
+        pay_order_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pay_orders)").fetchall()}
+        if "provider_order_id" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN provider_order_id TEXT DEFAULT NULL")
+        if "provider_transaction_id" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN provider_transaction_id TEXT DEFAULT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_lookup ON pay_orders(order_no, tenant_id, client_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_status ON pay_orders(status, created_at)")
         # PayJS 回调审计日志
@@ -1049,7 +1057,7 @@ def _init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS pay_callbacks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider TEXT NOT NULL DEFAULT 'payjs',
+                provider TEXT NOT NULL DEFAULT 'easypay',
                 event_type TEXT NOT NULL DEFAULT 'notify',
                 order_no TEXT NOT NULL DEFAULT '',
                 payload_text TEXT NOT NULL DEFAULT '',
@@ -1682,11 +1690,8 @@ def _new_order_no() -> str:
     return f"XM{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
 
 
-def _get_payment_provider() -> EasyPayProvider:
-    provider = _pay_provider_name()
-    if provider == "easypay":
-        return EasyPayProvider()
-    raise HTTPException(status_code=503, detail=f"不支持的支付通道: {provider}")
+def _get_payment_provider() -> PaymentProvider:
+    return get_payment_provider(_pay_provider_name())
 
 
 def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: str) -> Dict[str, Any]:
@@ -1768,13 +1773,15 @@ def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", provider
             UPDATE pay_orders
             SET status='paid',
                 credited_pages=?,
+                provider_transaction_id=COALESCE(NULLIF(?, ''), provider_transaction_id),
+                provider_order_id=COALESCE(NULLIF(?, ''), provider_order_id),
                 payjs_transaction_id=COALESCE(NULLIF(?, ''), payjs_transaction_id),
                 payjs_order_id=COALESCE(NULLIF(?, ''), payjs_order_id),
                 paid_at=CURRENT_TIMESTAMP,
                 updated_at=CURRENT_TIMESTAMP
             WHERE order_no=?
             """,
-            (pages, transaction_id, provider_order_id, order_no),
+            (pages, transaction_id, provider_order_id, transaction_id, provider_order_id, order_no),
         )
         conn.commit()
         row2 = conn.execute("SELECT * FROM pay_orders WHERE order_no=?", (order_no,)).fetchone()
@@ -2504,12 +2511,18 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     except Exception as exc:
         logger.exception("create payment order failed provider=%s order_no=%s channel=%s", _pay_provider_name(), order_no, channel)
         raise HTTPException(status_code=502, detail=f"支付下单失败: {exc}")
-    payjs_order_id = str(created_rsp.provider_order_id or "")
+    provider_order_id = str(created_rsp.provider_order_id or "")
     conn = _conn()
     try:
         conn.execute(
-            "UPDATE pay_orders SET payjs_order_id=?, updated_at=CURRENT_TIMESTAMP WHERE order_no=?",
-            (payjs_order_id, order_no),
+            """
+            UPDATE pay_orders
+            SET provider_order_id=COALESCE(NULLIF(?, ''), provider_order_id),
+                payjs_order_id=COALESCE(NULLIF(?, ''), payjs_order_id),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE order_no=?
+            """,
+            (provider_order_id, provider_order_id, order_no),
         )
         conn.commit()
     finally:
@@ -2528,6 +2541,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         "pages": calls,
         "amount_cny": amount_cny,
         "status": "pending",
+        "provider": _pay_provider_name(),
         "code_url": code_url,
         "pay_page_url": pay_page_url,
         "qr_image_url": qr_image_url,
@@ -2546,6 +2560,7 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
     return {
         "ok": True,
         "order_no": str(order.get("order_no") or ""),
+        "provider": str(order.get("provider") or _pay_provider_name()),
         "status": str(order.get("status") or "pending"),
         "channel": str(order.get("channel") or "wechat_native"),
         "refund_status": str(order.get("refund_status") or "none"),
@@ -2617,9 +2632,9 @@ async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRe
     if str(order.get("tenant_id")) != tenant_id or str(order.get("client_id")) != client_id:
         raise HTTPException(status_code=403, detail="订单不属于当前用户")
     provider = _get_payment_provider()
-    payjs_order_id = str(order.get("payjs_order_id") or "")
+    provider_order_id = str(order.get("provider_order_id") or order.get("payjs_order_id") or "")
     try:
-        provider.refund(order_no=order_no, provider_order_id=payjs_order_id)
+        provider.refund(order_no=order_no, provider_order_id=provider_order_id)
     except Exception:
         logger.exception("payment refund api failed, continue with local settlement")
     new_order = _refund_order_pages(order_no)
