@@ -565,6 +565,17 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
   };
 
+  const recreatePayOrder = () => {
+    clearPendingPayOrder();
+    setOrderNo("");
+    setOrderQrImage("");
+    setOrderPayPageUrl("");
+    setPayStatus("idle");
+    setPayMessage("已清除旧订单，正在重新创建");
+    setStatusNotice("");
+    void createPayOrder();
+  };
+
   return (
     <>
       <div className="flex flex-wrap items-center justify-end gap-1.5 text-right text-[11px] text-slate-500">
@@ -749,6 +760,14 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
               onClick={() => window.open(orderPayPageUrl, "_blank", "noopener,noreferrer")}
             >
               打开支付页
+            </button>
+          )}
+          {orderNo && payStatus === "pending" && (
+            <button
+              className="rounded-2xl bg-amber-50 px-3 py-2 text-sm text-amber-700 ring-1 ring-amber-200 transition hover:bg-amber-100"
+              onClick={recreatePayOrder}
+            >
+              重新下单
             </button>
           )}
           {orderNo && payStatus === "pending" && (
