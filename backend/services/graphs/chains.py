@@ -37,12 +37,22 @@ class AgentChains:
         sections = result.get("sections", [])
         return sections if isinstance(sections, list) else []
 
-    async def run_chat_graph(self, query: str, discipline: str, mode: str, tenant_id: str = "public") -> Dict[str, Any]:
+    async def run_chat_graph(
+        self,
+        query: str,
+        discipline: str,
+        mode: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+    ) -> Dict[str, Any]:
         initial: GraphState = {
             "query": query,
             "discipline": discipline,
             "mode": mode,
             "tenant_id": tenant_id,
+            "billing_client_id": billing_client_id,
+            "billing_exempt": billing_exempt,
             "top_k": 6,
             "agent_trace": [],
         }
@@ -75,6 +85,8 @@ class AgentChains:
         discipline: str,
         document_id: int | None = None,
         tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
         summary_debug_passthrough: bool = False,
         summary_compact_level: int = 1,
         summary_mode: str = "fast",
@@ -83,6 +95,8 @@ class AgentChains:
             "query": query,
             "discipline": discipline,
             "tenant_id": tenant_id,
+            "billing_client_id": billing_client_id,
+            "billing_exempt": billing_exempt,
             "top_k": 8,
             "max_qa_pairs": 3,
             "summary_debug_passthrough": bool(summary_debug_passthrough),
@@ -119,6 +133,8 @@ class AgentChains:
         discipline: str,
         document_id: int | None = None,
         tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
         report_mode: str = "full",
         summary_compact_level: int = 1,
     ) -> Dict[str, Any]:
@@ -126,6 +142,8 @@ class AgentChains:
             "query": query,
             "discipline": discipline,
             "tenant_id": tenant_id,
+            "billing_client_id": billing_client_id,
+            "billing_exempt": billing_exempt,
             "top_k": 16,
             "summary_mode": "full",
             "summary_compact_level": int(summary_compact_level),
@@ -153,11 +171,21 @@ class AgentChains:
         )
         return dict(result)
 
-    async def run_exam_graph(self, query: str, discipline: str, tenant_id: str = "public", question_type: str = "standard") -> Dict[str, Any]:
+    async def run_exam_graph(
+        self,
+        query: str,
+        discipline: str,
+        tenant_id: str = "public",
+        question_type: str = "standard",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+    ) -> Dict[str, Any]:
         initial: GraphState = {
             "query": query,
             "discipline": discipline,
             "tenant_id": tenant_id,
+            "billing_client_id": billing_client_id,
+            "billing_exempt": billing_exempt,
             "top_k": 4,
             "agent_trace": [],
             "question_type": question_type,

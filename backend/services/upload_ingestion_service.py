@@ -25,6 +25,7 @@ from backend.services.r2_storage import R2StorageConfig, download_to_file as r2_
 from backend.services.upload_load_control import log_ingestion_event
 from backend.services import gpu_ocr_billing
 from backend.services import ocr_token_billing
+from backend.services import embedding_token_billing
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -169,6 +170,8 @@ class UploadIngestionService:
                 ("ocr_provider", "ALTER TABLE upload_tasks ADD COLUMN ocr_provider TEXT"),
                 ("ocr_call_units", "ALTER TABLE upload_tasks ADD COLUMN ocr_call_units INTEGER NOT NULL DEFAULT 0"),
                 ("ocr_billable_tokens", "ALTER TABLE upload_tasks ADD COLUMN ocr_billable_tokens INTEGER NOT NULL DEFAULT 0"),
+                ("embedding_provider", "ALTER TABLE upload_tasks ADD COLUMN embedding_provider TEXT"),
+                ("embedding_billable_tokens", "ALTER TABLE upload_tasks ADD COLUMN embedding_billable_tokens INTEGER NOT NULL DEFAULT 0"),
                 ("extract_started_at", "ALTER TABLE upload_tasks ADD COLUMN extract_started_at TEXT"),
                 ("extract_finished_at", "ALTER TABLE upload_tasks ADD COLUMN extract_finished_at TEXT"),
                 ("index_started_at", "ALTER TABLE upload_tasks ADD COLUMN index_started_at TEXT"),
@@ -344,7 +347,7 @@ class UploadIngestionService:
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
                        file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
-                       ocr_provider, ocr_call_units, ocr_billable_tokens,
+                       ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -366,7 +369,7 @@ class UploadIngestionService:
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
                        file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
-                       ocr_provider, ocr_call_units, ocr_billable_tokens,
+                       ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -389,6 +392,7 @@ class UploadIngestionService:
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
                        file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_provider, ocr_call_units, ocr_billable_tokens,
+                       embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -540,6 +544,21 @@ class UploadIngestionService:
                 WHERE id = ?
                 """,
                 (str(provider or ""), max(0, int(call_units)), max(0, int(billable_tokens)), int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_task_embedding_usage(self, task_id: int, provider: str, billable_tokens: int) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                """
+                UPDATE upload_tasks
+                SET embedding_provider = ?, embedding_billable_tokens = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (str(provider or ""), max(0, int(billable_tokens)), int(task_id)),
             )
             conn.commit()
         finally:
@@ -938,6 +957,9 @@ class UploadIngestionService:
             status="running",
             error_message=None,
         )
+        task = self._get_task_any(task_id)
+        bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
+        exempt = bool(int(task.get("ocr_billing_exempt") or 0))
         attempt = 0
         last_error = ""
         while attempt < self.max_retries:
@@ -948,7 +970,29 @@ class UploadIngestionService:
                 embedding = embedding_resp.get("embedding", [])
                 if not embedding:
                     raise RuntimeError("empty embedding")
-                vector_id = self._write_vector_if_missing(
+                embedding_provider = str(embedding_resp.get("provider") or "").strip()
+                embedding_model_id = str(embedding_resp.get("model_id") or "").strip().lower()
+                embedding_tokens = int(embedding_resp.get("billable_tokens") or 0)
+                self.update_task_embedding_usage(task_id, provider=embedding_provider, billable_tokens=embedding_tokens)
+
+                bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
+                exempt = bool(int(task.get("ocr_billing_exempt") or 0))
+                is_billable_embedding = (
+                    not exempt
+                    and embedding_provider == "zhipu"
+                    and embedding_model_id == "embedding-3"
+                    and embedding_tokens > 0
+                )
+                if False and is_billable_embedding:
+                    balance = embedding_token_billing.get_token_balance(str(tenant_id), bill_cid)
+                    if balance < embedding_tokens:
+                        raise RuntimeError(
+                            f"Embedding-3 token 不足（建索引需 {embedding_tokens}，当前余额 {balance}）"
+                        )
+                    embedding_token_billing.add_tokens(
+                        str(tenant_id), bill_cid, -embedding_tokens, f"consume_embedding_tokens:task_{task_id}"
+                    )
+                vector_id, created_now = self._write_vector_if_missing(
                     tenant_id=tenant_id,
                     document_id=document_id,
                     chunk_id=chunk.chunk_id,
@@ -958,6 +1002,15 @@ class UploadIngestionService:
                     page_num=chunk.page_num,
                     chunk_type=chunk.chunk_type,
                 )
+                if is_billable_embedding and created_now:
+                    balance = embedding_token_billing.get_token_balance(str(tenant_id), bill_cid)
+                    if balance < embedding_tokens:
+                        raise RuntimeError(
+                            f"Embedding-3 token 不足（建索引需 {embedding_tokens}，当前余额 {balance}）"
+                        )
+                    embedding_token_billing.add_tokens(
+                        str(tenant_id), bill_cid, -embedding_tokens, f"consume_embedding_tokens:task_{task_id}"
+                    )
                 self._push_vector_chunk_to_pg_staging(
                     tenant_id=tenant_id,
                     task_id=task_id,
@@ -1136,7 +1189,7 @@ class UploadIngestionService:
         embedding: List[float],
         page_num: int = 0,
         chunk_type: str = "knowledge",
-    ) -> int:
+    ) -> Tuple[int, bool]:
         conn = self._conn()
         try:
             row = conn.execute(
@@ -1144,7 +1197,7 @@ class UploadIngestionService:
                 (tenant_id, document_id, chunk_id),
             ).fetchone()
             if row:
-                return int(row["id"])
+                return int(row["id"]), False
             vid = insert_returning_id(
                 conn,
                 """
@@ -1154,7 +1207,7 @@ class UploadIngestionService:
                 (tenant_id, document_id, chunk_id, content, section_path, json.dumps(embedding), page_num, chunk_type),
             )
             conn.commit()
-            return vid
+            return vid, True
         finally:
             conn.close()
 

@@ -136,6 +136,7 @@ class FreeAIRouter:
                     "provider": "transformers-local",
                     "embedding": self._normalize_vector_dimensions(local_vec, final_dim),
                     "model_id": self.hybrid_cfg.local_embedding_model_id,
+                    "billable_tokens": 0,
                 }
 
         if self.hybrid_cfg.enable_remote_fallback:
@@ -145,14 +146,17 @@ class FreeAIRouter:
                     "provider": "github-models",
                     "embedding": self._normalize_vector_dimensions(github_vec, target_dim),
                     "model_id": model,
+                    "billable_tokens": 0,
                 }
 
-            zhipu_vec = await self._zhipu_embedding(text)
-            if zhipu_vec:
+            zhipu_resp = await self._zhipu_embedding(text)
+            if zhipu_resp:
                 return {
                     "provider": "zhipu",
-                    "embedding": self._normalize_vector_dimensions(zhipu_vec, target_dim),
+                    "embedding": self._normalize_vector_dimensions(zhipu_resp.get("embedding", []), target_dim),
                     "model_id": self.zhipu_embed_model,
+                    "billable_tokens": int(zhipu_resp.get("billable_tokens") or 0),
+                    "usage": zhipu_resp.get("usage") or {},
                 }
 
             hf_vec = await self._hf_embedding(text)
@@ -161,6 +165,7 @@ class FreeAIRouter:
                     "provider": "huggingface",
                     "embedding": self._normalize_vector_dimensions(hf_vec, target_dim),
                     "model_id": self.hf_embed_model,
+                    "billable_tokens": 0,
                 }
 
         if not self.hybrid_cfg.local_first and self.hybrid_cfg.enable_local_embedding:
@@ -172,11 +177,17 @@ class FreeAIRouter:
                     "provider": "transformers-local",
                     "embedding": self._normalize_vector_dimensions(local_vec, final_dim),
                     "model_id": self.hybrid_cfg.local_embedding_model_id,
+                    "billable_tokens": 0,
                 }
 
         if self.hybrid_cfg.enable_hash_fallback:
-            return {"provider": "hash-fallback", "embedding": self._hash_embedding(text, target_dim), "model_id": "hash-embedding"}
-        return {"provider": "none", "embedding": self._hash_embedding(text, target_dim), "model_id": "hash-embedding"}
+            return {
+                "provider": "hash-fallback",
+                "embedding": self._hash_embedding(text, target_dim),
+                "model_id": "hash-embedding",
+                "billable_tokens": 0,
+            }
+        return {"provider": "none", "embedding": self._hash_embedding(text, target_dim), "model_id": "hash-embedding", "billable_tokens": 0}
 
     def _primary_remote_embed_model_id(self) -> Optional[str]:
         if not self.hybrid_cfg.enable_remote_fallback:
@@ -271,7 +282,7 @@ class FreeAIRouter:
         except Exception:
             return None
 
-    async def _zhipu_embedding(self, text: str) -> Optional[List[float]]:
+    async def _zhipu_embedding(self, text: str) -> Optional[Dict[str, Any]]:
         if not self.zhipu_token:
             return None
         url = f"{self.zhipu_base}/embeddings"
@@ -283,7 +294,15 @@ class FreeAIRouter:
         try:
             embedding = data.get("data", [{}])[0].get("embedding")
             if isinstance(embedding, list):
-                return [float(x) for x in embedding]
+                usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+                prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+                total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+                billable_tokens = prompt_tokens if isinstance(prompt_tokens, int) else total_tokens if isinstance(total_tokens, int) else 0
+                return {
+                    "embedding": [float(x) for x in embedding],
+                    "billable_tokens": max(0, int(billable_tokens or 0)),
+                    "usage": usage if isinstance(usage, dict) else {},
+                }
         except Exception:
             return None
         return None

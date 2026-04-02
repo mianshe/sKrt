@@ -17,6 +17,8 @@ class GraphNodes:
         document_id = int(state.get("document_id", 0) or 0) or None
         top_k = int(state.get("top_k", 6) or 6)
         tenant_id = str(state.get("tenant_id", "")).strip() or None
+        billing_client_id = str(state.get("billing_client_id", "")).strip() or None
+        billing_exempt = bool(state.get("billing_exempt", False))
         retrieval = await self.rag_engine.prepare_agent_context(
             query=query,
             discipline_filter=discipline,
@@ -24,6 +26,8 @@ class GraphNodes:
             top_k=top_k,
             compress_limit=min(4, top_k),
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         rows = retrieval.get("results", [])
         return {
@@ -42,6 +46,8 @@ class GraphNodes:
         document_id = int(state.get("document_id", 0) or 0) or None
         expanded_query = f"{query} 关键概念 定义 结论 证据"
         tenant_id = str(state.get("tenant_id", "")).strip() or None
+        billing_client_id = str(state.get("billing_client_id", "")).strip() or None
+        billing_exempt = bool(state.get("billing_exempt", False))
         retrieval = await self.rag_engine.prepare_agent_context(
             query=expanded_query,
             discipline_filter=discipline,
@@ -49,6 +55,8 @@ class GraphNodes:
             top_k=max(8, int(state.get("top_k", 6) or 6)),
             compress_limit=6,
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         rows = retrieval.get("results", [])
         return {
@@ -66,6 +74,8 @@ class GraphNodes:
         summary_mode = str(state.get("summary_mode", "fast")).strip().lower() or "fast"
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
         tenant_id = str(state.get("tenant_id", "")).strip() or None
+        billing_client_id = str(state.get("billing_client_id", "")).strip() or None
+        billing_exempt = bool(state.get("billing_exempt", False))
         percent_cfg = _summary_percent_config_by_compact_level(compact_level)
         preferred_top_k = int(percent_cfg["retrieval_top_k"])
         estimated_doc_chunks = self.rag_engine.estimate_document_chunk_count(document_id, tenant_id=tenant_id)
@@ -92,6 +102,8 @@ class GraphNodes:
             top_k=max(int(state.get("top_k", 8) or 8), preferred_top_k),
             max_qa_pairs=int(state.get("max_qa_pairs", 3) or 3),
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         rows = retrieval.get("results", [])
         return {
@@ -516,6 +528,8 @@ class GraphNodes:
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
         report_mode = str(state.get("report_mode", "full")).strip().lower() or "full"
         tenant_id = str(state.get("tenant_id", "")).strip() or None
+        billing_client_id = str(state.get("billing_client_id", "")).strip() or None
+        billing_exempt = bool(state.get("billing_exempt", False))
         report_cfg = _report_config_by_compact_level(compact_level)
         estimated_doc_chunks = self.rag_engine.estimate_document_chunk_count(document_id, tenant_id=tenant_id)
         sampling_strategy = "coverage" if report_mode == "full" else "head"
@@ -576,6 +590,8 @@ class GraphNodes:
             top_k=int(report_cfg["fallback_top_k"]),
             max_qa_pairs=4,
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         rows = retrieval.get("results", [])
         return {

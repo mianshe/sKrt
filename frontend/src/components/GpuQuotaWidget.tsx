@@ -21,7 +21,7 @@ type GpuQuota = {
   special?: boolean;
 };
 
-type ComplexOcrQuota = {
+type TokenQuota = {
   paid_tokens?: number;
   special?: boolean;
 };
@@ -51,7 +51,9 @@ function readPendingPayOrder(): PendingPayOrder | null {
       typeof parsed?.qrImageUrl !== "string" ||
       (parsed?.payPageUrl != null && typeof parsed.payPageUrl !== "string") ||
       typeof parsed?.provider !== "string" ||
-      (parsed?.productType !== "ocr_calls" && parsed?.productType !== "ocr_tokens" && parsed?.productType !== "cloud_capacity") ||
+      (parsed?.productType !== "ocr_calls" &&
+        parsed?.productType !== "glm_ocr_tokens" &&
+        parsed?.productType !== "embedding_tokens") ||
       typeof parsed?.productKey !== "string" ||
       !parsed.productKey ||
       (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr" && parsed?.channel !== "paypal")
@@ -81,14 +83,13 @@ function broadcastQuotaRefresh() {
 
 function productCreditText(product: PayProduct): string {
   if (product.type === "ocr_calls") return `${product.calls ?? 0} 次`;
-  if (product.type === "ocr_tokens") return `${product.tokens ?? 0} token`;
-  const storageGb = Math.round((product.storageBytes ?? 0) / (1024 * 1024 * 1024));
-  return `+${product.docBonus ?? 0} 文档 / ${storageGb}GB`;
+  return `${product.tokens ?? 0} token`;
 }
 
 export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
-  const [complexOcrQuota, setComplexOcrQuota] = useState<ComplexOcrQuota>({ paid_tokens: 0, special: false });
+  const [glmOcrQuota, setGlmOcrQuota] = useState<TokenQuota>({ paid_tokens: 0, special: false });
+  const [embeddingQuota, setEmbeddingQuota] = useState<TokenQuota>({ paid_tokens: 0, special: false });
   const [quotaLoadError, setQuotaLoadError] = useState(false);
 
   const [redeemOpen, setRedeemOpen] = useState(false);
@@ -188,7 +189,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
   };
 
-  const refreshComplexOcrQuota = async () => {
+  const refreshGlmOcrQuota = async () => {
     try {
       const response = await fetch(`${API_BASE}/ocr/token/quota`, {
         headers: withTenantHeaders(),
@@ -196,7 +197,24 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       });
       if (!response.ok) return;
       const data = await response.json();
-      setComplexOcrQuota({
+      setGlmOcrQuota({
+        paid_tokens: typeof data?.paid_tokens === "number" ? data.paid_tokens : 0,
+        special: data?.special === true,
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const refreshEmbeddingQuota = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/embedding/token/quota`, {
+        headers: withTenantHeaders(),
+        credentials: "include",
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      setEmbeddingQuota({
         paid_tokens: typeof data?.paid_tokens === "number" ? data.paid_tokens : 0,
         special: data?.special === true,
       });
@@ -263,7 +281,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setPayMessage(`已到账 ${creditText}`);
       setStatusNotice(`支付成功，已自动到账 ${creditText}`);
       await refreshQuota();
-      await refreshComplexOcrQuota();
+      await refreshGlmOcrQuota();
+      await refreshEmbeddingQuota();
       broadcastQuotaRefresh();
       return;
     }
@@ -306,13 +325,15 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   useEffect(() => {
     if (!loggedIn) {
       setGpuQuota({ used: 0, limit: 0, paid_balance: 0, special: false });
-      setComplexOcrQuota({ paid_tokens: 0, special: false });
+      setGlmOcrQuota({ paid_tokens: 0, special: false });
+      setEmbeddingQuota({ paid_tokens: 0, special: false });
       setQuotaLoadError(false);
       clearPendingPayOrder();
       return;
     }
     void refreshQuota();
-    void refreshComplexOcrQuota();
+    void refreshGlmOcrQuota();
+    void refreshEmbeddingQuota();
     void refreshPayConfig();
   }, [authSession, loggedIn]);
 
@@ -667,7 +688,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-emerald-600 ring-1 ring-emerald-200 transition hover:bg-emerald-50"
           onClick={openPayModal}
         >
-          购买次数包
+          购买计费包
         </button>
 
         <button
@@ -689,9 +710,17 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
         {loggedIn && (
           <span className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-amber-700 ring-1 ring-amber-200">
-            {complexOcrQuota.special
-              ? "复杂 OCR：不限"
-              : `复杂 OCR token：${typeof complexOcrQuota.paid_tokens === "number" ? complexOcrQuota.paid_tokens : "..."}`}
+            {glmOcrQuota.special
+              ? "GLM-OCR：不限"
+              : `GLM-OCR token：${typeof glmOcrQuota.paid_tokens === "number" ? glmOcrQuota.paid_tokens : "..."}`}
+          </span>
+        )}
+
+        {loggedIn && (
+          <span className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-sky-700 ring-1 ring-sky-200">
+            {embeddingQuota.special
+              ? "Embedding-3：不限"
+              : `Embedding-3 token：${typeof embeddingQuota.paid_tokens === "number" ? embeddingQuota.paid_tokens : "..."}`}
           </span>
         )}
 
@@ -762,11 +791,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         onClose={() => setPayOpen(false)}
         panelClassName="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
       >
-        <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包</p>
+        <p className="text-sm font-semibold text-slate-800">购买计费包</p>
         <p className="mt-1 text-xs text-slate-500">支付完成后会自动到账。即使关闭弹窗，系统也会继续轮询订单状态。</p>
 
         <div className="mt-3 flex flex-wrap gap-2">
-          {(["ocr_calls", "ocr_tokens", "cloud_capacity"] as PayProductType[]).map((type) => (
+          {(["ocr_calls", "glm_ocr_tokens", "embedding_tokens"] as PayProductType[]).map((type) => (
             <button
               key={type}
               className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
@@ -780,7 +809,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
               }}
               disabled={payStatus === "creating" || payStatus === "pending"}
             >
-              {type === "ocr_calls" ? "OCR 次数包" : type === "ocr_tokens" ? "复杂 OCR Token" : "云端容量包"}
+              {type === "ocr_calls" ? "OCR 次数包" : type === "glm_ocr_tokens" ? "GLM-OCR Token" : "Embedding-3 Token"}
             </button>
           ))}
         </div>
@@ -837,7 +866,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
             PayPal
           </button>
           <span className="self-center text-[11px] text-slate-400">
-            默认推荐：{recommendedPayChannel === "alipay_qr" ? "支付宝" : "微信"}
+            支付宝风控严可能会支付失败
           </span>
         </div>
 

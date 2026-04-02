@@ -17,10 +17,23 @@ class ExamProcessor:
         self.ai_router = ai_router
         self.agent_chains = agent_chains
 
-    async def analyze_exam(self, exam_text: str, discipline: str = "all", tenant_id: str = "public") -> Dict[str, Any]:
+    async def analyze_exam(
+        self,
+        exam_text: str,
+        discipline: str = "all",
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+    ) -> Dict[str, Any]:
         questions = self._split_questions(exam_text)
         stats = self._difficulty_stats(questions)
-        recommendations = await self._recommend(questions, discipline, tenant_id=tenant_id)
+        recommendations = await self._recommend(
+            questions,
+            discipline,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+        )
         return {
             "question_count": len(questions),
             "difficulty": stats,
@@ -29,10 +42,27 @@ class ExamProcessor:
         }
 
     async def analyze_and_answer_exam(
-        self, exam_text: str, discipline: str = "all", tenant_id: str = "public"
+        self,
+        exam_text: str,
+        discipline: str = "all",
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
     ) -> Dict[str, Any]:
-        analysis = await self.analyze_exam(exam_text, discipline, tenant_id=tenant_id)
-        answered_questions = await self._answer_questions(analysis.get("questions", []), discipline, tenant_id=tenant_id)
+        analysis = await self.analyze_exam(
+            exam_text,
+            discipline,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+        )
+        answered_questions = await self._answer_questions(
+            analysis.get("questions", []),
+            discipline,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+        )
         analysis["questions"] = answered_questions
         analysis["qa_regression_gates"] = self._aggregate_regression_gates(answered_questions)
         return analysis
@@ -419,11 +449,25 @@ class ExamProcessor:
         avg /= len(questions)
         return {"average_score": round(avg, 3), "distribution": counter}
 
-    async def _recommend(self, questions: List[Dict[str, Any]], discipline: str, tenant_id: str = "public") -> List[Dict[str, Any]]:
+    async def _recommend(
+        self,
+        questions: List[Dict[str, Any]],
+        discipline: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+    ) -> List[Dict[str, Any]]:
         if not questions:
             return []
         query = " ".join(q["text"] for q in questions[:3])[:1200]
-        found = await self.rag_engine.hybrid_search(query=query, discipline_filter=discipline, top_k=5, tenant_id=tenant_id)
+        found = await self.rag_engine.hybrid_search(
+            query=query,
+            discipline_filter=discipline,
+            top_k=5,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+        )
         recs = []
         for i, row in enumerate(found["results"]):
             recs.append(
@@ -437,7 +481,12 @@ class ExamProcessor:
         return recs
 
     async def _answer_questions(
-        self, questions: List[Dict[str, Any]], discipline: str, tenant_id: str = "public"
+        self,
+        questions: List[Dict[str, Any]],
+        discipline: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
     ) -> List[Dict[str, Any]]:
         if not questions:
             return []
@@ -450,7 +499,12 @@ class ExamProcessor:
             enriched_query = self._build_agent_query(query, question_type, material_text=material_text)
             if use_agent:
                 graph_result = await self.agent_chains.run_exam_graph(
-                    query=enriched_query, discipline=discipline, tenant_id=tenant_id, question_type=question_type
+                    query=enriched_query,
+                    discipline=discipline,
+                    tenant_id=tenant_id,
+                    question_type=question_type,
+                    billing_client_id=billing_client_id,
+                    billing_exempt=billing_exempt,
                 )
                 answer_text = str(graph_result.get("answer", "")).strip() or "未生成有效答案。"
                 brief_reasoning = self._sanitize_brief_reasoning(graph_result.get("brief_reasoning", []))
@@ -493,7 +547,14 @@ class ExamProcessor:
                     }
                 )
                 continue
-            retrieval = await self.rag_engine.hybrid_search(query=query, discipline_filter=discipline, top_k=4)
+            retrieval = await self.rag_engine.hybrid_search(
+                query=query,
+                discipline_filter=discipline,
+                top_k=4,
+                tenant_id=tenant_id,
+                billing_client_id=billing_client_id,
+                billing_exempt=billing_exempt,
+            )
             contexts = retrieval.get("results", [])
             evidence = [
                 {

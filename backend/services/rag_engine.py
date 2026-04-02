@@ -4,6 +4,9 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from fastapi import HTTPException
+
+from backend.services import embedding_token_billing
 from backend.services import knowledge_store
 
 from .free_ai_router import FreeAIRouter
@@ -49,8 +52,18 @@ class RAGEngine:
         document_id: Optional[int] = None,
         top_k: int = 8,
         tenant_id: Optional[str] = None,
+        billing_client_id: Optional[str] = None,
+        billing_exempt: bool = False,
     ) -> Dict[str, Any]:
-        query_vec = (await self.ai_router.embed(query))["embedding"]
+        embedding_resp = await self.ai_router.embed(query)
+        query_vec = embedding_resp["embedding"]
+        self._charge_query_embedding_if_needed(
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+            embedding_resp=embedding_resp,
+            reason="search_query_embedding",
+        )
         rows = self._fetch_rows(discipline_filter, document_id=document_id, tenant_id=tenant_id)
         if not rows:
             return {"results": [], "cross_discipline": []}
@@ -69,6 +82,8 @@ class RAGEngine:
         top_k: int = 8,
         max_qa_pairs: int = 3,
         tenant_id: Optional[str] = None,
+        billing_client_id: Optional[str] = None,
+        billing_exempt: bool = False,
     ) -> Dict[str, Any]:
         expanded_k = max(top_k * 3, 18)
         retrieval = await self.hybrid_search(
@@ -77,6 +92,8 @@ class RAGEngine:
             document_id=document_id,
             top_k=expanded_k,
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         base_rows = retrieval.get("results", [])
         ranked_rows = self._prioritize_for_summary(base_rows, top_k=top_k)
@@ -95,6 +112,8 @@ class RAGEngine:
         top_k: int = 6,
         compress_limit: int = 4,
         tenant_id: Optional[str] = None,
+        billing_client_id: Optional[str] = None,
+        billing_exempt: bool = False,
     ) -> Dict[str, Any]:
         """
         Agent-oriented RAG pipeline: retrieve -> lightweight compress -> answer context.
@@ -105,6 +124,8 @@ class RAGEngine:
             document_id=document_id,
             top_k=max(top_k, 1),
             tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
         )
         rows = retrieval.get("results", [])
         compressed_blocks: List[str] = []
@@ -138,6 +159,34 @@ class RAGEngine:
             return 0
         finally:
             conn.close()
+
+    def _charge_query_embedding_if_needed(
+        self,
+        *,
+        tenant_id: Optional[str],
+        billing_client_id: Optional[str],
+        billing_exempt: bool,
+        embedding_resp: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        if billing_exempt:
+            return
+        tid = str(tenant_id or "").strip()
+        cid = str(billing_client_id or "").strip()
+        if not tid or not cid:
+            return
+        provider = str(embedding_resp.get("provider") or "").strip().lower()
+        model_id = str(embedding_resp.get("model_id") or "").strip().lower()
+        billable_tokens = int(embedding_resp.get("billable_tokens") or 0)
+        if provider != "zhipu" or model_id != "embedding-3" or billable_tokens <= 0:
+            return
+        balance = embedding_token_billing.get_token_balance(tid, cid)
+        if balance < billable_tokens:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Embedding-3 token 不足，检索需 {billable_tokens}，当前余额 {balance}",
+            )
+        embedding_token_billing.add_tokens(tid, cid, -billable_tokens, reason)
 
     def load_document_chunks(
         self,

@@ -24,7 +24,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -55,6 +55,7 @@ from backend.services import local_auth_service
 from backend.services import knowledge_store
 from backend.services import gpu_ocr_billing
 from backend.services import ocr_token_billing
+from backend.services import embedding_token_billing
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
 from backend.services.payments.base import PaymentProvider
@@ -232,7 +233,7 @@ class ChunkUploadMeta(TypedDict):
 
 
 class PayOrderCreateRequest(BaseModel):
-    product_type: str = Field(default="ocr_calls", pattern="^(ocr_calls|ocr_tokens|cloud_capacity)$")
+    product_type: str = Field(default="ocr_calls", pattern="^(ocr_calls|glm_ocr_tokens|embedding_tokens|ocr_tokens|cloud_capacity)$")
     product_key: Optional[str] = Field(default=None, min_length=1, max_length=32)
     pack_key: Optional[str] = Field(default=None, pattern="^(A|B|C)$")
     provider: Optional[str] = Field(default=None, pattern="^(easypay|jeepay|paypal|xpay)$")
@@ -1025,6 +1026,36 @@ def _init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS embedding_token_balance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL DEFAULT 'public',
+                client_id TEXT NOT NULL,
+                tokens_balance INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, client_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embedding_token_balance_lookup ON embedding_token_balance(tenant_id, client_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embedding_token_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL DEFAULT 'public',
+                client_id TEXT NOT NULL,
+                delta_tokens INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embedding_token_ledger_lookup ON embedding_token_ledger(tenant_id, client_id, created_at)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS tenant_quota_entitlements (
                 tenant_id TEXT PRIMARY KEY,
                 doc_bonus INTEGER NOT NULL DEFAULT 0,
@@ -1059,6 +1090,7 @@ def _init_db() -> None:
                 pack_key TEXT NOT NULL,
                 pages INTEGER NOT NULL DEFAULT 0,
                 credit_tokens INTEGER NOT NULL DEFAULT 0,
+                credit_embedding_tokens INTEGER NOT NULL DEFAULT 0,
                 credit_documents INTEGER NOT NULL DEFAULT 0,
                 credit_storage_bytes INTEGER NOT NULL DEFAULT 0,
                 amount_cny REAL NOT NULL DEFAULT 0,
@@ -1090,6 +1122,8 @@ def _init_db() -> None:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN provider_transaction_id TEXT DEFAULT NULL")
         if "credit_tokens" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_tokens INTEGER NOT NULL DEFAULT 0")
+        if "credit_embedding_tokens" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_embedding_tokens INTEGER NOT NULL DEFAULT 0")
         if "credit_documents" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_documents INTEGER NOT NULL DEFAULT 0")
         if "credit_storage_bytes" not in pay_order_columns:
@@ -1625,23 +1659,34 @@ PAY_OCR_CALL_PACKS: Dict[str, Dict[str, Any]] = {
     "C": {"calls": 5000, "amount_cny": 59.9},
 }
 
-PAY_OCR_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
+PAY_GLM_OCR_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
     "T1": {"tokens": 20000, "amount_cny": 19.9},
     "T2": {"tokens": 80000, "amount_cny": 59.9},
     "T3": {"tokens": 200000, "amount_cny": 129.9},
 }
 
-PAY_CLOUD_CAPACITY_PACKS: Dict[str, Dict[str, Any]] = {
-    "S1": {"doc_bonus": 500, "storage_bytes": 5 * 1024 * 1024 * 1024, "amount_cny": 19.9},
-    "S2": {"doc_bonus": 2000, "storage_bytes": 20 * 1024 * 1024 * 1024, "amount_cny": 59.9},
-    "S3": {"doc_bonus": 5000, "storage_bytes": 50 * 1024 * 1024 * 1024, "amount_cny": 129.9},
+PAY_EMBEDDING_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
+    "S1": {"tokens": 10000, "amount_cny": 19.9},
+    "S2": {"tokens": 40000, "amount_cny": 59.9},
+    "S3": {"tokens": 90000, "amount_cny": 129.9},
 }
 
 PAY_PRODUCT_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     "ocr_calls": PAY_OCR_CALL_PACKS,
-    "ocr_tokens": PAY_OCR_TOKEN_PACKS,
-    "cloud_capacity": PAY_CLOUD_CAPACITY_PACKS,
+    "glm_ocr_tokens": PAY_GLM_OCR_TOKEN_PACKS,
+    "ocr_tokens": PAY_GLM_OCR_TOKEN_PACKS,
+    "embedding_tokens": PAY_EMBEDDING_TOKEN_PACKS,
+    "cloud_capacity": PAY_EMBEDDING_TOKEN_PACKS,
 }
+
+
+def _normalize_pay_product_type(product_type: str) -> str:
+    raw = str(product_type or "ocr_calls").strip().lower()
+    if raw == "ocr_tokens":
+        return "glm_ocr_tokens"
+    if raw == "cloud_capacity":
+        return "embedding_tokens"
+    return raw
 
 
 def _random_code_email_target() -> str:
@@ -1777,7 +1822,8 @@ def _get_payment_provider(provider_name: Optional[str] = None) -> PaymentProvide
 
 
 def _get_pay_product(product_type: str, product_key: str) -> Dict[str, Any]:
-    catalog = PAY_PRODUCT_CATALOG.get(product_type)
+    normalized_type = _normalize_pay_product_type(product_type)
+    catalog = PAY_PRODUCT_CATALOG.get(normalized_type)
     if not catalog:
         raise HTTPException(status_code=400, detail="invalid product type")
     product = catalog.get(product_key)
@@ -1787,13 +1833,13 @@ def _get_pay_product(product_type: str, product_key: str) -> Dict[str, Any]:
 
 
 def _describe_pay_product(product_type: str, product_key: str, product: Dict[str, Any]) -> str:
-    if product_type == "ocr_calls":
+    normalized_type = _normalize_pay_product_type(product_type)
+    if normalized_type == "ocr_calls":
         return f"sKrt OCR calls {product_key} x{int(product.get('calls') or 0)}"
-    if product_type == "ocr_tokens":
-        return f"sKrt OCR tokens {product_key} x{int(product.get('tokens') or 0)}"
-    if product_type == "cloud_capacity":
-        storage_gb = int(product.get("storage_bytes") or 0) // (1024 * 1024 * 1024)
-        return f"sKrt cloud pack {product_key} +{int(product.get('doc_bonus') or 0)} docs/{storage_gb}GB"
+    if normalized_type == "glm_ocr_tokens":
+        return f"sKrt GLM OCR tokens {product_key} x{int(product.get('tokens') or 0)}"
+    if normalized_type == "embedding_tokens":
+        return f"sKrt Embedding tokens {product_key} x{int(product.get('tokens') or 0)}"
     return f"sKrt product {product_key}"
 
 
@@ -1845,13 +1891,15 @@ def _create_pay_order(
     channel: str,
     provider_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    product = _get_pay_product(product_type, product_key)
+    normalized_type = _normalize_pay_product_type(product_type)
+    product = _get_pay_product(normalized_type, product_key)
     resolved_provider = (provider_name or _pay_provider_name()).strip().lower()
     if channel not in _pay_provider_supported_channels(resolved_provider):
         raise HTTPException(status_code=400, detail="invalid payment channel")
     order_no = _new_order_no()
     calls = int(product.get("calls") or 0)
-    tokens = int(product.get("tokens") or 0)
+    glm_ocr_tokens = int(product.get("tokens") or 0) if normalized_type == "glm_ocr_tokens" else 0
+    embedding_tokens = int(product.get("tokens") or 0) if normalized_type == "embedding_tokens" else 0
     credit_documents = int(product.get("doc_bonus") or 0)
     credit_storage_bytes = int(product.get("storage_bytes") or 0)
     amount_cny = float(product["amount_cny"])
@@ -1861,19 +1909,20 @@ def _create_pay_order(
             """
             INSERT INTO pay_orders(
                 order_no, tenant_id, client_id, product_type, product_key, pack_key, pages,
-                credit_tokens, credit_documents, credit_storage_bytes, amount_cny, status, provider, channel
+                credit_tokens, credit_embedding_tokens, credit_documents, credit_storage_bytes, amount_cny, status, provider, channel
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?)
             """,
             (
                 order_no,
                 tenant_id,
                 client_id,
-                product_type,
+                normalized_type,
                 product_key,
                 product_key,
                 calls,
-                tokens,
+                glm_ocr_tokens,
+                embedding_tokens,
                 credit_documents,
                 credit_storage_bytes,
                 amount_cny,
@@ -1884,16 +1933,18 @@ def _create_pay_order(
         conn.commit()
         return {
             "order_no": order_no,
-            "product_type": product_type,
+            "product_type": normalized_type,
             "product_key": product_key,
             "calls": calls,
             "pages": calls,
-            "tokens": tokens,
+            "tokens": glm_ocr_tokens,
+            "glm_ocr_tokens": glm_ocr_tokens,
+            "embedding_tokens": embedding_tokens,
             "credit_documents": credit_documents,
             "credit_storage_bytes": credit_storage_bytes,
             "amount_cny": amount_cny,
             "channel": channel,
-            "subject": _describe_pay_product(product_type, product_key, product),
+            "subject": _describe_pay_product(normalized_type, product_key, product),
         }
     finally:
         conn.close()
@@ -1952,6 +2003,7 @@ def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", provider
         client_id = str(row["client_id"])
         pages = int(row["pages"] or 0)
         credit_tokens = int(row["credit_tokens"] or 0)
+        credit_embedding_tokens = int(row["credit_embedding_tokens"] or 0)
         credit_documents = int(row["credit_documents"] or 0)
         credit_storage_bytes = int(row["credit_storage_bytes"] or 0)
         if pages:
@@ -1981,6 +2033,20 @@ def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", provider
             conn.execute(
                 "INSERT INTO ocr_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
                 (tenant_id, client_id, credit_tokens, f"pay_order_credit:{order_no}"),
+            )
+        if credit_embedding_tokens:
+            conn.execute(
+                """
+                INSERT INTO embedding_token_balance(tenant_id, client_id, tokens_balance)
+                VALUES(?, ?, ?)
+                ON CONFLICT(tenant_id, client_id) DO UPDATE
+                SET tokens_balance = tokens_balance + excluded.tokens_balance, updated_at=CURRENT_TIMESTAMP
+                """,
+                (tenant_id, client_id, credit_embedding_tokens),
+            )
+            conn.execute(
+                "INSERT INTO embedding_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
+                (tenant_id, client_id, credit_embedding_tokens, f"pay_order_credit:{order_no}"),
             )
         if credit_documents or credit_storage_bytes:
             conn.execute(
@@ -2112,6 +2178,10 @@ def _get_complex_ocr_token_balance(tenant_id: str, client_id: str) -> int:
     return ocr_token_billing.get_token_balance(tenant_id, client_id)
 
 
+def _get_embedding_token_balance(tenant_id: str, client_id: str) -> int:
+    return embedding_token_billing.get_token_balance(tenant_id, client_id)
+
+
 def _ensure_gpu_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
     grant = _gpu_ocr_initial_free_calls()
     if grant <= 0:
@@ -2168,6 +2238,10 @@ def _ensure_complex_ocr_initial_balance(tenant_id: str, client_id: str) -> None:
 
 def _add_complex_ocr_tokens(tenant_id: str, client_id: str, delta_tokens: int, reason: str) -> int:
     return ocr_token_billing.add_tokens(tenant_id, client_id, delta_tokens, reason)
+
+
+def _add_embedding_tokens(tenant_id: str, client_id: str, delta_tokens: int, reason: str) -> int:
+    return embedding_token_billing.add_tokens(tenant_id, client_id, delta_tokens, reason)
 
 
 def _ensure_gpu_calls_balance_covers_or_raise(request: Request, page_count: int) -> None:
@@ -2494,6 +2568,10 @@ async def auth_register_complete(request: Request, body: Dict[str, Any] = Body(.
             "INSERT INTO ocr_token_balance(tenant_id, client_id, tokens_balance) VALUES(?,?,?)",
             (uid, uid, max(0, int(free_complex_tokens))),
         )
+        conn.execute(
+            "INSERT INTO embedding_token_balance(tenant_id, client_id, tokens_balance) VALUES(?,?,?)",
+            (uid, uid, 0),
+        )
         if free_complex_tokens > 0:
             conn.execute(
                 "INSERT INTO ocr_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
@@ -2649,6 +2727,20 @@ async def get_complex_ocr_token_quota(request: Request) -> Dict[str, Any]:
     }
 
 
+@app.get("/embedding/token/quota")
+async def get_embedding_token_quota(request: Request) -> Dict[str, Any]:
+    tenant_id, client_id = _billing_tenant_client(request)
+    special = bool(_is_special_user(request))
+    balance = _get_embedding_token_balance(tenant_id, client_id)
+    ledger = embedding_token_billing.recent_ledger(tenant_id, client_id, limit=12)
+    return {
+        "paid_balance": int(max(0, balance)),
+        "paid_tokens": int(max(0, balance)),
+        "special": special,
+        "ledger": ledger,
+    }
+
+
 @app.post("/gpu/autostart/start")
 async def gpu_autostart_start_route(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
@@ -2731,7 +2823,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     if provider_name != "paypal" and not notify_url:
         raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
     tenant_id, client_id = _ocr_billing_tenant_client(request)
-    product_type = str(body.product_type or "ocr_calls")
+    product_type = _normalize_pay_product_type(str(body.product_type or "ocr_calls"))
     product_key = str(body.product_key or body.pack_key or "").strip()
     if not product_key:
         raise HTTPException(status_code=400, detail="missing product key")
@@ -2739,6 +2831,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     order_no = str(created["order_no"])
     calls = int(created.get("calls") or created.get("pages") or 0)
     tokens = int(created.get("tokens") or 0)
+    embedding_tokens = int(created.get("embedding_tokens") or 0)
     credit_documents = int(created.get("credit_documents") or 0)
     credit_storage_bytes = int(created.get("credit_storage_bytes") or 0)
     amount_cny = float(created["amount_cny"])
@@ -2767,7 +2860,9 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         )
     except Exception as exc:
         logger.exception("create payment order failed provider=%s order_no=%s channel=%s", provider_name, order_no, channel)
-        raise HTTPException(status_code=502, detail=f"支付下单失败: {exc}")
+        detail = str(exc)
+        detail = detail.replace("作者的学生服务器", "60块一个月的服务器")
+        raise HTTPException(status_code=502, detail=f"支付下单失败: {detail}")
     provider_order_id = str(created_rsp.provider_order_id or "")
     conn = _conn()
     try:
@@ -2787,6 +2882,8 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     code_url = str(created_rsp.code_url or "")
     pay_page_url = str(created_rsp.payment_url or "")
     qr_image_url = str(created_rsp.qr_image_url or "")
+    if provider_name == "xpay" and channel == "wechat_native" and qr_image_url:
+        qr_image_url = str(request.url_for("xpay_wechat_qr_image"))
     if not qr_image_url and code_url:
         qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}"
     return {
@@ -2799,6 +2896,8 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         "calls": calls,
         "pages": calls,
         "tokens": tokens,
+        "glm_ocr_tokens": tokens,
+        "embedding_tokens": embedding_tokens,
         "credit_documents": credit_documents,
         "credit_storage_bytes": credit_storage_bytes,
         "amount_cny": amount_cny,
@@ -2809,6 +2908,25 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         "pay_page_url": pay_page_url,
         "qr_image_url": qr_image_url,
     }
+
+
+@app.get("/gpu/ocr/pay/xpay/wechat-qr", name="xpay_wechat_qr_image")
+async def xpay_wechat_qr_image() -> Response:
+    provider = _get_payment_provider("xpay")
+    api_base = getattr(provider, "api_base", "").strip().rstrip("/")
+    if not api_base:
+        raise HTTPException(status_code=503, detail="xpay not configured")
+    url = f"{api_base}/assets/qr/wechat/custom.png"
+    req = UrlRequest(url=url, method="GET")
+    req.add_header("Accept", "image/png,image/*;q=0.8,*/*;q=0.5")
+    try:
+        with urlopen(req, timeout=20) as resp:  # nosec B310
+            data = resp.read()
+            content_type = str(resp.headers.get("Content-Type") or "image/png")
+    except Exception as exc:
+        logger.exception("xpay wechat qr proxy failed url=%s", url)
+        raise HTTPException(status_code=502, detail=f"xpay qr proxy failed: {exc}") from exc
+    return Response(content=data, media_type=content_type)
 
 
 @app.get("/gpu/ocr/pay/order/{order_no}")
@@ -2848,6 +2966,8 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
         "calls": int(order.get("pages") or 0),
         "pages": int(order.get("pages") or 0),
         "tokens": int(order.get("credit_tokens") or 0),
+        "glm_ocr_tokens": int(order.get("credit_tokens") or 0),
+        "embedding_tokens": int(order.get("credit_embedding_tokens") or 0),
         "credit_documents": int(order.get("credit_documents") or 0),
         "credit_storage_bytes": int(order.get("credit_storage_bytes") or 0),
         "amount_cny": float(order.get("amount_cny") or 0),
@@ -3104,6 +3224,8 @@ def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "ocr_provider": str(task.get("ocr_provider", "") or ""),
         "ocr_call_units": int(task.get("ocr_call_units", 0) or 0),
         "ocr_billable_tokens": int(task.get("ocr_billable_tokens", 0) or 0),
+        "embedding_provider": str(task.get("embedding_provider", "") or ""),
+        "embedding_billable_tokens": int(task.get("embedding_billable_tokens", 0) or 0),
         **timing,
         "rollup_task_count": rollup.get("rollup_task_count"),
         "rollup_avg_sec_per_mb_extract": rollup.get("avg_extract_sec_per_mb"),
@@ -3279,6 +3401,8 @@ async def _handle_completed_chunked_upload(
     *,
     ocr_billing_client_id: Optional[str] = None,
     ocr_billing_exempt: bool = False,
+    embedding_billing_client_id: Optional[str] = None,
+    embedding_billing_exempt: bool = False,
 ) -> Dict[str, Any]:
     if purpose == "docs":
         task = upload_ingestion_service.create_task(
@@ -3297,7 +3421,13 @@ async def _handle_completed_chunked_upload(
         return {"tasks": [_normalize_task(task)]}
 
     parsed = parser.parse(str(target_path), document_type or "exam")
-    analysis = await exam_processor.analyze_and_answer_exam(parsed.text, discipline, tenant_id=tenant_id)
+    analysis = await exam_processor.analyze_and_answer_exam(
+        parsed.text,
+        discipline,
+        tenant_id=tenant_id,
+        billing_client_id=str(embedding_billing_client_id or ""),
+        billing_exempt=bool(embedding_billing_exempt),
+    )
     return {
         "filename": filename,
         "discipline": discipline,
@@ -3541,6 +3671,7 @@ async def complete_chunk_upload(
             logger.exception("upload to r2 failed for chunked upload (fallback to local file_path)")
 
     _btid, client_id = _billing_tenant_client(request)
+    vector_exempt = _is_special_user(request)
     if purpose == "docs":
         conn_th = _conn()
         try:
@@ -3568,6 +3699,8 @@ async def complete_chunk_upload(
         ocr_mode=ocr_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
+        embedding_billing_client_id=client_id,
+        embedding_billing_exempt=bool(vector_exempt),
     )
 
     # 若上面已写入 R2，则把 task.file_path 更新为 r2://...（并确保本地文件可删除）
@@ -4272,11 +4405,15 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     enriched_query = req.query
     if memory_context_lines:
         enriched_query = f"{req.query}\n\n[历史工作记忆]\n" + "\n\n".join(memory_context_lines[-_chat_memory_recent_limit():])
+    _, billing_client_id = _billing_tenant_client(request)
+    billing_exempt = _is_special_user(request)
     graph_result = await agent_chains.run_chat_graph(
         query=enriched_query,
         discipline=req.discipline,
         mode=req.mode,
         tenant_id=tenant_id,
+        billing_client_id=billing_client_id,
+        billing_exempt=bool(billing_exempt),
     )
     answer = str(graph_result.get("answer", "")).strip()
     brief_reasoning = graph_result.get("brief_reasoning", [])
@@ -4360,6 +4497,8 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
     tenant_id = str(identity.get("tenant_id", "public"))
+    _, billing_client_id = _billing_tenant_client(request)
+    billing_exempt = _is_special_user(request)
     summary_debug_passthrough = _env_bool("SUMMARY_DEBUG_PASSTHROUGH", False)
     summary_compact_level = 0
     summary_mode = "full"
@@ -4368,6 +4507,8 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
         discipline=req.discipline,
         document_id=req.document_id,
         tenant_id=tenant_id,
+        billing_client_id=billing_client_id,
+        billing_exempt=bool(billing_exempt),
         summary_debug_passthrough=summary_debug_passthrough,
         summary_compact_level=summary_compact_level,
         summary_mode=summary_mode,
@@ -4452,6 +4593,8 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
     tenant_id = str(identity.get("tenant_id", "public"))
+    _, billing_client_id = _billing_tenant_client(request)
+    billing_exempt = _is_special_user(request)
     default_summary_compact_level = _resolve_summary_compact_level(os.getenv("SUMMARY_COMPACT_LEVEL"), default=1)
     summary_compact_level = _resolve_summary_compact_level(req.summary_compact_level, default=default_summary_compact_level)
     report_mode = _resolve_summary_mode(req.report_mode, default="full")
@@ -4460,6 +4603,8 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
         discipline=req.discipline,
         document_id=req.document_id,
         tenant_id=tenant_id,
+        billing_client_id=billing_client_id,
+        billing_exempt=bool(billing_exempt),
         report_mode=report_mode,
         summary_compact_level=summary_compact_level,
     )
@@ -4643,6 +4788,8 @@ async def exam_upload(
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.exam.write")
     tenant_id = str(identity.get("tenant_id", "public"))
+    _, billing_client_id = _billing_tenant_client(request)
+    billing_exempt = _is_special_user(request)
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     suffix = Path(file.filename).suffix.lower()
@@ -4655,7 +4802,13 @@ async def exam_upload(
 
     dtype = document_type or "exam"
     parsed = parser.parse(str(target), dtype)
-    analysis = await exam_processor.analyze_and_answer_exam(parsed.text, discipline, tenant_id=tenant_id)
+    analysis = await exam_processor.analyze_and_answer_exam(
+        parsed.text,
+        discipline,
+        tenant_id=tenant_id,
+        billing_client_id=billing_client_id,
+        billing_exempt=bool(billing_exempt),
+    )
     return {
         "filename": file.filename,
         "tenant_id": tenant_id,
