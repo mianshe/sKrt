@@ -232,8 +232,11 @@ class ChunkUploadMeta(TypedDict):
 
 
 class PayOrderCreateRequest(BaseModel):
-    pack_key: str = Field(pattern="^(A|B|C)$")
-    channel: str = Field(default="wechat_native", pattern="^(wechat_native|alipay_qr)$")
+    product_type: str = Field(default="ocr_calls", pattern="^(ocr_calls|ocr_tokens|cloud_capacity)$")
+    product_key: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    pack_key: Optional[str] = Field(default=None, pattern="^(A|B|C)$")
+    provider: Optional[str] = Field(default=None, pattern="^(easypay|jeepay|paypal|xpay)$")
+    channel: str = Field(default="wechat_native", pattern="^(wechat_native|alipay_qr|paypal)$")
 
 
 class PayOrderRefundRequest(BaseModel):
@@ -769,6 +772,9 @@ def _tenant_quota_snapshot(identity: RequestIdentity) -> Dict[str, Any]:
         finally:
             if conn:
                 conn.close()
+    bonus = _get_tenant_quota_bonus(tenant_id)
+    quotas["max_documents"] += int(bonus.get("doc_bonus") or 0)
+    quotas["max_storage_bytes"] += int(bonus.get("storage_bytes_bonus") or 0)
     conn_sql = _conn()
     try:
         docs = int(
@@ -1017,6 +1023,29 @@ def _init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ocr_token_ledger_lookup ON ocr_token_ledger(tenant_id, client_id, created_at)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenant_quota_entitlements (
+                tenant_id TEXT PRIMARY KEY,
+                doc_bonus INTEGER NOT NULL DEFAULT 0,
+                storage_bytes_bonus INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenant_quota_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                delta_documents INTEGER NOT NULL DEFAULT 0,
+                delta_storage_bytes INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_quota_ledger_lookup ON tenant_quota_ledger(tenant_id, created_at)")
         # PayJS 订单表
         conn.execute(
             """
@@ -1025,8 +1054,13 @@ def _init_db() -> None:
                 order_no TEXT NOT NULL UNIQUE,
                 tenant_id TEXT NOT NULL DEFAULT 'public',
                 client_id TEXT NOT NULL,
+                product_type TEXT NOT NULL DEFAULT 'ocr_calls',
+                product_key TEXT NOT NULL DEFAULT '',
                 pack_key TEXT NOT NULL,
                 pages INTEGER NOT NULL DEFAULT 0,
+                credit_tokens INTEGER NOT NULL DEFAULT 0,
+                credit_documents INTEGER NOT NULL DEFAULT 0,
+                credit_storage_bytes INTEGER NOT NULL DEFAULT 0,
                 amount_cny REAL NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 provider TEXT NOT NULL DEFAULT 'easypay',
@@ -1046,10 +1080,20 @@ def _init_db() -> None:
             """
         )
         pay_order_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pay_orders)").fetchall()}
+        if "product_type" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN product_type TEXT NOT NULL DEFAULT 'ocr_calls'")
+        if "product_key" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN product_key TEXT NOT NULL DEFAULT ''")
         if "provider_order_id" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN provider_order_id TEXT DEFAULT NULL")
         if "provider_transaction_id" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN provider_transaction_id TEXT DEFAULT NULL")
+        if "credit_tokens" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_tokens INTEGER NOT NULL DEFAULT 0")
+        if "credit_documents" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_documents INTEGER NOT NULL DEFAULT 0")
+        if "credit_storage_bytes" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_storage_bytes INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_lookup ON pay_orders(order_no, tenant_id, client_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_status ON pay_orders(status, created_at)")
         # PayJS 回调审计日志
@@ -1554,11 +1598,49 @@ def _pay_provider_name() -> str:
     return (os.getenv("PAY_PROVIDER") or "easypay").strip().lower()
 
 
+def _pay_enabled_providers() -> List[str]:
+    raw = (os.getenv("PAY_ENABLED_PROVIDERS") or "").strip()
+    if raw:
+        providers = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    else:
+        providers = [_pay_provider_name()]
+    seen: List[str] = []
+    for provider in providers:
+        if provider in {"easypay", "jeepay", "paypal", "xpay"} and provider not in seen:
+            seen.append(provider)
+    return seen or [_pay_provider_name()]
+
+
+def _pay_provider_supported_channels(provider_name: Optional[str] = None) -> List[str]:
+    provider = (provider_name or _pay_provider_name()).strip().lower()
+    if provider == "paypal":
+        return ["paypal"]
+    return ["wechat_native", "alipay_qr"]
+
+
 # 键为次数（与 gpu_ocr_paid_pages_balance 扣减单位一致；DB 列名仍沿用 pages 历史字段）
 PAY_OCR_CALL_PACKS: Dict[str, Dict[str, Any]] = {
     "A": {"calls": 500, "amount_cny": 9.9},
     "B": {"calls": 2000, "amount_cny": 29.9},
     "C": {"calls": 5000, "amount_cny": 59.9},
+}
+
+PAY_OCR_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
+    "T1": {"tokens": 20000, "amount_cny": 19.9},
+    "T2": {"tokens": 80000, "amount_cny": 59.9},
+    "T3": {"tokens": 200000, "amount_cny": 129.9},
+}
+
+PAY_CLOUD_CAPACITY_PACKS: Dict[str, Dict[str, Any]] = {
+    "S1": {"doc_bonus": 500, "storage_bytes": 5 * 1024 * 1024 * 1024, "amount_cny": 19.9},
+    "S2": {"doc_bonus": 2000, "storage_bytes": 20 * 1024 * 1024 * 1024, "amount_cny": 59.9},
+    "S3": {"doc_bonus": 5000, "storage_bytes": 50 * 1024 * 1024 * 1024, "amount_cny": 129.9},
+}
+
+PAY_PRODUCT_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "ocr_calls": PAY_OCR_CALL_PACKS,
+    "ocr_tokens": PAY_OCR_TOKEN_PACKS,
+    "cloud_capacity": PAY_CLOUD_CAPACITY_PACKS,
 }
 
 
@@ -1690,30 +1772,129 @@ def _new_order_no() -> str:
     return f"XM{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
 
 
-def _get_payment_provider() -> PaymentProvider:
-    return get_payment_provider(_pay_provider_name())
+def _get_payment_provider(provider_name: Optional[str] = None) -> PaymentProvider:
+    return get_payment_provider((provider_name or _pay_provider_name()).strip().lower())
 
 
-def _create_pay_order(tenant_id: str, client_id: str, pack_key: str, channel: str) -> Dict[str, Any]:
-    pack = PAY_OCR_CALL_PACKS.get(pack_key)
-    if not pack:
-        raise HTTPException(status_code=400, detail="无效次数包")
-    if channel not in {"wechat_native", "alipay_qr"}:
-        raise HTTPException(status_code=400, detail="无效支付渠道")
-    order_no = _new_order_no()
-    calls = int(pack["calls"])
-    amount_cny = float(pack["amount_cny"])
+def _get_pay_product(product_type: str, product_key: str) -> Dict[str, Any]:
+    catalog = PAY_PRODUCT_CATALOG.get(product_type)
+    if not catalog:
+        raise HTTPException(status_code=400, detail="invalid product type")
+    product = catalog.get(product_key)
+    if not product:
+        raise HTTPException(status_code=400, detail="invalid product key")
+    return product
+
+
+def _describe_pay_product(product_type: str, product_key: str, product: Dict[str, Any]) -> str:
+    if product_type == "ocr_calls":
+        return f"sKrt OCR calls {product_key} x{int(product.get('calls') or 0)}"
+    if product_type == "ocr_tokens":
+        return f"sKrt OCR tokens {product_key} x{int(product.get('tokens') or 0)}"
+    if product_type == "cloud_capacity":
+        storage_gb = int(product.get("storage_bytes") or 0) // (1024 * 1024 * 1024)
+        return f"sKrt cloud pack {product_key} +{int(product.get('doc_bonus') or 0)} docs/{storage_gb}GB"
+    return f"sKrt product {product_key}"
+
+
+def _credit_tenant_quota(tenant_id: str, delta_documents: int, delta_storage_bytes: int, *, reason: str) -> None:
+    if delta_documents == 0 and delta_storage_bytes == 0:
+        return
     conn = _conn()
     try:
         conn.execute(
             """
-            INSERT INTO pay_orders(order_no, tenant_id, client_id, pack_key, pages, amount_cny, status, provider, channel)
-            VALUES(?,?,?,?,?,?, 'pending', ?, ?)
+            INSERT INTO tenant_quota_entitlements(tenant_id, doc_bonus, storage_bytes_bonus)
+            VALUES(?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE
+            SET doc_bonus = doc_bonus + excluded.doc_bonus,
+                storage_bytes_bonus = storage_bytes_bonus + excluded.storage_bytes_bonus,
+                updated_at = CURRENT_TIMESTAMP
             """,
-            (order_no, tenant_id, client_id, pack_key, calls, amount_cny, _pay_provider_name(), channel),
+            (tenant_id, delta_documents, delta_storage_bytes),
+        )
+        conn.execute(
+            "INSERT INTO tenant_quota_ledger(tenant_id, delta_documents, delta_storage_bytes, reason) VALUES(?,?,?,?)",
+            (tenant_id, delta_documents, delta_storage_bytes, reason),
         )
         conn.commit()
-        return {"order_no": order_no, "calls": calls, "pages": calls, "amount_cny": amount_cny, "channel": channel}
+    finally:
+        conn.close()
+
+
+def _get_tenant_quota_bonus(tenant_id: str) -> Dict[str, int]:
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT doc_bonus, storage_bytes_bonus FROM tenant_quota_entitlements WHERE tenant_id=?",
+            (tenant_id,),
+        ).fetchone()
+        return {
+            "doc_bonus": int(row["doc_bonus"]) if row else 0,
+            "storage_bytes_bonus": int(row["storage_bytes_bonus"]) if row else 0,
+        }
+    finally:
+        conn.close()
+
+
+def _create_pay_order(
+    tenant_id: str,
+    client_id: str,
+    product_type: str,
+    product_key: str,
+    channel: str,
+    provider_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    product = _get_pay_product(product_type, product_key)
+    resolved_provider = (provider_name or _pay_provider_name()).strip().lower()
+    if channel not in _pay_provider_supported_channels(resolved_provider):
+        raise HTTPException(status_code=400, detail="invalid payment channel")
+    order_no = _new_order_no()
+    calls = int(product.get("calls") or 0)
+    tokens = int(product.get("tokens") or 0)
+    credit_documents = int(product.get("doc_bonus") or 0)
+    credit_storage_bytes = int(product.get("storage_bytes") or 0)
+    amount_cny = float(product["amount_cny"])
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO pay_orders(
+                order_no, tenant_id, client_id, product_type, product_key, pack_key, pages,
+                credit_tokens, credit_documents, credit_storage_bytes, amount_cny, status, provider, channel
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?)
+            """,
+            (
+                order_no,
+                tenant_id,
+                client_id,
+                product_type,
+                product_key,
+                product_key,
+                calls,
+                tokens,
+                credit_documents,
+                credit_storage_bytes,
+                amount_cny,
+                resolved_provider,
+                channel,
+            ),
+        )
+        conn.commit()
+        return {
+            "order_no": order_no,
+            "product_type": product_type,
+            "product_key": product_key,
+            "calls": calls,
+            "pages": calls,
+            "tokens": tokens,
+            "credit_documents": credit_documents,
+            "credit_storage_bytes": credit_storage_bytes,
+            "amount_cny": amount_cny,
+            "channel": channel,
+            "subject": _describe_pay_product(product_type, product_key, product),
+        }
     finally:
         conn.close()
 
@@ -1727,7 +1908,15 @@ def _get_pay_order(order_no: str) -> Optional[Any]:
         conn.close()
 
 
-def _log_pay_callback(order_no: str, payload: Dict[str, Any], *, sign_ok: bool, handled: bool, result_text: str) -> None:
+def _log_pay_callback(
+    order_no: str,
+    payload: Dict[str, Any],
+    *,
+    sign_ok: bool,
+    handled: bool,
+    result_text: str,
+    provider_name: Optional[str] = None,
+) -> None:
     conn = _conn()
     try:
         conn.execute(
@@ -1735,7 +1924,14 @@ def _log_pay_callback(order_no: str, payload: Dict[str, Any], *, sign_ok: bool, 
             INSERT INTO pay_callbacks(provider, event_type, order_no, payload_text, sign_ok, handled, result_text)
             VALUES(?, 'notify', ?, ?, ?, ?, ?)
             """,
-            (_pay_provider_name(), order_no, json.dumps(payload, ensure_ascii=False), int(sign_ok), int(handled), str(result_text)),
+            (
+                (provider_name or _pay_provider_name()),
+                order_no,
+                json.dumps(payload, ensure_ascii=False),
+                int(sign_ok),
+                int(handled),
+                str(result_text),
+            ),
         )
         conn.commit()
     finally:
@@ -1755,19 +1951,53 @@ def _mark_order_paid_if_needed(order_no: str, transaction_id: str = "", provider
         tenant_id = str(row["tenant_id"])
         client_id = str(row["client_id"])
         pages = int(row["pages"] or 0)
-        conn.execute(
-            """
-            INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance)
-            VALUES(?, ?, ?)
-            ON CONFLICT(tenant_id, client_id) DO UPDATE
-            SET pages_balance = pages_balance + excluded.pages_balance, updated_at=CURRENT_TIMESTAMP
-            """,
-            (tenant_id, client_id, pages),
-        )
-        conn.execute(
-            "INSERT INTO gpu_ocr_paid_pages_ledger(tenant_id, client_id, delta_pages, reason) VALUES(?,?,?,?)",
-            (tenant_id, client_id, pages, f"pay_order_credit:{order_no}"),
-        )
+        credit_tokens = int(row["credit_tokens"] or 0)
+        credit_documents = int(row["credit_documents"] or 0)
+        credit_storage_bytes = int(row["credit_storage_bytes"] or 0)
+        if pages:
+            conn.execute(
+                """
+                INSERT INTO gpu_ocr_paid_pages_balance(tenant_id, client_id, pages_balance)
+                VALUES(?, ?, ?)
+                ON CONFLICT(tenant_id, client_id) DO UPDATE
+                SET pages_balance = pages_balance + excluded.pages_balance, updated_at=CURRENT_TIMESTAMP
+                """,
+                (tenant_id, client_id, pages),
+            )
+            conn.execute(
+                "INSERT INTO gpu_ocr_paid_pages_ledger(tenant_id, client_id, delta_pages, reason) VALUES(?,?,?,?)",
+                (tenant_id, client_id, pages, f"pay_order_credit:{order_no}"),
+            )
+        if credit_tokens:
+            conn.execute(
+                """
+                INSERT INTO ocr_token_balance(tenant_id, client_id, tokens_balance)
+                VALUES(?, ?, ?)
+                ON CONFLICT(tenant_id, client_id) DO UPDATE
+                SET tokens_balance = tokens_balance + excluded.tokens_balance, updated_at=CURRENT_TIMESTAMP
+                """,
+                (tenant_id, client_id, credit_tokens),
+            )
+            conn.execute(
+                "INSERT INTO ocr_token_ledger(tenant_id, client_id, delta_tokens, reason) VALUES(?,?,?,?)",
+                (tenant_id, client_id, credit_tokens, f"pay_order_credit:{order_no}"),
+            )
+        if credit_documents or credit_storage_bytes:
+            conn.execute(
+                """
+                INSERT INTO tenant_quota_entitlements(tenant_id, doc_bonus, storage_bytes_bonus)
+                VALUES(?, ?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE
+                SET doc_bonus = doc_bonus + excluded.doc_bonus,
+                    storage_bytes_bonus = storage_bytes_bonus + excluded.storage_bytes_bonus,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (tenant_id, credit_documents, credit_storage_bytes),
+            )
+            conn.execute(
+                "INSERT INTO tenant_quota_ledger(tenant_id, delta_documents, delta_storage_bytes, reason) VALUES(?,?,?,?)",
+                (tenant_id, credit_documents, credit_storage_bytes, f"pay_order_credit:{order_no}"),
+            )
         conn.execute(
             """
             UPDATE pay_orders
@@ -1796,6 +2026,8 @@ def _refund_order_pages(order_no: str) -> Dict[str, Any]:
         row = conn.execute("SELECT * FROM pay_orders WHERE order_no=?", (order_no,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="订单不存在")
+        if str(row["product_type"] or "ocr_calls") != "ocr_calls":
+            raise HTTPException(status_code=400, detail="当前仅支持 OCR 次数包退款")
         if str(row["status"]) not in {"paid", "refund_pending_settlement"}:
             raise HTTPException(status_code=400, detail="订单状态不允许退款")
         tenant_id = str(row["tenant_id"])
@@ -2474,42 +2706,67 @@ async def send_gpu_redeem_code(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"发送失败: {exc}")
 
 
+@app.get("/gpu/ocr/pay/config")
+async def get_gpu_pay_config() -> Dict[str, Any]:
+    providers = _pay_enabled_providers()
+    provider_name = providers[0]
+    return {
+        "ok": True,
+        "provider": provider_name,
+        "providers": providers,
+        "supported_channels": _pay_provider_supported_channels(provider_name),
+        "provider_channels": {provider: _pay_provider_supported_channels(provider) for provider in providers},
+    }
+
+
 @app.post("/gpu/ocr/pay/order/create")
 async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) -> Dict[str, Any]:
-    provider = _get_payment_provider()
+    enabled_providers = _pay_enabled_providers()
+    provider_name = str(body.provider or enabled_providers[0]).strip().lower()
+    if provider_name not in enabled_providers:
+        raise HTTPException(status_code=400, detail="provider not enabled")
+    provider = _get_payment_provider(provider_name)
     notify_url = (os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip()
     return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
-    if not notify_url:
+    if provider_name != "paypal" and not notify_url:
         raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
     tenant_id, client_id = _ocr_billing_tenant_client(request)
-    created = _create_pay_order(tenant_id, client_id, body.pack_key, body.channel)
+    product_type = str(body.product_type or "ocr_calls")
+    product_key = str(body.product_key or body.pack_key or "").strip()
+    if not product_key:
+        raise HTTPException(status_code=400, detail="missing product key")
+    created = _create_pay_order(tenant_id, client_id, product_type, product_key, body.channel, provider_name=provider_name)
     order_no = str(created["order_no"])
     calls = int(created.get("calls") or created.get("pages") or 0)
+    tokens = int(created.get("tokens") or 0)
+    credit_documents = int(created.get("credit_documents") or 0)
+    credit_storage_bytes = int(created.get("credit_storage_bytes") or 0)
     amount_cny = float(created["amount_cny"])
     channel = str(created["channel"])
     total_fee = _amount_to_fen(amount_cny)
     logger.info(
-        "create payment order request order_no=%s tenant_id=%s client_id=%s pack_key=%s channel=%s amount_cny=%.2f notify_url=%s return_url=%s provider=%s",
+        "create payment order request order_no=%s tenant_id=%s client_id=%s product_type=%s product_key=%s channel=%s amount_cny=%.2f notify_url=%s return_url=%s provider=%s",
         order_no,
         tenant_id,
         client_id,
-        body.pack_key,
+        product_type,
+        product_key,
         channel,
         amount_cny,
         notify_url,
         return_url,
-        _pay_provider_name(),
+        provider_name,
     )
     try:
         created_rsp = provider.create_order(
             order_no=order_no,
             amount_fen=total_fee,
             channel=channel,
-            subject=f"sKrt 次数包{body.pack_key} {calls}次",
+            subject=str(created.get("subject") or f"sKrt {product_type} {product_key}"),
             notify_url=notify_url,
         )
     except Exception as exc:
-        logger.exception("create payment order failed provider=%s order_no=%s channel=%s", _pay_provider_name(), order_no, channel)
+        logger.exception("create payment order failed provider=%s order_no=%s channel=%s", provider_name, order_no, channel)
         raise HTTPException(status_code=502, detail=f"支付下单失败: {exc}")
     provider_order_id = str(created_rsp.provider_order_id or "")
     conn = _conn()
@@ -2535,13 +2792,19 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     return {
         "ok": True,
         "order_no": order_no,
-        "pack_key": body.pack_key,
+        "product_type": product_type,
+        "product_key": product_key,
+        "pack_key": product_key,
         "channel": channel,
         "calls": calls,
         "pages": calls,
+        "tokens": tokens,
+        "credit_documents": credit_documents,
+        "credit_storage_bytes": credit_storage_bytes,
         "amount_cny": amount_cny,
         "status": "pending",
-        "provider": _pay_provider_name(),
+        "provider": provider_name,
+        "pay_hint": str(created_rsp.raw.get("pay_hint") or ""),
         "code_url": code_url,
         "pay_page_url": pay_page_url,
         "qr_image_url": qr_image_url,
@@ -2557,6 +2820,21 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
     order = dict(row)
     if str(order.get("tenant_id")) != tenant_id or str(order.get("client_id")) != client_id:
         raise HTTPException(status_code=403, detail="订单不属于当前用户")
+    if str(order.get("status") or "pending") == "pending":
+        provider = _get_payment_provider(str(order.get("provider") or ""))
+        try:
+            sync_result = provider.sync_order_status(
+                order_no=order_no,
+                provider_order_id=str(order.get("provider_order_id") or order.get("payjs_order_id") or ""),
+            )
+            if sync_result and sync_result.paid:
+                order = _mark_order_paid_if_needed(
+                    order_no=order_no,
+                    transaction_id=sync_result.transaction_id,
+                    provider_order_id=sync_result.provider_order_id,
+                )
+        except Exception:
+            logger.exception("payment sync failed order_no=%s provider=%s", order_no, str(order.get("provider") or ""))
     return {
         "ok": True,
         "order_no": str(order.get("order_no") or ""),
@@ -2564,9 +2842,14 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
         "status": str(order.get("status") or "pending"),
         "channel": str(order.get("channel") or "wechat_native"),
         "refund_status": str(order.get("refund_status") or "none"),
+        "product_type": str(order.get("product_type") or "ocr_calls"),
+        "product_key": str(order.get("product_key") or order.get("pack_key") or ""),
         "pack_key": str(order.get("pack_key") or ""),
         "calls": int(order.get("pages") or 0),
         "pages": int(order.get("pages") or 0),
+        "tokens": int(order.get("credit_tokens") or 0),
+        "credit_documents": int(order.get("credit_documents") or 0),
+        "credit_storage_bytes": int(order.get("credit_storage_bytes") or 0),
         "amount_cny": float(order.get("amount_cny") or 0),
         "credited_pages": int(order.get("credited_pages") or 0),
         "reverted_pages": int(order.get("reverted_pages") or 0),
@@ -2575,7 +2858,6 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
 
 @app.post("/gpu/ocr/pay/notify")
 async def notify_gpu_pay_order(request: Request) -> PlainTextResponse:
-    provider = _get_payment_provider()
     payload: Dict[str, Any] = {}
     try:
         form = await request.form()
@@ -2589,17 +2871,24 @@ async def notify_gpu_pay_order(request: Request) -> PlainTextResponse:
                 payload = {str(k): str(v) for k, v in raw.items()}
         except Exception:
             payload = {}
+    order_hint = str(payload.get("out_trade_no") or payload.get("mchOrderNo") or payload.get("order_no") or payload.get("invoice_id") or "")
+    provider_name = ""
+    if order_hint:
+        row = _get_pay_order(order_hint)
+        if row:
+            provider_name = str(dict(row).get("provider") or "")
+    provider = _get_payment_provider(provider_name or None)
     try:
         notify_result = provider.verify_notify(payload)
     except Exception:
         order_no = str(payload.get("out_trade_no") or "")
-        _log_pay_callback(order_no, payload, sign_ok=False, handled=False, result_text="bad_sign")
+        _log_pay_callback(order_no, payload, sign_ok=False, handled=False, result_text="bad_sign", provider_name=provider_name)
         logger.warning("payment notify invalid sign order_no=%s payload_keys=%s", order_no, ",".join(sorted(payload.keys())))
         return PlainTextResponse("fail", status_code=403)
     order_no = notify_result.order_no
     if not notify_result.paid:
         status_val = str(payload.get("trade_status") or payload.get("status") or "")
-        _log_pay_callback(order_no, payload, sign_ok=True, handled=False, result_text=f"ignore_status:{status_val}")
+        _log_pay_callback(order_no, payload, sign_ok=True, handled=False, result_text=f"ignore_status:{status_val}", provider_name=provider_name)
         logger.info("payment notify ignored order_no=%s status=%s", order_no, status_val)
         return PlainTextResponse("success")
     _mark_order_paid_if_needed(
@@ -2607,7 +2896,7 @@ async def notify_gpu_pay_order(request: Request) -> PlainTextResponse:
         transaction_id=notify_result.transaction_id,
         provider_order_id=notify_result.provider_order_id,
     )
-    _log_pay_callback(order_no, payload, sign_ok=True, handled=True, result_text="credited")
+    _log_pay_callback(order_no, payload, sign_ok=True, handled=True, result_text="credited", provider_name=provider_name)
     logger.info(
         "payment notify credited order_no=%s transaction_id=%s provider_order_id=%s",
         order_no,
@@ -2631,7 +2920,7 @@ async def refund_gpu_pay_order(order_no: str, request: Request, body: PayOrderRe
     order = dict(row)
     if str(order.get("tenant_id")) != tenant_id or str(order.get("client_id")) != client_id:
         raise HTTPException(status_code=403, detail="订单不属于当前用户")
-    provider = _get_payment_provider()
+    provider = _get_payment_provider(str(order.get("provider") or ""))
     provider_order_id = str(order.get("provider_order_id") or order.get("payjs_order_id") or "")
     try:
         provider.refund(order_no=order_no, provider_order_id=provider_order_id)

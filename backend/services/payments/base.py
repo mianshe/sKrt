@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -22,6 +22,15 @@ class PaymentNotifyResult:
     raw: Dict[str, Any]
 
 
+@dataclass
+class PaymentSyncResult:
+    status: str
+    paid: bool
+    transaction_id: str
+    provider_order_id: str
+    raw: Dict[str, Any]
+
+
 class PaymentProvider:
     def create_order(self, *, order_no: str, amount_fen: int, channel: str, subject: str, notify_url: str) -> PaymentCreateResult:
         raise NotImplementedError
@@ -31,3 +40,6 @@ class PaymentProvider:
 
     def refund(self, *, order_no: str, provider_order_id: str = "") -> Dict[str, Any]:
         raise NotImplementedError
+
+    def sync_order_status(self, *, order_no: str, provider_order_id: str = "") -> Optional[PaymentSyncResult]:
+        return None

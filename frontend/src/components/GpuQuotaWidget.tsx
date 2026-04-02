@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { GPU_OCR_CALL_PACKS } from "../config/gpuOcrPricing";
 import { API_BASE } from "../config/apiBase";
+import { PAY_PRODUCTS, describePayProduct, formatPayChannel, getPayProduct, listPayProducts, type PayChannel, type PayProduct, type PayProductType } from "../config/payProducts";
 import { useAccessToken } from "../lib/auth";
 import { formatApiFetchError } from "../lib/fetchErrors";
 import { withTenantHeaders } from "../hooks/useDocuments";
@@ -30,8 +30,10 @@ type PendingPayOrder = {
   orderNo: string;
   qrImageUrl: string;
   payPageUrl?: string;
-  packKey: "A" | "B" | "C";
-  channel: "wechat_native" | "alipay_qr";
+  provider: string;
+  productType: PayProductType;
+  productKey: string;
+  channel: PayChannel;
 };
 
 type GpuQuotaWidgetProps = {
@@ -48,8 +50,11 @@ function readPendingPayOrder(): PendingPayOrder | null {
       typeof parsed?.orderNo !== "string" ||
       typeof parsed?.qrImageUrl !== "string" ||
       (parsed?.payPageUrl != null && typeof parsed.payPageUrl !== "string") ||
-      (parsed?.packKey !== "A" && parsed?.packKey !== "B" && parsed?.packKey !== "C") ||
-      (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr")
+      typeof parsed?.provider !== "string" ||
+      (parsed?.productType !== "ocr_calls" && parsed?.productType !== "ocr_tokens" && parsed?.productType !== "cloud_capacity") ||
+      typeof parsed?.productKey !== "string" ||
+      !parsed.productKey ||
+      (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr" && parsed?.channel !== "paypal")
     ) {
       return null;
     }
@@ -72,6 +77,13 @@ function clearPendingPayOrder() {
 function broadcastQuotaRefresh() {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(GPU_QUOTA_REFRESH_EVENT));
+}
+
+function productCreditText(product: PayProduct): string {
+  if (product.type === "ocr_calls") return `${product.calls ?? 0} 次`;
+  if (product.type === "ocr_tokens") return `${product.tokens ?? 0} token`;
+  const storageGb = Math.round((product.storageBytes ?? 0) / (1024 * 1024 * 1024));
+  return `+${product.docBonus ?? 0} 文档 / ${storageGb}GB`;
 }
 
 export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
@@ -100,8 +112,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const orderNoRef = useRef("");
   const [payStatus, setPayStatus] = useState<"idle" | "creating" | "pending" | "paid" | "error">("idle");
   const [payMessage, setPayMessage] = useState("");
-  const [selectedPackKey, setSelectedPackKey] = useState<"A" | "B" | "C">("A");
-  const [payChannel, setPayChannel] = useState<"wechat_native" | "alipay_qr">("wechat_native");
+  const [payProvider, setPayProvider] = useState("easypay");
+  const [availableProviders, setAvailableProviders] = useState<string[]>(["easypay"]);
+  const [providerChannels, setProviderChannels] = useState<Record<string, PayChannel[]>>({ easypay: ["wechat_native", "alipay_qr"] });
+  const [supportedChannels, setSupportedChannels] = useState<PayChannel[]>(["wechat_native", "alipay_qr"]);
+  const [selectedProductType, setSelectedProductType] = useState<PayProductType>("ocr_calls");
+  const [selectedProductKey, setSelectedProductKey] = useState("A");
+  const [payChannel, setPayChannel] = useState<PayChannel>("wechat_native");
   const [orderNo, setOrderNo] = useState("");
   const [orderQrImage, setOrderQrImage] = useState("");
   const [orderPayPageUrl, setOrderPayPageUrl] = useState("");
@@ -110,9 +127,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const accessToken = useAccessToken();
   const loggedIn = Boolean(accessToken);
 
-  const selectedPack = useMemo(
-    () => GPU_OCR_CALL_PACKS.find((item) => item.key === selectedPackKey) ?? GPU_OCR_CALL_PACKS[0],
-    [selectedPackKey]
+  const selectedProduct = useMemo<PayProduct>(
+    () => getPayProduct(selectedProductType, selectedProductKey) ?? PAY_PRODUCTS[0],
+    [selectedProductKey, selectedProductType]
   );
 
   const isIosSafari = useMemo(() => {
@@ -141,10 +158,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     };
   }, []);
 
-  const recommendedPayChannel = useMemo<"wechat_native" | "alipay_qr">(() => {
+  const recommendedPayChannel = useMemo<PayChannel>(() => {
+    if (payProvider === "paypal") return "paypal";
     const ua = window.navigator.userAgent.toLowerCase();
     return /alipayclient/.test(ua) ? "alipay_qr" : "wechat_native";
-  }, []);
+  }, [payProvider]);
 
   const refreshQuota = async () => {
     try {
@@ -187,7 +205,47 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
   };
 
-  const checkPayOrderStatus = async (currentOrderNo: string, expectedCalls: number) => {
+  const refreshPayConfig = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/gpu/ocr/pay/config`, {
+        headers: withTenantHeaders(),
+        credentials: "include",
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      const providers = Array.isArray(data?.providers)
+        ? data.providers.filter((item: unknown): item is string => typeof item === "string" && item.length > 0)
+        : [];
+      const provider = typeof data?.provider === "string" ? data.provider : providers[0] || "easypay";
+      const channelMap: Record<string, PayChannel[]> =
+        data?.provider_channels && typeof data.provider_channels === "object" ? data.provider_channels : {};
+      const channels = Array.isArray(data?.supported_channels)
+        ? (data.supported_channels.filter(
+            (item: unknown): item is PayChannel =>
+              item === "wechat_native" || item === "alipay_qr" || item === "paypal"
+          ) as PayChannel[])
+        : [];
+      setAvailableProviders(providers.length > 0 ? providers : [provider]);
+      setProviderChannels(channelMap);
+      setPayProvider(provider);
+      if (channels.length > 0) {
+        setSupportedChannels(channels);
+        setPayChannel((current) => (channels.includes(current) ? current : channels[0]));
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    const channels = providerChannels[payProvider];
+    if (Array.isArray(channels) && channels.length > 0) {
+      setSupportedChannels(channels);
+      setPayChannel((current) => (channels.includes(current) ? current : channels[0]));
+    }
+  }, [payProvider, providerChannels]);
+
+  const checkPayOrderStatus = async (currentOrderNo: string, product: PayProduct) => {
     const response = await fetch(`${API_BASE}/gpu/ocr/pay/order/${currentOrderNo}`, {
       headers: withTenantHeaders(),
       credentials: "include",
@@ -201,9 +259,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     if (status === "paid") {
       clearPendingPayOrder();
       setPayStatus("paid");
-      setPayMessage(`已到账 ${expectedCalls} 次`);
-      setStatusNotice(`支付成功，已自动到账 ${expectedCalls} 次`);
+      const creditText = productCreditText(product);
+      setPayMessage(`已到账 ${creditText}`);
+      setStatusNotice(`支付成功，已自动到账 ${creditText}`);
       await refreshQuota();
+      await refreshComplexOcrQuota();
       broadcastQuotaRefresh();
       return;
     }
@@ -223,7 +283,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
     const pending = readPendingPayOrder();
     if (pending) {
-      setSelectedPackKey(pending.packKey);
+      setPayProvider(pending.provider || payProvider);
+      setSelectedProductType(pending.productType);
+      setSelectedProductKey(pending.productKey);
       setPayChannel(pending.channel);
       setOrderNo(pending.orderNo);
       setOrderQrImage(pending.qrImageUrl);
@@ -233,7 +295,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       return;
     }
 
-    setPayChannel(recommendedPayChannel);
+    setPayChannel(supportedChannels.includes(recommendedPayChannel) ? recommendedPayChannel : supportedChannels[0] ?? "wechat_native");
     setPayStatus("idle");
     setPayMessage("");
     setOrderNo("");
@@ -251,6 +313,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     }
     void refreshQuota();
     void refreshComplexOcrQuota();
+    void refreshPayConfig();
   }, [authSession, loggedIn]);
 
   useEffect(() => {
@@ -306,7 +369,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     const pending = readPendingPayOrder();
     if (!pending) return;
 
-    setSelectedPackKey(pending.packKey);
+    setSelectedProductType(pending.productType);
+    setSelectedProductKey(pending.productKey);
+    setPayProvider(pending.provider || payProvider);
     setPayChannel(pending.channel);
     setOrderNo(pending.orderNo);
     setOrderQrImage(pending.qrImageUrl);
@@ -319,17 +384,17 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     if (!orderNo || payStatus !== "pending") return;
 
     let stopped = false;
-    void checkPayOrderStatus(orderNo, selectedPack.calls);
+    void checkPayOrderStatus(orderNo, selectedProduct);
     const timer = window.setInterval(() => {
       if (stopped) return;
-      void checkPayOrderStatus(orderNo, selectedPack.calls);
+      void checkPayOrderStatus(orderNo, selectedProduct);
     }, 2000);
 
     return () => {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [orderNo, payStatus, selectedPack.calls]);
+  }, [orderNo, payStatus, selectedProduct]);
 
   useEffect(() => {
     if (!loggedIn) return;
@@ -341,8 +406,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       void refreshQuota();
       const currentOrderNo = orderNoRef.current;
       if (!currentOrderNo) return;
-      const pendingPack = GPU_OCR_CALL_PACKS.find((item) => item.key === selectedPackKey) ?? selectedPack;
-      void checkPayOrderStatus(currentOrderNo, pendingPack.calls);
+      const pendingProduct = getPayProduct(selectedProductType, selectedProductKey) ?? selectedProduct;
+      void checkPayOrderStatus(currentOrderNo, pendingProduct);
     };
 
     window.addEventListener(GPU_QUOTA_REFRESH_EVENT, onQuotaRefresh);
@@ -353,7 +418,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       window.removeEventListener("focus", onWindowFocus);
       document.removeEventListener("visibilitychange", onWindowFocus);
     };
-  }, [loggedIn, selectedPack, selectedPackKey]);
+  }, [loggedIn, selectedProduct, selectedProductKey, selectedProductType]);
 
   useEffect(() => {
     if (payStatus !== "paid") return;
@@ -526,7 +591,12 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         method: "POST",
         headers: withTenantHeaders({ "Content-Type": "application/json" }),
         credentials: "include",
-        body: JSON.stringify({ pack_key: selectedPack.key, channel: payChannel }),
+        body: JSON.stringify({
+          provider: payProvider,
+          product_type: selectedProduct.type,
+          product_key: selectedProduct.key,
+          channel: payChannel,
+        }),
       });
       const data = await response.json().catch(() => ({}));
       if (!payOpenRef.current || reqId !== payReqIdRef.current) return;
@@ -541,20 +611,23 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       const nextOrderNo = typeof data?.order_no === "string" ? data.order_no : "";
       const nextQrImage = typeof data?.qr_image_url === "string" ? data.qr_image_url : "";
       const nextPayPageUrl = typeof data?.pay_page_url === "string" ? data.pay_page_url : "";
+      const payHint = typeof data?.pay_hint === "string" ? data.pay_hint : "";
       setOrderNo(nextOrderNo);
       setOrderQrImage(nextQrImage);
       setOrderPayPageUrl(nextPayPageUrl);
       setPayStatus("pending");
-      setPayMessage(payChannel === "alipay_qr" ? "请使用支付宝扫码完成支付" : "请使用微信扫码完成支付");
+      setPayMessage(payHint || (payChannel === "paypal" ? "请在新页面完成 PayPal 支付" : `请使用${formatPayChannel(payChannel)}完成支付`));
       if (nextPayPageUrl) {
-        setPayMessage("支付页已生成，可直接打开支付页，也可以继续扫码");
+        setPayMessage("支付页已生成，可直接打开支付页继续完成付款");
       }
       if (nextOrderNo && (nextQrImage || nextPayPageUrl)) {
         writePendingPayOrder({
           orderNo: nextOrderNo,
           qrImageUrl: nextQrImage,
           payPageUrl: nextPayPageUrl,
-          packKey: selectedPack.key,
+          provider: payProvider,
+          productType: selectedProduct.type,
+          productKey: selectedProduct.key,
           channel: payChannel,
         });
       }
@@ -692,15 +765,42 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         <p className="text-sm font-semibold text-slate-800">购买外部 OCR 次数包</p>
         <p className="mt-1 text-xs text-slate-500">支付完成后会自动到账。即使关闭弹窗，系统也会继续轮询订单状态。</p>
 
-        <ul className="mt-2 space-y-1 rounded-xl bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600 ring-1 ring-slate-100">
-          {GPU_OCR_CALL_PACKS.map((pack) => (
-            <li key={pack.key}>
-              <span className="font-medium text-slate-700">{pack.name}</span>
-              ：共 <strong>{pack.calls}</strong> 次，总价 <strong>¥{pack.priceCny}</strong>，单次约{" "}
-              <strong>¥{pack.pricePerCallCny.toFixed(4)}</strong>
-            </li>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {(["ocr_calls", "ocr_tokens", "cloud_capacity"] as PayProductType[]).map((type) => (
+            <button
+              key={type}
+              className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
+                selectedProductType === type
+                  ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                  : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+              }`}
+              onClick={() => {
+                setSelectedProductType(type);
+                setSelectedProductKey(listPayProducts(type)[0]?.key ?? "");
+              }}
+              disabled={payStatus === "creating" || payStatus === "pending"}
+            >
+              {type === "ocr_calls" ? "OCR 次数包" : type === "ocr_tokens" ? "复杂 OCR Token" : "云端容量包"}
+            </button>
           ))}
-        </ul>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          {availableProviders.map((provider) => (
+            <button
+              key={provider}
+              className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
+                payProvider === provider
+                  ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                  : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+              }`}
+              onClick={() => setPayProvider(provider)}
+              disabled={payStatus === "creating" || payStatus === "pending"}
+            >
+              {provider === "paypal" ? "PayPal 直连" : provider === "xpay" ? "XPay 聚合" : provider}
+            </button>
+          ))}
+        </div>
 
         <div className="mt-3 flex gap-2">
           <button
@@ -710,7 +810,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
                 : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
             }`}
             onClick={() => setPayChannel("wechat_native")}
-            disabled={payStatus === "creating" || payStatus === "pending"}
+            disabled={payStatus === "creating" || payStatus === "pending" || !supportedChannels.includes("wechat_native")}
           >
             微信
           </button>
@@ -721,9 +821,20 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
                 : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
             }`}
             onClick={() => setPayChannel("alipay_qr")}
-            disabled={payStatus === "creating" || payStatus === "pending"}
+            disabled={payStatus === "creating" || payStatus === "pending" || !supportedChannels.includes("alipay_qr")}
           >
             支付宝
+          </button>
+          <button
+            className={`rounded-xl px-3 py-1.5 text-xs ring-1 transition ${
+              payChannel === "paypal"
+                ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
+                : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
+            }`}
+            onClick={() => setPayChannel("paypal")}
+            disabled={payStatus === "creating" || payStatus === "pending" || !supportedChannels.includes("paypal")}
+          >
+            PayPal
           </button>
           <span className="self-center text-[11px] text-slate-400">
             默认推荐：{recommendedPayChannel === "alipay_qr" ? "支付宝" : "微信"}
@@ -731,21 +842,19 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         </div>
 
         <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-          {GPU_OCR_CALL_PACKS.map((pack) => (
+          {listPayProducts(selectedProductType).map((product) => (
             <button
-              key={pack.key}
+              key={product.key}
               className={`rounded-xl px-3 py-2 text-left text-xs ring-1 transition ${
-                selectedPackKey === pack.key
+                selectedProductKey === product.key
                   ? "bg-emerald-50 text-emerald-700 ring-emerald-300"
                   : "bg-white text-slate-600 ring-slate-200 hover:bg-slate-50"
               }`}
-              onClick={() => setSelectedPackKey(pack.key)}
+              onClick={() => setSelectedProductKey(product.key)}
               disabled={payStatus === "creating" || payStatus === "pending"}
             >
-              <div className="font-semibold">{pack.name}</div>
-              <div className="mt-0.5 text-[11px] text-slate-500">
-                {pack.calls} 次 · ¥{pack.priceCny}
-              </div>
+              <div className="font-semibold">{product.name}</div>
+              <div className="mt-0.5 text-[11px] text-slate-500">{describePayProduct(product)}</div>
             </button>
           ))}
         </div>
@@ -774,7 +883,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
             <button
               className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
               onClick={() => {
-                void checkPayOrderStatus(orderNo, selectedPack.calls);
+                void checkPayOrderStatus(orderNo, selectedProduct);
               }}
             >
               刷新状态
