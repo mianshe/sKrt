@@ -1111,7 +1111,7 @@ def _init_db() -> None:
             )
             """
         )
-        pay_order_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pay_orders)").fetchall()}
+        pay_order_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(pay_orders)").fetchall()}
         if "product_type" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN product_type TEXT NOT NULL DEFAULT 'ocr_calls'")
         if "product_key" not in pay_order_columns:
