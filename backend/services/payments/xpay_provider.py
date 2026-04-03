@@ -6,6 +6,7 @@ import os
 from decimal import Decimal
 from typing import Any, Dict
 from urllib.parse import quote, urlencode
+from urllib.error import HTTPError
 from urllib.request import Request as UrlRequest, urlopen
 
 from .base import PaymentCreateResult, PaymentNotifyResult, PaymentProvider, PaymentSyncResult
@@ -24,6 +25,11 @@ class XPayProvider(PaymentProvider):
         self.create_timeout = max(3, int((os.getenv("XPAY_CREATE_TIMEOUT") or "12").strip() or "12"))
         self.status_timeout = max(2, int((os.getenv("XPAY_STATUS_TIMEOUT") or "6").strip() or "6"))
 
+    def _add_common_headers(self, req: UrlRequest) -> None:
+        req.add_header("Accept", "application/json,text/plain,*/*")
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Referer", f"{self.api_base}/")
+
     def _ensure_enabled(self) -> None:
         missing = []
         if not self.api_base:
@@ -38,9 +44,15 @@ class XPayProvider(PaymentProvider):
         body = urlencode({k: str(v) for k, v in form.items() if v is not None}).encode("utf-8")
         req = UrlRequest(url=url, data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-        req.add_header("Accept", "application/json,text/plain,*/*")
-        with urlopen(req, timeout=self.create_timeout) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8", errors="ignore")
+        self._add_common_headers(req)
+        try:
+            with urlopen(req, timeout=self.create_timeout) as resp:  # nosec B310
+                raw = resp.read().decode("utf-8", errors="ignore")
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="ignore").strip()
+            if body_text:
+                raise RuntimeError(f"xpay_http_{exc.code}: {body_text[:300]}") from exc
+            raise RuntimeError(f"xpay_http_{exc.code}") from exc
         try:
             parsed = json.loads(raw or "{}")
         except Exception as exc:
@@ -52,9 +64,15 @@ class XPayProvider(PaymentProvider):
     def _get_json(self, path: str) -> Dict[str, Any]:
         url = f"{self.api_base}/{path.lstrip('/')}"
         req = UrlRequest(url=url, method="GET")
-        req.add_header("Accept", "application/json,text/plain,*/*")
-        with urlopen(req, timeout=self.status_timeout) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8", errors="ignore")
+        self._add_common_headers(req)
+        try:
+            with urlopen(req, timeout=self.status_timeout) as resp:  # nosec B310
+                raw = resp.read().decode("utf-8", errors="ignore")
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="ignore").strip()
+            if body_text:
+                raise RuntimeError(f"xpay_http_{exc.code}: {body_text[:300]}") from exc
+            raise RuntimeError(f"xpay_http_{exc.code}") from exc
         try:
             parsed = json.loads(raw or "{}")
         except Exception as exc:
