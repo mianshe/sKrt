@@ -2919,8 +2919,10 @@ async def xpay_wechat_qr_image() -> Response:
     url = f"{api_base}/assets/qr/wechat/custom.png"
     req = UrlRequest(url=url, method="GET")
     req.add_header("Accept", "image/png,image/*;q=0.8,*/*;q=0.5")
+    req.add_header("User-Agent", "Mozilla/5.0")
+    req.add_header("Referer", f"{api_base}/")
     try:
-        with urlopen(req, timeout=20) as resp:  # nosec B310
+        with urlopen(req, timeout=8) as resp:  # nosec B310
             data = resp.read()
             content_type = str(resp.headers.get("Content-Type") or "image/png")
     except Exception as exc:

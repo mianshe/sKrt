@@ -111,6 +111,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const payOpenRef = useRef(false);
   const payReqIdRef = useRef(0);
   const orderNoRef = useRef("");
+  const payStatusPollInFlightRef = useRef(false);
   const [payStatus, setPayStatus] = useState<"idle" | "creating" | "pending" | "paid" | "error">("idle");
   const [payMessage, setPayMessage] = useState("");
   const [payProvider, setPayProvider] = useState("easypay");
@@ -264,6 +265,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   }, [payProvider, providerChannels]);
 
   const checkPayOrderStatus = async (currentOrderNo: string, product: PayProduct) => {
+    if (payStatusPollInFlightRef.current) return;
+    payStatusPollInFlightRef.current = true;
+    try {
     const response = await fetch(`${API_BASE}/gpu/ocr/pay/order/${currentOrderNo}`, {
       headers: withTenantHeaders(),
       credentials: "include",
@@ -292,6 +296,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setPayStatus("error");
       setPayMessage(`订单状态：${status}`);
       setStatusNotice(`订单状态已更新：${status}`);
+    }
+    } finally {
+      payStatusPollInFlightRef.current = false;
     }
   };
 
@@ -405,15 +412,20 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     if (!orderNo || payStatus !== "pending") return;
 
     let stopped = false;
-    void checkPayOrderStatus(orderNo, selectedProduct);
-    const timer = window.setInterval(() => {
+    let timer: number | null = null;
+    const poll = async () => {
       if (stopped) return;
-      void checkPayOrderStatus(orderNo, selectedProduct);
-    }, 2000);
+      await checkPayOrderStatus(orderNo, selectedProduct);
+      if (stopped || orderNoRef.current !== orderNo) return;
+      timer = window.setTimeout(() => {
+        void poll();
+      }, 5000);
+    };
+    void poll();
 
     return () => {
       stopped = true;
-      window.clearInterval(timer);
+      if (timer != null) window.clearTimeout(timer);
     };
   }, [orderNo, payStatus, selectedProduct]);
 

@@ -21,6 +21,8 @@ class XPayProvider(PaymentProvider):
         self.info_prefix = (os.getenv("XPAY_INFO_PREFIX") or "sKrt").strip() or "sKrt"
         self.test_email = (os.getenv("XPAY_TEST_EMAIL") or "").strip()
         self.force_custom = (os.getenv("XPAY_FORCE_CUSTOM") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.create_timeout = max(3, int((os.getenv("XPAY_CREATE_TIMEOUT") or "12").strip() or "12"))
+        self.status_timeout = max(2, int((os.getenv("XPAY_STATUS_TIMEOUT") or "6").strip() or "6"))
 
     def _ensure_enabled(self) -> None:
         missing = []
@@ -37,7 +39,7 @@ class XPayProvider(PaymentProvider):
         req = UrlRequest(url=url, data=body, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
         req.add_header("Accept", "application/json,text/plain,*/*")
-        with urlopen(req, timeout=20) as resp:  # nosec B310
+        with urlopen(req, timeout=self.create_timeout) as resp:  # nosec B310
             raw = resp.read().decode("utf-8", errors="ignore")
         try:
             parsed = json.loads(raw or "{}")
@@ -51,7 +53,7 @@ class XPayProvider(PaymentProvider):
         url = f"{self.api_base}/{path.lstrip('/')}"
         req = UrlRequest(url=url, method="GET")
         req.add_header("Accept", "application/json,text/plain,*/*")
-        with urlopen(req, timeout=20) as resp:  # nosec B310
+        with urlopen(req, timeout=self.status_timeout) as resp:  # nosec B310
             raw = resp.read().decode("utf-8", errors="ignore")
         try:
             parsed = json.loads(raw or "{}")
