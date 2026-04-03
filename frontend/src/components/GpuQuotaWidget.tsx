@@ -88,6 +88,22 @@ function broadcastQuotaRefresh() {
   window.dispatchEvent(new CustomEvent(GPU_QUOTA_REFRESH_EVENT));
 }
 
+function normalizePaymentUrl(rawUrl: string): string {
+  if (!rawUrl || typeof window === "undefined") return rawUrl;
+  try {
+    const currentOrigin = window.location.origin;
+    const apiUrl = new URL(API_BASE, currentOrigin);
+    const parsed = new URL(rawUrl, currentOrigin);
+    if (parsed.origin === apiUrl.origin) return parsed.toString();
+    if (/^https?:$/.test(parsed.protocol) && parsed.pathname.startsWith("/gpu/")) {
+      return `${apiUrl.origin}${API_BASE.replace(/\/$/, "")}${parsed.pathname}${parsed.search}`;
+    }
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
 function productCreditText(product: PayProduct): string {
   if (product.type === "ocr_calls") return `${product.calls ?? 0} 次`;
   return `${product.tokens ?? 0} token`;
@@ -321,8 +337,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setSelectedProductKey(pending.productKey);
       setPayChannel(pending.channel);
       setOrderNo(pending.orderNo);
-      setOrderQrImage(pending.qrImageUrl);
-      setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? pending.payPageUrl : "");
+      setOrderQrImage(normalizePaymentUrl(pending.qrImageUrl));
+      setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? normalizePaymentUrl(pending.payPageUrl) : "");
       setPayStatus("pending");
       setPayMessage("检测到未完成订单，请继续扫码或等待到账");
       return;
@@ -409,8 +425,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setPayProvider(pending.provider || payProvider);
     setPayChannel(pending.channel);
     setOrderNo(pending.orderNo);
-    setOrderQrImage(pending.qrImageUrl);
-    setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? pending.payPageUrl : "");
+    setOrderQrImage(normalizePaymentUrl(pending.qrImageUrl));
+    setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? normalizePaymentUrl(pending.payPageUrl) : "");
     setPayStatus("pending");
     setPayMessage("检测到未完成订单，正在自动查询到账状态");
   }, [loggedIn, authSession]);
@@ -649,8 +665,8 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       }
 
       const nextOrderNo = typeof data?.order_no === "string" ? data.order_no : "";
-      const nextQrImage = typeof data?.qr_image_url === "string" ? data.qr_image_url : "";
-      const nextPayPageUrl = typeof data?.pay_page_url === "string" ? data.pay_page_url : "";
+      const nextQrImage = typeof data?.qr_image_url === "string" ? normalizePaymentUrl(data.qr_image_url) : "";
+      const nextPayPageUrl = typeof data?.pay_page_url === "string" ? normalizePaymentUrl(data.pay_page_url) : "";
       const payHint = typeof data?.pay_hint === "string" ? data.pay_hint : "";
       setOrderNo(nextOrderNo);
       setOrderQrImage(nextQrImage);
