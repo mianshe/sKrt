@@ -1093,6 +1093,8 @@ def _init_db() -> None:
                 credit_embedding_tokens INTEGER NOT NULL DEFAULT 0,
                 credit_documents INTEGER NOT NULL DEFAULT 0,
                 credit_storage_bytes INTEGER NOT NULL DEFAULT 0,
+                original_amount_cny REAL NOT NULL DEFAULT 0,
+                random_discount_cny REAL NOT NULL DEFAULT 0,
                 amount_cny REAL NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 provider TEXT NOT NULL DEFAULT 'easypay',
@@ -1128,6 +1130,10 @@ def _init_db() -> None:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_documents INTEGER NOT NULL DEFAULT 0")
         if "credit_storage_bytes" not in pay_order_columns:
             conn.execute("ALTER TABLE pay_orders ADD COLUMN credit_storage_bytes INTEGER NOT NULL DEFAULT 0")
+        if "original_amount_cny" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN original_amount_cny REAL NOT NULL DEFAULT 0")
+        if "random_discount_cny" not in pay_order_columns:
+            conn.execute("ALTER TABLE pay_orders ADD COLUMN random_discount_cny REAL NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_lookup ON pay_orders(order_no, tenant_id, client_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_orders_status ON pay_orders(status, created_at)")
         # PayJS 回调审计日志
@@ -1671,6 +1677,9 @@ PAY_EMBEDDING_TOKEN_PACKS: Dict[str, Dict[str, Any]] = {
     "S3": {"tokens": 90000, "amount_cny": 129.9},
 }
 
+MANUAL_PAY_RANDOM_DISCOUNT_OPTIONS: Tuple[Decimal, ...] = tuple(Decimal(f"0.0{i}") for i in range(1, 10))
+MANUAL_PAY_RANDOM_DISCOUNT_WINDOW_MINUTES = 30
+
 PAY_PRODUCT_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     "ocr_calls": PAY_OCR_CALL_PACKS,
     "glm_ocr_tokens": PAY_GLM_OCR_TOKEN_PACKS,
@@ -1843,6 +1852,50 @@ def _describe_pay_product(product_type: str, product_key: str, product: Dict[str
     return f"sKrt product {product_key}"
 
 
+def _allocate_manual_pay_amount(base_amount_cny: float, provider_name: str, channel: str) -> Tuple[float, float]:
+    base_amount = Decimal(str(base_amount_cny)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if provider_name != "xpay" or channel != "wechat_native":
+        return float(base_amount), 0.0
+    lower_bound = float((base_amount - Decimal("0.09")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    upper_bound = float(base_amount)
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT amount_cny
+            FROM pay_orders
+            WHERE provider=? AND channel=? AND status='pending'
+              AND amount_cny BETWEEN ? AND ?
+              AND created_at >= datetime('now', ?)
+            ORDER BY created_at DESC
+            """,
+            (
+                provider_name,
+                channel,
+                lower_bound,
+                upper_bound,
+                f"-{MANUAL_PAY_RANDOM_DISCOUNT_WINDOW_MINUTES} minutes",
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+    used_discounts = set()
+    for row in rows:
+        try:
+            discount = (base_amount - Decimal(str(row["amount_cny"] or 0))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except Exception:
+            continue
+        if Decimal("0.01") <= discount <= Decimal("0.09"):
+            used_discounts.add(discount)
+    for discount in MANUAL_PAY_RANDOM_DISCOUNT_OPTIONS:
+        final_amount = (base_amount - discount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if final_amount <= Decimal("0.00"):
+            continue
+        if discount not in used_discounts:
+            return float(final_amount), float(discount)
+    raise HTTPException(status_code=429, detail="当前微信支付排队较多，请稍后重试")
+
+
 def _credit_tenant_quota(tenant_id: str, delta_documents: int, delta_storage_bytes: int, *, reason: str) -> None:
     if delta_documents == 0 and delta_storage_bytes == 0:
         return
@@ -1902,16 +1955,18 @@ def _create_pay_order(
     embedding_tokens = int(product.get("tokens") or 0) if normalized_type == "embedding_tokens" else 0
     credit_documents = int(product.get("doc_bonus") or 0)
     credit_storage_bytes = int(product.get("storage_bytes") or 0)
-    amount_cny = float(product["amount_cny"])
+    original_amount_cny = float(product["amount_cny"])
+    amount_cny, random_discount_cny = _allocate_manual_pay_amount(original_amount_cny, resolved_provider, channel)
     conn = _conn()
     try:
         conn.execute(
             """
             INSERT INTO pay_orders(
                 order_no, tenant_id, client_id, product_type, product_key, pack_key, pages,
-                credit_tokens, credit_embedding_tokens, credit_documents, credit_storage_bytes, amount_cny, status, provider, channel
+                credit_tokens, credit_embedding_tokens, credit_documents, credit_storage_bytes,
+                original_amount_cny, random_discount_cny, amount_cny, status, provider, channel
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', ?, ?)
             """,
             (
                 order_no,
@@ -1925,6 +1980,8 @@ def _create_pay_order(
                 embedding_tokens,
                 credit_documents,
                 credit_storage_bytes,
+                original_amount_cny,
+                random_discount_cny,
                 amount_cny,
                 resolved_provider,
                 channel,
@@ -1942,6 +1999,8 @@ def _create_pay_order(
             "embedding_tokens": embedding_tokens,
             "credit_documents": credit_documents,
             "credit_storage_bytes": credit_storage_bytes,
+            "original_amount_cny": original_amount_cny,
+            "random_discount_cny": random_discount_cny,
             "amount_cny": amount_cny,
             "channel": channel,
             "subject": _describe_pay_product(normalized_type, product_key, product),
@@ -2886,6 +2945,11 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         qr_image_url = f"{request.url_for('xpay_wechat_qr_image')}?order_no={quote_plus(order_no)}&ts={int(time.time())}"
     if not qr_image_url and code_url:
         qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}"
+    pay_hint = str(created_rsp.raw.get("pay_hint") or "")
+    original_amount_cny = float(created.get("original_amount_cny") or amount_cny)
+    random_discount_cny = float(created.get("random_discount_cny") or 0)
+    if provider_name == "xpay" and channel == "wechat_native" and random_discount_cny > 0:
+        pay_hint = f"限时随机优惠 -{random_discount_cny:.2f} 元，请按 {amount_cny:.2f} 元付款。{pay_hint}"
     return {
         "ok": True,
         "order_no": order_no,
@@ -2900,10 +2964,12 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
         "embedding_tokens": embedding_tokens,
         "credit_documents": credit_documents,
         "credit_storage_bytes": credit_storage_bytes,
+        "original_amount_cny": original_amount_cny,
+        "random_discount_cny": random_discount_cny,
         "amount_cny": amount_cny,
         "status": "pending",
         "provider": provider_name,
-        "pay_hint": str(created_rsp.raw.get("pay_hint") or ""),
+        "pay_hint": pay_hint,
         "code_url": code_url,
         "pay_page_url": pay_page_url,
         "qr_image_url": qr_image_url,
@@ -2995,6 +3061,8 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
         "embedding_tokens": int(order.get("credit_embedding_tokens") or 0),
         "credit_documents": int(order.get("credit_documents") or 0),
         "credit_storage_bytes": int(order.get("credit_storage_bytes") or 0),
+        "original_amount_cny": float(order.get("original_amount_cny") or order.get("amount_cny") or 0),
+        "random_discount_cny": float(order.get("random_discount_cny") or 0),
         "amount_cny": float(order.get("amount_cny") or 0),
         "credited_pages": int(order.get("credited_pages") or 0),
         "reverted_pages": int(order.get("reverted_pages") or 0),

@@ -36,6 +36,9 @@ type PendingPayOrder = {
   productKey: string;
   channel: PayChannel;
   createdAt: number;
+  amountCny?: number;
+  originalAmountCny?: number;
+  randomDiscountCny?: number;
 };
 
 type GpuQuotaWidgetProps = {
@@ -59,7 +62,10 @@ function readPendingPayOrder(): PendingPayOrder | null {
       typeof parsed?.productKey !== "string" ||
       !parsed.productKey ||
       (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr" && parsed?.channel !== "paypal") ||
-      typeof parsed?.createdAt !== "number"
+      typeof parsed?.createdAt !== "number" ||
+      (parsed?.amountCny != null && typeof parsed.amountCny !== "number") ||
+      (parsed?.originalAmountCny != null && typeof parsed.originalAmountCny !== "number") ||
+      (parsed?.randomDiscountCny != null && typeof parsed.randomDiscountCny !== "number")
     ) {
       return null;
     }
@@ -147,6 +153,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [orderNo, setOrderNo] = useState("");
   const [orderQrImage, setOrderQrImage] = useState("");
   const [orderPayPageUrl, setOrderPayPageUrl] = useState("");
+  const [orderAmountCny, setOrderAmountCny] = useState<number | null>(null);
+  const [orderOriginalAmountCny, setOrderOriginalAmountCny] = useState<number | null>(null);
+  const [orderRandomDiscountCny, setOrderRandomDiscountCny] = useState<number | null>(null);
   const [statusNotice, setStatusNotice] = useState("");
 
   const accessToken = useAccessToken();
@@ -339,6 +348,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setOrderNo(pending.orderNo);
       setOrderQrImage(normalizePaymentUrl(pending.qrImageUrl));
       setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? normalizePaymentUrl(pending.payPageUrl) : "");
+      setOrderAmountCny(typeof pending.amountCny === "number" ? pending.amountCny : null);
+      setOrderOriginalAmountCny(typeof pending.originalAmountCny === "number" ? pending.originalAmountCny : null);
+      setOrderRandomDiscountCny(typeof pending.randomDiscountCny === "number" ? pending.randomDiscountCny : null);
       setPayStatus("pending");
       setPayMessage("检测到未完成订单，请继续扫码或等待到账");
       return;
@@ -350,6 +362,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setOrderNo("");
     setOrderQrImage("");
     setOrderPayPageUrl("");
+    setOrderAmountCny(null);
+    setOrderOriginalAmountCny(null);
+    setOrderRandomDiscountCny(null);
   };
 
   useEffect(() => {
@@ -413,6 +428,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setOrderNo("");
       setOrderQrImage("");
       setOrderPayPageUrl("");
+      setOrderAmountCny(null);
+      setOrderOriginalAmountCny(null);
+      setOrderRandomDiscountCny(null);
       setPayStatus("idle");
       return;
     }
@@ -427,6 +445,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setOrderNo(pending.orderNo);
     setOrderQrImage(normalizePaymentUrl(pending.qrImageUrl));
     setOrderPayPageUrl(typeof pending.payPageUrl === "string" ? normalizePaymentUrl(pending.payPageUrl) : "");
+    setOrderAmountCny(typeof pending.amountCny === "number" ? pending.amountCny : null);
+    setOrderOriginalAmountCny(typeof pending.originalAmountCny === "number" ? pending.originalAmountCny : null);
+    setOrderRandomDiscountCny(typeof pending.randomDiscountCny === "number" ? pending.randomDiscountCny : null);
     setPayStatus("pending");
     setPayMessage("检测到未完成订单，正在自动查询到账状态");
   }, [loggedIn, authSession]);
@@ -483,6 +504,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       setOrderNo("");
       setOrderQrImage("");
       setOrderPayPageUrl("");
+      setOrderAmountCny(null);
+      setOrderOriginalAmountCny(null);
+      setOrderRandomDiscountCny(null);
       setPayStatus("idle");
       setPayMessage("");
     }, 2200);
@@ -640,6 +664,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setOrderNo("");
     setOrderQrImage("");
     setOrderPayPageUrl("");
+    setOrderAmountCny(null);
+    setOrderOriginalAmountCny(null);
+    setOrderRandomDiscountCny(null);
     clearPendingPayOrder();
 
     try {
@@ -667,10 +694,16 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       const nextOrderNo = typeof data?.order_no === "string" ? data.order_no : "";
       const nextQrImage = typeof data?.qr_image_url === "string" ? normalizePaymentUrl(data.qr_image_url) : "";
       const nextPayPageUrl = typeof data?.pay_page_url === "string" ? normalizePaymentUrl(data.pay_page_url) : "";
+      const nextAmountCny = typeof data?.amount_cny === "number" ? data.amount_cny : null;
+      const nextOriginalAmountCny = typeof data?.original_amount_cny === "number" ? data.original_amount_cny : null;
+      const nextRandomDiscountCny = typeof data?.random_discount_cny === "number" ? data.random_discount_cny : null;
       const payHint = typeof data?.pay_hint === "string" ? data.pay_hint : "";
       setOrderNo(nextOrderNo);
       setOrderQrImage(nextQrImage);
       setOrderPayPageUrl(nextPayPageUrl);
+      setOrderAmountCny(nextAmountCny);
+      setOrderOriginalAmountCny(nextOriginalAmountCny);
+      setOrderRandomDiscountCny(nextRandomDiscountCny);
       setPayStatus("pending");
       setPayMessage(payHint || (payChannel === "paypal" ? "请在新页面完成 PayPal 支付" : `请使用${formatPayChannel(payChannel)}完成支付`));
       if (nextPayPageUrl) {
@@ -686,6 +719,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
           productKey: selectedProduct.key,
           channel: payChannel,
           createdAt: Date.now(),
+          amountCny: nextAmountCny ?? undefined,
+          originalAmountCny: nextOriginalAmountCny ?? undefined,
+          randomDiscountCny: nextRandomDiscountCny ?? undefined,
         });
       }
     } catch (error) {
@@ -700,6 +736,9 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setOrderNo("");
     setOrderQrImage("");
     setOrderPayPageUrl("");
+    setOrderAmountCny(null);
+    setOrderOriginalAmountCny(null);
+    setOrderRandomDiscountCny(null);
     setPayStatus("idle");
     setPayMessage("已清除旧订单，正在重新创建");
     setStatusNotice("");
@@ -963,6 +1002,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         </div>
 
         {payMessage && <p className="mt-2 text-xs text-slate-600">{payMessage}</p>}
+        {orderAmountCny != null && (
+          <p className="mt-2 text-xs text-emerald-700">
+            {orderOriginalAmountCny != null && orderRandomDiscountCny != null && orderRandomDiscountCny > 0
+              ? `标价 ￥${orderOriginalAmountCny.toFixed(2)}，随机优惠 -￥${orderRandomDiscountCny.toFixed(2)}，实付 ￥${orderAmountCny.toFixed(2)}`
+              : `实付金额 ￥${orderAmountCny.toFixed(2)}`}
+          </p>
+        )}
         {orderNo && <p className="mt-1 text-[11px] text-slate-400">订单号：{orderNo}</p>}
         {orderQrImage && (
           <div className="mt-3 flex items-center justify-center">
