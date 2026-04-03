@@ -1003,6 +1003,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
         {payMessage && <p className="mt-2 text-xs text-slate-600">{payMessage}</p>}
         {orderAmountCny != null && (
+          <div className="mt-2 rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold leading-relaxed text-rose-700 ring-1 ring-rose-200">
+            必须严格按实付金额付款，否则无法自动到账
+          </div>
+        )}
+        {orderAmountCny != null && (
           <p className="mt-2 text-xs text-emerald-700">
             {orderOriginalAmountCny != null && orderRandomDiscountCny != null && orderRandomDiscountCny > 0
               ? `标价 ￥${orderOriginalAmountCny.toFixed(2)}，随机优惠 -￥${orderRandomDiscountCny.toFixed(2)}，实付 ￥${orderAmountCny.toFixed(2)}`

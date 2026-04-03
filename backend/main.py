@@ -2949,6 +2949,11 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     original_amount_cny = float(created.get("original_amount_cny") or amount_cny)
     random_discount_cny = float(created.get("random_discount_cny") or 0)
     if provider_name == "xpay" and channel == "wechat_native" and random_discount_cny > 0:
+        pay_hint = (
+            f"必须严格按实付金额付款，否则无法自动到账。当前实付金额为 {amount_cny:.2f} 元。"
+            f"{pay_hint}"
+        )
+    if provider_name == "xpay" and channel == "wechat_native" and random_discount_cny > 0:
         pay_hint = f"限时随机优惠 -{random_discount_cny:.2f} 元，请按 {amount_cny:.2f} 元付款。{pay_hint}"
     return {
         "ok": True,

@@ -44,6 +44,19 @@ class PayPalProvider(PaymentProvider):
     def _token_cache_key(self) -> str:
         return f"{self.api_base}|{self.client_id}"
 
+    def _clear_cached_token(self) -> None:
+        self._token_cache.pop(self._token_cache_key(), None)
+
+    def _parse_http_error(self, exc: HTTPError) -> Dict[str, Any]:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        try:
+            parsed = json.loads(raw or "{}")
+        except Exception:
+            parsed = {"message": (raw or "").strip()[:500]}
+        if not isinstance(parsed, dict):
+            parsed = {"message": str(parsed)[:500]}
+        return parsed
+
     def _access_token(self) -> str:
         self._ensure_enabled()
         cache_key = self._token_cache_key()
@@ -59,8 +72,18 @@ class PayPalProvider(PaymentProvider):
         req.add_header("Authorization", f"Basic {auth}")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         req.add_header("Accept", "application/json")
-        with urlopen(req, timeout=20) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8", errors="ignore")
+        try:
+            with urlopen(req, timeout=20) as resp:  # nosec B310
+                raw = resp.read().decode("utf-8", errors="ignore")
+        except HTTPError as exc:
+            self._clear_cached_token()
+            parsed = self._parse_http_error(exc)
+            error_code = str(parsed.get("error") or parsed.get("name") or "").strip()
+            description = str(parsed.get("error_description") or parsed.get("message") or "").strip()
+            if exc.code == 401 or error_code in {"invalid_client", "invalid_token"}:
+                hint = "请检查 PAYPAL_MODE、PAYPAL_API_BASE、PAYPAL_CLIENT_ID、PAYPAL_CLIENT_SECRET 是否匹配同一套环境"
+                raise RuntimeError(f"PayPal 鉴权失败: {description or error_code or '401 Unauthorized'}；{hint}") from exc
+            raise RuntimeError(f"paypal_oauth_http_{exc.code}:{description or error_code or 'oauth_failed'}") from exc
         try:
             parsed = json.loads(raw or "{}")
         except Exception as exc:
@@ -80,36 +103,45 @@ class PayPalProvider(PaymentProvider):
         payload: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        token = self._access_token()
         data = None
-        req_headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            **(headers or {}),
-        }
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            req_headers["Content-Type"] = "application/json"
-        req = UrlRequest(url=f"{self.api_base}/{path.lstrip('/')}", data=data, method=method.upper())
-        for key, value in req_headers.items():
-            req.add_header(key, value)
-        try:
-            with urlopen(req, timeout=25) as resp:  # nosec B310
-                raw = resp.read().decode("utf-8", errors="ignore")
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="ignore")
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            token = self._access_token()
+            req_headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                **(headers or {}),
+            }
+            if data is not None:
+                req_headers["Content-Type"] = "application/json"
+            req = UrlRequest(url=f"{self.api_base}/{path.lstrip('/')}", data=data, method=method.upper())
+            for key, value in req_headers.items():
+                req.add_header(key, value)
             try:
-                parsed = json.loads(raw or "{}")
-            except Exception:
-                parsed = {"message": (raw or "").strip()[:500]}
-            message = (
-                parsed.get("message")
-                or parsed.get("error_description")
-                or parsed.get("error")
-                or parsed.get("name")
-                or f"http_{exc.code}"
-            )
-            raise RuntimeError(f"paypal_api_error:{message}") from exc
+                with urlopen(req, timeout=25) as resp:  # nosec B310
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                break
+            except HTTPError as exc:
+                parsed = self._parse_http_error(exc)
+                message = (
+                    parsed.get("message")
+                    or parsed.get("error_description")
+                    or parsed.get("error")
+                    or parsed.get("name")
+                    or f"http_{exc.code}"
+                )
+                if exc.code == 401 and attempt == 0:
+                    logger.warning("paypal api got 401, clearing cached token and retrying path=%s", path)
+                    self._clear_cached_token()
+                    last_error = RuntimeError(f"paypal_api_error:{message}")
+                    continue
+                raise RuntimeError(f"paypal_api_error:{message}") from exc
+        else:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("paypal_api_error:request_failed")
         try:
             parsed = json.loads(raw or "{}")
         except Exception as exc:

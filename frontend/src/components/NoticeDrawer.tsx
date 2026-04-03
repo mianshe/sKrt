@@ -24,6 +24,12 @@ const DEFAULT_NOTICES: Notice[] = [
     body:
       "处理后的文本会保留数据，包括原件副本+过程JSON，默认保存在本地浏览器数据内，可在应用内下载解析后的结果文件。本地保存失败的话数据会自动保存云端，因资源有限，每个账号云端容量100MB，最长保留30天。测试项目云端有限，超额会限制使用。游客使用数据只能保存本地。",
   },
+  {
+    title: "公告三：支付说明",
+    date: "2026-04-03",
+    body:
+      "近期ai低代码产品大量涌现导致大部分聚合支付不提供线上交易支持，本站交易方式采用随机优惠形成随机费用尾号的方式+支付时间生成唯一订单号区分付款方以代替经营码（按照可变收款码收费形成唯一订单号），需规定时间内下单且金额必须输入一致，否则后台无法自动区分订单",
+  },
 ];
 
 export default function NoticeDrawer({ open, onClose, widthPx = 360, notices = DEFAULT_NOTICES }: Props) {
@@ -71,4 +77,3 @@ export default function NoticeDrawer({ open, onClose, widthPx = 360, notices = D
     </>
   );
 }
-
