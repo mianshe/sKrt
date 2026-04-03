@@ -7,7 +7,8 @@ import { withTenantHeaders } from "../hooks/useDocuments";
 import ModalShell from "./ModalShell";
 
 const GPU_QUOTA_REFRESH_EVENT = "gpu-ocr-quota-refresh";
-const PENDING_PAY_ORDER_STORAGE_KEY = "gpu-ocr-pending-pay-order-v1";
+const PENDING_PAY_ORDER_STORAGE_KEY = "gpu-ocr-pending-pay-order-v2";
+const PENDING_PAY_ORDER_MAX_AGE_MS = 30 * 60 * 1000;
 
 type DeferredInstallPrompt = Event & {
   prompt: () => Promise<void>;
@@ -34,6 +35,7 @@ type PendingPayOrder = {
   productType: PayProductType;
   productKey: string;
   channel: PayChannel;
+  createdAt: number;
 };
 
 type GpuQuotaWidgetProps = {
@@ -56,8 +58,13 @@ function readPendingPayOrder(): PendingPayOrder | null {
         parsed?.productType !== "embedding_tokens") ||
       typeof parsed?.productKey !== "string" ||
       !parsed.productKey ||
-      (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr" && parsed?.channel !== "paypal")
+      (parsed?.channel !== "wechat_native" && parsed?.channel !== "alipay_qr" && parsed?.channel !== "paypal") ||
+      typeof parsed?.createdAt !== "number"
     ) {
+      return null;
+    }
+    if (Date.now() - parsed.createdAt > PENDING_PAY_ORDER_MAX_AGE_MS) {
+      clearPendingPayOrder();
       return null;
     }
     return parsed as PendingPayOrder;
@@ -662,6 +669,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
           productType: selectedProduct.type,
           productKey: selectedProduct.key,
           channel: payChannel,
+          createdAt: Date.now(),
         });
       }
     } catch (error) {
