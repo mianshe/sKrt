@@ -179,6 +179,8 @@ export type UploadTaskItem = {
   status: string;
   phase: string;
   progress_percent: number;
+  extract_progress_percent: number;
+  index_progress_percent: number;
   error_message: string;
   retries: number;
 };
@@ -202,6 +204,8 @@ function normalizeTask(task: UploadTaskPayload): UploadTaskItem {
     status: String(task.status || "queued"),
     phase: String(task.phase || task.status || "queued"),
     progress_percent: Number(task.progress_percent || 0),
+    extract_progress_percent: Number(task.extract_progress_percent || 0),
+    index_progress_percent: Number(task.index_progress_percent || 0),
     error_message: String(task.error_message || ""),
     retries: Number(task.retries || 0),
   };

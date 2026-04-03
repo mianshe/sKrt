@@ -87,6 +87,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
   const discipline = "all";
   const mode: "free" = "free";
   const [loading, setLoading] = useState(false);
+  const [queryStatus, setQueryStatus] = useState("");
   const [examFile, setExamFile] = useState<File | null>(null);
   const [examUploading, setExamUploading] = useState(false);
   const [examUploadProgress, setExamUploadProgress] = useState(0);
@@ -119,6 +120,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
     setQuery("");
     setMessages((prev) => [...prev, { role: "user", content: userText }]);
     setLoading(true);
+    setQueryStatus("正在检索相关内容…");
 
     try {
       const resp = await fetch(`${API_BASE}/chat`, {
@@ -128,6 +130,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
       });
       if (!resp.ok) throw new Error("查询请求失败");
       const data = await resp.json();
+      setQueryStatus("正在生成回答…");
 
       const fullText = String(data.answer || "");
       const aiItem: ChatItem = {
@@ -157,6 +160,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
         { role: "assistant", content: err instanceof Error ? err.message : "请求失败，请稍后重试。" },
       ]);
     } finally {
+      setQueryStatus("");
       setLoading(false);
     }
   };
@@ -363,6 +367,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
+        {loading && queryStatus && <p className="mt-2 text-xs text-violet-600">{queryStatus}</p>}
         <div className="mt-2 flex justify-end">
           <button className="btn-primary" disabled={disabled} type="submit">
             {loading ? "处理中..." : "查询"}

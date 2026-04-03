@@ -43,6 +43,30 @@ type Props = {
   authSession?: number;
 };
 
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function splitIndexStage(indexPercent: number, phase: string, status: string): { vector: number; indexBuild: number } {
+  if (status === "completed" || phase === "completed") {
+    return { vector: 100, indexBuild: 100 };
+  }
+  if (phase !== "indexing") {
+    return { vector: 0, indexBuild: 0 };
+  }
+  const normalized = clampPercent(indexPercent);
+  if (normalized <= 80) {
+    return {
+      vector: clampPercent((normalized / 80) * 100),
+      indexBuild: 0,
+    };
+  }
+  return {
+    vector: 100,
+    indexBuild: clampPercent(((normalized - 80) / 20) * 100),
+  };
+}
+
 async function mergeCloudIntoLocalBackups(
   tasks: UploadTaskItem[],
   files: File[],
@@ -83,6 +107,9 @@ function UploadTab({
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [parseProgress, setParseProgress] = useState(0);
+  const [extractProgress, setExtractProgress] = useState(0);
+  const [vectorProgress, setVectorProgress] = useState(0);
+  const [indexBuildProgress, setIndexBuildProgress] = useState(0);
   const [phaseText, setPhaseText] = useState("");
   const [slowHint, setSlowHint] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -123,17 +150,33 @@ function UploadTab({
       while (!done) {
         await new Promise((resolve) => setTimeout(resolve, 900));
         const latest = await Promise.all(taskIds.map((taskId) => onGetTask(taskId)));
-        const avg = latest.reduce((sum, item) => sum + (item.progress_percent || 0), 0) / latest.length;
-        setParseProgress(Math.max(0, Math.min(100, Math.round(avg))));
+        const avgOverall = latest.reduce((sum, item) => sum + (item.progress_percent || 0), 0) / latest.length;
+        const avgExtract = latest.reduce((sum, item) => sum + (item.extract_progress_percent || 0), 0) / latest.length;
+        const stageSplit = latest.reduce(
+          (sum, item) => {
+            const split = splitIndexStage(item.index_progress_percent || 0, item.phase || "", item.status || "");
+            return {
+              vector: sum.vector + split.vector,
+              indexBuild: sum.indexBuild + split.indexBuild,
+            };
+          },
+          { vector: 0, indexBuild: 0 }
+        );
+        setParseProgress(clampPercent(avgOverall));
+        setExtractProgress(clampPercent(avgExtract));
+        setVectorProgress(clampPercent(stageSplit.vector / latest.length));
+        setIndexBuildProgress(clampPercent(stageSplit.indexBuild / latest.length));
         setSlowHint(latest.some((t) => (t.page_count || 0) > 100 && t.status !== "completed"));
 
         const phase = latest.find((item) => item.status !== "completed")?.phase || "completed";
         if (phase === "parsing") {
-          setPhaseText("正在解析文档…");
+          setPhaseText("正在 OCR / 提取文本…");
+        } else if (phase === "splitting") {
+          setPhaseText("正在切分文档，准备向量化…");
         } else if (phase === "indexing") {
-          setPhaseText("正在建立索引…");
+          setPhaseText(avgOverall < 90 ? "正在向量化并写入知识库…" : "正在建立检索索引…");
         } else if (phase === "completed") {
-          setPhaseText("上传与解析已完成");
+          setPhaseText("上传、解析、向量化与建索引已完成");
         } else if (phase === "failed") {
           setPhaseText("任务失败");
         } else {
@@ -214,6 +257,9 @@ function UploadTab({
     setUploading(true);
     setUploadProgress(0);
     setParseProgress(0);
+    setExtractProgress(0);
+    setVectorProgress(0);
+    setIndexBuildProgress(0);
     setPhaseText("正在上传文件…");
     setSlowHint(false);
 
@@ -275,6 +321,9 @@ function UploadTab({
       <div className="card p-4">
         <p className="mb-2 text-xs text-slate-600">
           默认先写入本机（IndexedDB）。勾选「上传云端」后所选文件会参与服务端解析与知识库检索；未勾选时，仅在本机保存失败时自动上传对应文件。
+        </p>
+        <p className="mb-2 text-xs font-medium text-amber-700">
+          未勾选「上传云端」且本机保存成功时，只会保存原件，不会开始云端解析、向量化和建索引。
         </p>
         {authLocalEnabled && (
           <p className="mb-2 text-xs text-violet-700">
@@ -384,13 +433,32 @@ function UploadTab({
             </div>
             <div>
               <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
-                <span>解析与入库</span>
-                <span>{parseProgress}%</span>
+                <span>OCR / 文本提取</span>
+                <span>{extractProgress}%</span>
               </div>
               <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                <div className="h-full bg-emerald-600 transition-all" style={{ width: `${parseProgress}%` }} />
+                <div className="h-full bg-emerald-600 transition-all" style={{ width: `${extractProgress}%` }} />
               </div>
             </div>
+            <div>
+              <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
+                <span>向量化</span>
+                <span>{vectorProgress}%</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+                <div className="h-full bg-cyan-600 transition-all" style={{ width: `${vectorProgress}%` }} />
+              </div>
+            </div>
+            <div>
+              <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
+                <span>建索引</span>
+                <span>{indexBuildProgress}%</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+                <div className="h-full bg-violet-600 transition-all" style={{ width: `${indexBuildProgress}%` }} />
+              </div>
+            </div>
+            <p className="text-[11px] text-slate-500">云端处理总进度 {parseProgress}%</p>
             {phaseText && <p className="text-xs text-slate-600">{phaseText}</p>}
           </div>
         )}
