@@ -2916,6 +2916,7 @@ async def xpay_wechat_qr_image() -> Response:
     api_base = getattr(provider, "api_base", "").strip().rstrip("/")
     if not api_base:
         raise HTTPException(status_code=503, detail="xpay not configured")
+    cache_path = ROOT_DIR / ".cache" / "xpay_wechat_custom.png"
     url = f"{api_base}/assets/qr/wechat/custom.png"
     req = UrlRequest(url=url, method="GET")
     req.add_header("Accept", "image/png,image/*;q=0.8,*/*;q=0.5")
@@ -2925,10 +2926,18 @@ async def xpay_wechat_qr_image() -> Response:
         with urlopen(req, timeout=8) as resp:  # nosec B310
             data = resp.read()
             content_type = str(resp.headers.get("Content-Type") or "image/png")
+        if data:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(data)
+        return Response(content=data, media_type=content_type)
     except Exception as exc:
+        if cache_path.exists():
+            try:
+                return Response(content=cache_path.read_bytes(), media_type="image/png")
+            except Exception:
+                logger.exception("xpay wechat qr cache read failed path=%s", cache_path)
         logger.exception("xpay wechat qr proxy failed url=%s", url)
         raise HTTPException(status_code=502, detail=f"xpay qr proxy failed: {exc}") from exc
-    return Response(content=data, media_type=content_type)
 
 
 @app.get("/gpu/ocr/pay/order/{order_no}")
