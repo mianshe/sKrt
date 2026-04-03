@@ -2883,7 +2883,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     pay_page_url = str(created_rsp.payment_url or "")
     qr_image_url = str(created_rsp.qr_image_url or "")
     if provider_name == "xpay" and channel == "wechat_native" and qr_image_url:
-        qr_image_url = str(request.url_for("xpay_wechat_qr_image"))
+        qr_image_url = f"{request.url_for('xpay_wechat_qr_image')}?order_no={quote_plus(order_no)}&ts={int(time.time())}"
     if not qr_image_url and code_url:
         qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={quote_plus(code_url)}"
     return {
@@ -2929,11 +2929,25 @@ async def xpay_wechat_qr_image() -> Response:
         if data:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_bytes(data)
-        return Response(content=data, media_type=content_type)
+        return Response(
+            content=data,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
     except Exception as exc:
         if cache_path.exists():
             try:
-                return Response(content=cache_path.read_bytes(), media_type="image/png")
+                return Response(
+                    content=cache_path.read_bytes(),
+                    media_type="image/png",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                        "Pragma": "no-cache",
+                    },
+                )
             except Exception:
                 logger.exception("xpay wechat qr cache read failed path=%s", cache_path)
         logger.exception("xpay wechat qr proxy failed url=%s", url)
