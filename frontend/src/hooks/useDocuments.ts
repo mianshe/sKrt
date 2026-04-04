@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { LocalProcessSnapshot } from "../lib/localUserBackup";
 import { API_BASE } from "../config/apiBase";
 import { getAccessToken, setAccessToken, useAccessToken } from "../lib/auth";
+import type { EmbeddingMode } from "../lib/embeddingMode";
 
 const TENANT_KEY = "xm_tenant_id";
 const CLIENT_KEY = "xm_client_id";
@@ -84,6 +85,7 @@ export class ExternalOcrConfirmRequiredError extends Error {
     public readonly resumeContext: {
       discipline: string;
       documentType: string;
+      embeddingMode: EmbeddingMode;
       useGpuOcr: boolean;
       onUploadPercent?: (n: number) => void;
     },
@@ -336,6 +338,7 @@ async function createSingleFileTask(
   file: File,
   discipline: string,
   documentType: string,
+  embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
   externalOcrConfirmed: boolean
 ): Promise<UploadTaskItem> {
@@ -344,6 +347,7 @@ async function createSingleFileTask(
   const url = new URL(`${API_BASE}/upload/tasks`);
   url.searchParams.set("discipline", discipline);
   url.searchParams.set("document_type", documentType);
+  url.searchParams.set("embedding_mode", embeddingMode);
   url.searchParams.set("ocr_mode", ocrMode);
   url.searchParams.set("external_ocr_confirmed", externalOcrConfirmed ? "1" : "0");
   let resp: Response;
@@ -382,6 +386,7 @@ async function postChunkComplete(
   uploadId: string,
   discipline: string,
   documentType: string,
+  embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
   externalOcrConfirmed: boolean
 ): Promise<Response> {
@@ -392,6 +397,7 @@ async function postChunkComplete(
       discipline,
       document_type: documentType,
       purpose: "docs",
+      embedding_mode: embeddingMode,
       ocr_mode: ocrMode,
       external_ocr_confirmed: externalOcrConfirmed,
     }),
@@ -403,9 +409,10 @@ export async function resumeChunkUploadAfterExternalOcrConfirm(
   uploadId: string,
   discipline: string,
   documentType: string,
+  embeddingMode: EmbeddingMode,
   ocrMode: OcrMode
 ): Promise<UploadTaskItem> {
-  const completeResp = await postChunkComplete(uploadId, discipline, documentType, ocrMode, true);
+  const completeResp = await postChunkComplete(uploadId, discipline, documentType, embeddingMode, ocrMode, true);
   if (!completeResp.ok) {
     const t = await completeResp.text();
     throw new Error(t || "分片合并失败");
@@ -422,6 +429,7 @@ async function createSingleFileChunkTask(
   file: File,
   discipline: string,
   documentType: string,
+  embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
   externalOcrConfirmed: boolean,
   onUploadPercent?: (n: number) => void
@@ -434,6 +442,7 @@ async function createSingleFileChunkTask(
     discipline,
     document_type: documentType,
     purpose: "docs" as const,
+    embedding_mode: embeddingMode,
     ocr_mode: ocrMode,
   };
   let initResp: Response;
@@ -479,7 +488,14 @@ async function createSingleFileChunkTask(
 
   let completeResp: Response;
   try {
-    completeResp = await postChunkComplete(upload_id, discipline, documentType, ocrMode, externalOcrConfirmed);
+    completeResp = await postChunkComplete(
+      upload_id,
+      discipline,
+      documentType,
+      embeddingMode,
+      ocrMode,
+      externalOcrConfirmed
+    );
   } catch {
     throw new Error(`无法连接后端（${API_BASE}/upload/chunks/.../complete）。${backendHint()}`);
   }
@@ -497,6 +513,7 @@ async function createSingleFileChunkTask(
         {
           discipline,
           documentType,
+          embeddingMode,
           useGpuOcr: ocrMode === "complex_layout",
           onUploadPercent,
         },
@@ -628,10 +645,12 @@ export function useDocuments() {
       discipline: string,
       documentType: string,
       onUploadProgress?: (percent: number) => void,
-      options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean }
+      options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean; embedding_mode?: EmbeddingMode }
     ): Promise<UploadTaskItem[]> => {
       if (!files.length) return [];
       const normalizedDiscipline = discipline.trim().toLowerCase() || "all";
+      const embeddingMode: EmbeddingMode =
+        options?.embedding_mode === "local" || options?.embedding_mode === "api" ? options.embedding_mode : "auto";
       const ocrMode: OcrMode = options?.ocr_mode === "complex_layout" ? "complex_layout" : "standard";
       const externalOcrConfirmed = Boolean(options?.external_ocr_confirmed);
       const all: UploadTaskItem[] = [];
@@ -643,6 +662,7 @@ export function useDocuments() {
                 file,
                 normalizedDiscipline,
                 documentType,
+                embeddingMode,
                 ocrMode,
                 externalOcrConfirmed,
                 (p) => {
@@ -651,7 +671,14 @@ export function useDocuments() {
                   onUploadProgress?.(Math.min(99, base + local));
                 }
               )
-            : await createSingleFileTask(file, normalizedDiscipline, documentType, ocrMode, externalOcrConfirmed);
+            : await createSingleFileTask(
+                file,
+                normalizedDiscipline,
+                documentType,
+                embeddingMode,
+                ocrMode,
+                externalOcrConfirmed
+              );
         completed += 1;
         onUploadProgress?.(Math.round((completed / files.length) * 100));
         all.push(task);

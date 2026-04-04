@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from backend.services import embedding_token_billing
 from backend.services import knowledge_store
+from backend.services.billing_mode import is_self_hosted_embedding_billing
 
 from .free_ai_router import FreeAIRouter
 
@@ -15,16 +16,30 @@ from .free_ai_router import FreeAIRouter
 class RAGEngine:
     def __init__(self, ai_router: FreeAIRouter) -> None:
         self.ai_router = ai_router
-        self.embedding_model_id = self.ai_router.get_active_embedding_model_id()
 
-    async def index_chunks(self, document_id: int, chunks: List[Dict[str, Any]]) -> None:
-        await self.index_chunks_for_tenant(document_id=document_id, chunks=chunks, tenant_id="public")
+    async def index_chunks(
+        self, document_id: int, chunks: List[Dict[str, Any]], embedding_mode: str = "auto"
+    ) -> Dict[str, Any]:
+        return await self.index_chunks_for_tenant(
+            document_id=document_id,
+            chunks=chunks,
+            tenant_id="public",
+            embedding_mode=embedding_mode,
+        )
 
-    async def index_chunks_for_tenant(self, document_id: int, chunks: List[Dict[str, Any]], tenant_id: str) -> None:
+    async def index_chunks_for_tenant(
+        self,
+        document_id: int,
+        chunks: List[Dict[str, Any]],
+        tenant_id: str,
+        embedding_mode: str = "auto",
+    ) -> Dict[str, Any]:
         conn = knowledge_store.connect()
+        last_embedding_resp: Dict[str, Any] = {}
         try:
             for chunk in chunks:
-                embedding_resp = await self.ai_router.embed(chunk["content"])
+                embedding_resp = await self.ai_router.embed(chunk["content"], embedding_mode=embedding_mode)
+                last_embedding_resp = dict(embedding_resp)
                 embedding = embedding_resp["embedding"]
                 conn.execute(
                     """
@@ -44,6 +59,7 @@ class RAGEngine:
             conn.commit()
         finally:
             conn.close()
+        return last_embedding_resp
 
     async def hybrid_search(
         self,
@@ -54,9 +70,11 @@ class RAGEngine:
         tenant_id: Optional[str] = None,
         billing_client_id: Optional[str] = None,
         billing_exempt: bool = False,
+        embedding_mode: str = "auto",
     ) -> Dict[str, Any]:
-        embedding_resp = await self.ai_router.embed(query)
+        embedding_resp = await self.ai_router.embed(query, embedding_mode=embedding_mode)
         query_vec = embedding_resp["embedding"]
+        query_model_id = str(embedding_resp.get("model_id") or "").strip()
         self._charge_query_embedding_if_needed(
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
@@ -64,7 +82,12 @@ class RAGEngine:
             embedding_resp=embedding_resp,
             reason="search_query_embedding",
         )
-        rows = self._fetch_rows(discipline_filter, document_id=document_id, tenant_id=tenant_id)
+        rows = self._fetch_rows(
+            discipline_filter,
+            document_id=document_id,
+            tenant_id=tenant_id,
+            embedding_model_id=query_model_id,
+        )
         if not rows:
             return {"results": [], "cross_discipline": []}
 
@@ -84,6 +107,7 @@ class RAGEngine:
         tenant_id: Optional[str] = None,
         billing_client_id: Optional[str] = None,
         billing_exempt: bool = False,
+        embedding_mode: str = "auto",
     ) -> Dict[str, Any]:
         expanded_k = max(top_k * 3, 18)
         retrieval = await self.hybrid_search(
@@ -94,6 +118,7 @@ class RAGEngine:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         base_rows = retrieval.get("results", [])
         ranked_rows = self._prioritize_for_summary(base_rows, top_k=top_k)
@@ -114,6 +139,7 @@ class RAGEngine:
         tenant_id: Optional[str] = None,
         billing_client_id: Optional[str] = None,
         billing_exempt: bool = False,
+        embedding_mode: str = "auto",
     ) -> Dict[str, Any]:
         """
         Agent-oriented RAG pipeline: retrieve -> lightweight compress -> answer context.
@@ -126,6 +152,7 @@ class RAGEngine:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
         compressed_blocks: List[str] = []
@@ -169,7 +196,7 @@ class RAGEngine:
         embedding_resp: Dict[str, Any],
         reason: str,
     ) -> None:
-        if billing_exempt:
+        if billing_exempt or is_self_hosted_embedding_billing():
             return
         tid = str(tenant_id or "").strip()
         cid = str(billing_client_id or "").strip()
@@ -195,10 +222,16 @@ class RAGEngine:
         limit: Optional[int] = None,
         sampling_strategy: str = "head",
         tenant_id: Optional[str] = None,
+        embedding_model_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not isinstance(document_id, int) or document_id <= 0:
             return []
-        rows = self._fetch_rows(discipline_filter, document_id=document_id, tenant_id=tenant_id)
+        rows = self._fetch_rows(
+            discipline_filter,
+            document_id=document_id,
+            tenant_id=tenant_id,
+            embedding_model_id=embedding_model_id,
+        )
         if not rows:
             return []
         rows.sort(key=lambda x: str(x.get("section_path", "")))
@@ -243,7 +276,11 @@ class RAGEngine:
         return [rows[idx] for idx in ordered_indices]
 
     def _fetch_rows(
-        self, discipline_filter: Optional[str], document_id: Optional[int] = None, tenant_id: Optional[str] = None
+        self,
+        discipline_filter: Optional[str],
+        document_id: Optional[int] = None,
+        tenant_id: Optional[str] = None,
+        embedding_model_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         conn = knowledge_store.connect()
         try:
@@ -289,19 +326,24 @@ class RAGEngine:
                     ((tenant_id,) if tenant_id else ()),
                 )
             rows = [dict(row) for row in cursor.fetchall()]
-            filtered: List[Dict[str, Any]] = []
-            for row in rows:
-                meta = FreeAIRouter.safe_json_loads(str(row.get("metadata", "")), {})
-                model_tag = str(meta.get("embedding_model", "")).strip()
-                # 锁定单向量空间：仅召回与当前 embedding 模型一致的向量。
-                if model_tag and model_tag != self.embedding_model_id:
-                    continue
-                if not model_tag and self.embedding_model_id:
-                    continue
-                filtered.append(row)
-            return filtered
+            return self._filter_rows_by_embedding_model(rows, embedding_model_id=embedding_model_id)
         finally:
             conn.close()
+
+    def _filter_rows_by_embedding_model(
+        self, rows: List[Dict[str, Any]], embedding_model_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        normalized_embedding_model_id = str(embedding_model_id or "").strip()
+        if not normalized_embedding_model_id:
+            return rows
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            meta = FreeAIRouter.safe_json_loads(str(row.get("metadata", "")), {})
+            model_tag = str(meta.get("embedding_model", "")).strip()
+            if model_tag != normalized_embedding_model_id:
+                continue
+            filtered.append(row)
+        return filtered
 
     def _dense_rank(self, rows: List[Dict[str, Any]], query_vec: List[float]) -> List[Dict[str, Any]]:
         ranked = []

@@ -26,6 +26,7 @@ from backend.services.upload_load_control import log_ingestion_event
 from backend.services import gpu_ocr_billing
 from backend.services import ocr_token_billing
 from backend.services import embedding_token_billing
+from backend.services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -165,6 +166,8 @@ class UploadIngestionService:
                 ("page_count", "ALTER TABLE upload_tasks ADD COLUMN page_count INTEGER NOT NULL DEFAULT 0"),
                 ("use_gpu_ocr", "ALTER TABLE upload_tasks ADD COLUMN use_gpu_ocr INTEGER NOT NULL DEFAULT 0"),
                 ("ocr_mode", "ALTER TABLE upload_tasks ADD COLUMN ocr_mode TEXT NOT NULL DEFAULT 'standard'"),
+                ("embedding_mode", "ALTER TABLE upload_tasks ADD COLUMN embedding_mode TEXT NOT NULL DEFAULT 'auto'"),
+                ("embedding_model", "ALTER TABLE upload_tasks ADD COLUMN embedding_model TEXT"),
                 ("ocr_billing_client_id", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_client_id TEXT"),
                 ("ocr_billing_exempt", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_exempt INTEGER NOT NULL DEFAULT 0"),
                 ("ocr_provider", "ALTER TABLE upload_tasks ADD COLUMN ocr_provider TEXT"),
@@ -272,6 +275,7 @@ class UploadIngestionService:
         *,
         storage_basename: Optional[str] = None,
         ocr_mode: str = "standard",
+        embedding_mode: str = "auto",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
@@ -291,8 +295,8 @@ class UploadIngestionService:
                 conn,
                 """
                 INSERT INTO upload_tasks (tenant_id, filename, file_path, discipline, document_type, status, phase, file_size_bytes,
-                    ocr_mode, ocr_billing_client_id, ocr_billing_exempt)
-                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)
+                    ocr_mode, embedding_mode, embedding_model, ocr_billing_client_id, ocr_billing_exempt)
+                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tenant_id,
@@ -302,6 +306,8 @@ class UploadIngestionService:
                     document_type,
                     file_size_bytes,
                     str(ocr_mode or "standard"),
+                    str(embedding_mode or "auto"),
+                    self.ai_router.get_active_embedding_model_id(embedding_mode),
                     ocr_billing_client_id,
                     1 if ocr_billing_exempt else 0,
                 ),
@@ -320,6 +326,7 @@ class UploadIngestionService:
         *,
         storage_basename: str,
         ocr_mode: str = "standard",
+        embedding_mode: str = "auto",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
     ) -> Dict[str, Any]:
@@ -335,6 +342,7 @@ class UploadIngestionService:
             tenant_id=tenant_id,
             storage_basename=storage_basename,
             ocr_mode=ocr_mode,
+            embedding_mode=embedding_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
         )
@@ -346,8 +354,9 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
-                       ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       ocr_billing_client_id, ocr_billing_exempt, ocr_provider, ocr_call_units, ocr_billable_tokens,
+                       embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -368,8 +377,9 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_billing_client_id, ocr_billing_exempt,
-                       ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       ocr_billing_client_id, ocr_billing_exempt, ocr_provider, ocr_call_units, ocr_billable_tokens,
+                       embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -391,8 +401,8 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, ocr_provider, ocr_call_units, ocr_billable_tokens,
-                       embedding_provider, embedding_billable_tokens,
+                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
                 FROM upload_tasks
@@ -534,6 +544,17 @@ class UploadIngestionService:
         finally:
             conn.close()
 
+    def update_task_embedding_config(self, task_id: int, embedding_mode: str, embedding_model: Optional[str] = None) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE upload_tasks SET embedding_mode = ?, embedding_model = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (str(embedding_mode or "auto"), str(embedding_model or "") or None, int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def update_task_ocr_usage(self, task_id: int, provider: str, call_units: int, billable_tokens: int) -> None:
         conn = self._conn()
         try:
@@ -549,16 +570,54 @@ class UploadIngestionService:
         finally:
             conn.close()
 
-    def update_task_embedding_usage(self, task_id: int, provider: str, billable_tokens: int) -> None:
+    def update_task_embedding_usage(
+        self,
+        task_id: int,
+        provider: str,
+        billable_tokens: int,
+        model_id: Optional[str] = None,
+    ) -> None:
         conn = self._conn()
         try:
             conn.execute(
                 """
                 UPDATE upload_tasks
-                SET embedding_provider = ?, embedding_billable_tokens = ?, updated_at = CURRENT_TIMESTAMP
+                SET embedding_provider = ?, embedding_billable_tokens = ?, embedding_model = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (str(provider or ""), max(0, int(billable_tokens)), int(task_id)),
+                (str(provider or ""), max(0, int(billable_tokens)), str(model_id or "") or None, int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_document_embedding_metadata(
+        self,
+        document_id: int,
+        tenant_id: str,
+        *,
+        embedding_mode: Optional[str] = None,
+        embedding_model: Optional[str] = None,
+        embedding_provider: Optional[str] = None,
+    ) -> None:
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT metadata FROM documents WHERE id = ? AND tenant_id = ?",
+                (int(document_id), str(tenant_id)),
+            ).fetchone()
+            if not row:
+                return
+            meta = FreeAIRouter.safe_json_loads(str(row["metadata"] or ""), {})
+            if embedding_mode is not None:
+                meta["embedding_mode"] = str(embedding_mode or "auto")
+            if embedding_model is not None:
+                meta["embedding_model"] = str(embedding_model or "")
+            if embedding_provider is not None:
+                meta["embedding_provider"] = str(embedding_provider or "")
+            conn.execute(
+                "UPDATE documents SET metadata = ? WHERE id = ? AND tenant_id = ?",
+                (json.dumps(meta, ensure_ascii=False), int(document_id), str(tenant_id)),
             )
             conn.commit()
         finally:
@@ -851,7 +910,7 @@ class UploadIngestionService:
             self.update_task_ocr_usage(task_id, provider=provider, call_units=call_units + bill, billable_tokens=bill_tokens)
 
             use_gpu_flag = bool(int(task.get("use_gpu_ocr") or 0))
-            exempt = bool(int(task.get("ocr_billing_exempt") or 0))
+            exempt = bool(int(task.get("ocr_billing_exempt") or 0)) or is_self_hosted_ocr_billing()
             bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
             if use_gpu_flag and not exempt and bill > 0:
                 bal = gpu_ocr_billing.get_paid_calls_balance(str(tenant_id), bill_cid)
@@ -959,39 +1018,44 @@ class UploadIngestionService:
         )
         task = self._get_task_any(task_id)
         bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
-        exempt = bool(int(task.get("ocr_billing_exempt") or 0))
+        exempt = bool(int(task.get("ocr_billing_exempt") or 0)) or is_self_hosted_ocr_billing()
         attempt = 0
         last_error = ""
         while attempt < self.max_retries:
             attempt += 1
             self._increase_checkpoint_attempt(task_id, chunk.chunk_hash)
             try:
-                embedding_resp = await self.ai_router.embed(chunk.content)
+                embedding_mode = self.ai_router.normalize_embedding_mode(task.get("embedding_mode"))
+                embedding_resp = await self.ai_router.embed(chunk.content, embedding_mode=embedding_mode)
                 embedding = embedding_resp.get("embedding", [])
                 if not embedding:
                     raise RuntimeError("empty embedding")
                 embedding_provider = str(embedding_resp.get("provider") or "").strip()
                 embedding_model_id = str(embedding_resp.get("model_id") or "").strip().lower()
                 embedding_tokens = int(embedding_resp.get("billable_tokens") or 0)
-                self.update_task_embedding_usage(task_id, provider=embedding_provider, billable_tokens=embedding_tokens)
+                self.update_task_embedding_usage(
+                    task_id,
+                    provider=embedding_provider,
+                    billable_tokens=embedding_tokens,
+                    model_id=embedding_model_id,
+                )
+                self.update_document_embedding_metadata(
+                    document_id=document_id,
+                    tenant_id=tenant_id,
+                    embedding_mode=embedding_mode,
+                    embedding_model=embedding_model_id,
+                    embedding_provider=embedding_provider,
+                )
 
                 bill_cid = (str(task.get("ocr_billing_client_id") or "").strip() or str(tenant_id))
                 exempt = bool(int(task.get("ocr_billing_exempt") or 0))
                 is_billable_embedding = (
-                    not exempt
+                    not is_self_hosted_embedding_billing()
+                    and not exempt
                     and embedding_provider == "zhipu"
                     and embedding_model_id == "embedding-3"
                     and embedding_tokens > 0
                 )
-                if False and is_billable_embedding:
-                    balance = embedding_token_billing.get_token_balance(str(tenant_id), bill_cid)
-                    if balance < embedding_tokens:
-                        raise RuntimeError(
-                            f"Embedding-3 token 不足（建索引需 {embedding_tokens}，当前余额 {balance}）"
-                        )
-                    embedding_token_billing.add_tokens(
-                        str(tenant_id), bill_cid, -embedding_tokens, f"consume_embedding_tokens:task_{task_id}"
-                    )
                 vector_id, created_now = self._write_vector_if_missing(
                     tenant_id=tenant_id,
                     document_id=document_id,
@@ -1049,7 +1113,9 @@ class UploadIngestionService:
     def _prepare_document_record_from_parsed(self, task: Dict[str, Any], parsed: ParsedDocument) -> int:
         merged_meta = dict(parsed.metadata)
         merged_meta["discipline"] = task["discipline"]
-        merged_meta["embedding_model"] = self.ai_router.get_active_embedding_model_id()
+        embedding_mode = self.ai_router.normalize_embedding_mode(task.get("embedding_mode"))
+        merged_meta["embedding_mode"] = embedding_mode
+        merged_meta["embedding_model"] = self.ai_router.get_active_embedding_model_id(embedding_mode)
         tenant_id = str(task.get("tenant_id", "public") or "public")
         conn = self._conn()
         try:

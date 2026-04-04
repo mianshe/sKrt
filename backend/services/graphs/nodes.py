@@ -14,6 +14,7 @@ class GraphNodes:
     async def retrieve_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
         query = str(state.get("query", "")).strip()
         discipline = str(state.get("discipline", "all")).strip() or "all"
+        embedding_mode = str(state.get("embedding_mode", "auto")).strip() or "auto"
         document_id = int(state.get("document_id", 0) or 0) or None
         top_k = int(state.get("top_k", 6) or 6)
         tenant_id = str(state.get("tenant_id", "")).strip() or None
@@ -28,6 +29,7 @@ class GraphNodes:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
         return {
@@ -43,6 +45,7 @@ class GraphNodes:
             return {}
         query = str(state.get("query", "")).strip()
         discipline = str(state.get("discipline", "all")).strip() or "all"
+        embedding_mode = str(state.get("embedding_mode", "auto")).strip() or "auto"
         document_id = int(state.get("document_id", 0) or 0) or None
         expanded_query = f"{query} 关键概念 定义 结论 证据"
         tenant_id = str(state.get("tenant_id", "")).strip() or None
@@ -57,6 +60,7 @@ class GraphNodes:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
         return {
@@ -70,6 +74,7 @@ class GraphNodes:
     async def retrieve_summary_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
         query = str(state.get("query", "")).strip()
         discipline = str(state.get("discipline", "all")).strip() or "all"
+        embedding_mode = str(state.get("embedding_mode", "auto")).strip() or "auto"
         document_id = int(state.get("document_id", 0) or 0) or None
         summary_mode = str(state.get("summary_mode", "fast")).strip().lower() or "fast"
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
@@ -104,6 +109,7 @@ class GraphNodes:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
         return {
@@ -524,6 +530,7 @@ class GraphNodes:
     async def retrieve_report_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
         query = str(state.get("query", "")).strip()
         discipline = str(state.get("discipline", "all")).strip() or "all"
+        embedding_mode = str(state.get("embedding_mode", "auto")).strip() or "auto"
         document_id = int(state.get("document_id", 0) or 0) or None
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
         report_mode = str(state.get("report_mode", "full")).strip().lower() or "full"
@@ -592,6 +599,7 @@ class GraphNodes:
             tenant_id=tenant_id,
             billing_client_id=billing_client_id,
             billing_exempt=billing_exempt,
+            embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
         return {

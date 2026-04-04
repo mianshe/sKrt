@@ -7,6 +7,7 @@ class GraphState(TypedDict, total=False):
     tenant_id: str
     query: str
     mode: str
+    embedding_mode: str
     discipline: str
     document_id: int
     summary_compact_level: int

@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import ChatMessage, { ChatItem } from "../components/ChatMessage";
 import { ExamChunkUploadResult } from "../hooks/useDocuments";
 import { API_BASE } from "../config/apiBase";
+import { useEmbeddingModePreference } from "../lib/embeddingMode";
 
 const CHAT_STORAGE_KEY = "xm_chat_state_v1";
 const CHAT_SESSION_KEY = "xm_chat_session_id_v1";
@@ -86,6 +87,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
   const [query, setQuery] = useState(persisted?.query || "");
   const discipline = "all";
   const mode: "free" = "free";
+  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
   const [loading, setLoading] = useState(false);
   const [queryStatus, setQueryStatus] = useState("");
   const [examFile, setExamFile] = useState<File | null>(null);
@@ -126,7 +128,7 @@ function ChatTab({ onUploadExamByChunks }: Props) {
       const resp = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
-        body: JSON.stringify({ query: userText, discipline, mode, session_id: sessionId }),
+        body: JSON.stringify({ query: userText, discipline, mode, session_id: sessionId, embedding_mode: embeddingMode }),
       });
       if (!resp.ok) throw new Error("查询请求失败");
       const data = await resp.json();
@@ -216,6 +218,31 @@ function ChatTab({ onUploadExamByChunks }: Props) {
         <p className="text-sm font-medium text-violet-600">当前模式：查询</p>
         <p className="mt-1 text-xs text-slate-500">学科与文档类型由系统自动理解。</p>
       </div>
+
+      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+        <button
+          type="button"
+          className={`rounded-full px-3 py-1 ${embeddingMode === "auto" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+          onClick={() => setEmbeddingMode("auto")}
+        >
+          自动向量
+        </button>
+        <button
+          type="button"
+          className={`rounded-full px-3 py-1 ${embeddingMode === "local" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+          onClick={() => setEmbeddingMode("local")}
+        >
+          本地向量
+        </button>
+        <button
+          type="button"
+          className={`rounded-full px-3 py-1 ${embeddingMode === "api" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+          onClick={() => setEmbeddingMode("api")}
+        >
+          API 向量
+        </button>
+      </div>
+      <p className="px-4 text-xs text-amber-700">切换模式后，全局检索只会命中同一向量模型下的文档。</p>
 
       <div className="card h-[430px] overflow-y-auto p-4">
         <div className="mb-2 flex items-center justify-between">

@@ -29,6 +29,64 @@ class FreeAIRouter:
         self._local_chat_runtime: Optional[Tuple[Any, Any]] = None
         self._local_embed_runtime: Optional[Tuple[Any, Any, Any]] = None
 
+    @staticmethod
+    def normalize_embedding_mode(value: Optional[str]) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in {"local", "api"}:
+            return mode
+        return "auto"
+
+    def has_remote_embedding_provider(self) -> bool:
+        if not self.hybrid_cfg.enable_remote_fallback:
+            return False
+        return bool(self.github_token or self.zhipu_token or self.hf_token)
+
+    def ensure_embedding_mode_available(self, embedding_mode: Optional[str] = None) -> str:
+        mode = self.normalize_embedding_mode(embedding_mode)
+        if mode == "local" and not self.hybrid_cfg.enable_local_embedding:
+            raise RuntimeError("当前未启用本地 embedding")
+        if mode == "api" and not self.has_remote_embedding_provider():
+            raise RuntimeError("当前未配置可用的远程 embedding API")
+        return mode
+
+    def _embedding_provider_order(self, embedding_mode: str) -> List[str]:
+        mode = self.normalize_embedding_mode(embedding_mode)
+        if mode == "local":
+            return ["transformers-local"]
+        if mode == "api":
+            if not self.hybrid_cfg.enable_remote_fallback:
+                return []
+            return ["github-models", "zhipu", "huggingface"]
+        order: List[str] = []
+        remotes = ["github-models", "zhipu", "huggingface"] if self.hybrid_cfg.enable_remote_fallback else []
+        if self.hybrid_cfg.local_first:
+            if self.hybrid_cfg.enable_local_embedding:
+                order.append("transformers-local")
+            order.extend(remotes)
+            return order
+        order.extend(remotes)
+        if self.hybrid_cfg.enable_local_embedding:
+            order.append("transformers-local")
+        return order
+
+    def _local_embedding_response(self, embedding: List[float], dimensions: Optional[int], target_dim: int) -> Dict[str, Any]:
+        local_dim = len(embedding)
+        final_dim = dimensions or local_dim or target_dim
+        return {
+            "provider": "transformers-local",
+            "embedding": self._normalize_vector_dimensions(embedding, final_dim),
+            "model_id": self.hybrid_cfg.local_embedding_model_id,
+            "billable_tokens": 0,
+        }
+
+    def _hash_embedding_response(self, target_dim: int) -> Dict[str, Any]:
+        return {
+            "provider": "hash-fallback",
+            "embedding": self._hash_embedding("", target_dim),
+            "model_id": "hash-embedding",
+            "billable_tokens": 0,
+        }
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -123,63 +181,61 @@ class FreeAIRouter:
         return {"provider": "none", "content": "", "task_type": task_type}
 
     async def embed(
-        self, text: str, model: str = "text-embedding-3-small", dimensions: Optional[int] = None
+        self,
+        text: str,
+        model: str = "text-embedding-3-small",
+        dimensions: Optional[int] = None,
+        embedding_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         target_dim = dimensions or self.hybrid_cfg.embedding_dimensions
+        mode = self.normalize_embedding_mode(embedding_mode)
+        provider_order = self._embedding_provider_order(mode)
 
-        if self.hybrid_cfg.local_first and self.hybrid_cfg.enable_local_embedding:
-            local_vec = await self._local_embedding(text)
-            if local_vec:
-                local_dim = len(local_vec)
-                final_dim = dimensions or local_dim or target_dim
-                return {
-                    "provider": "transformers-local",
-                    "embedding": self._normalize_vector_dimensions(local_vec, final_dim),
-                    "model_id": self.hybrid_cfg.local_embedding_model_id,
-                    "billable_tokens": 0,
-                }
+        if mode == "local" and "transformers-local" not in provider_order:
+            raise RuntimeError("当前未启用本地 embedding")
+        if mode == "api" and not provider_order:
+            raise RuntimeError("当前未配置可用的远程 embedding API")
 
-        if self.hybrid_cfg.enable_remote_fallback:
-            github_vec = await self._github_embedding(text, model)
-            if github_vec:
-                return {
-                    "provider": "github-models",
-                    "embedding": self._normalize_vector_dimensions(github_vec, target_dim),
-                    "model_id": model,
-                    "billable_tokens": 0,
-                }
+        for provider in provider_order:
+            if provider == "transformers-local":
+                local_vec = await self._local_embedding(text)
+                if local_vec:
+                    return self._local_embedding_response(local_vec, dimensions, target_dim)
+                continue
+            if provider == "github-models":
+                github_vec = await self._github_embedding(text, model)
+                if github_vec:
+                    return {
+                        "provider": "github-models",
+                        "embedding": self._normalize_vector_dimensions(github_vec, target_dim),
+                        "model_id": model,
+                        "billable_tokens": 0,
+                    }
+                continue
+            if provider == "zhipu":
+                zhipu_resp = await self._zhipu_embedding(text)
+                if zhipu_resp:
+                    return {
+                        "provider": "zhipu",
+                        "embedding": self._normalize_vector_dimensions(zhipu_resp.get("embedding", []), target_dim),
+                        "model_id": self.zhipu_embed_model,
+                        "billable_tokens": int(zhipu_resp.get("billable_tokens") or 0),
+                        "usage": zhipu_resp.get("usage") or {},
+                    }
+                continue
+            if provider == "huggingface":
+                hf_vec = await self._hf_embedding(text)
+                if hf_vec:
+                    return {
+                        "provider": "huggingface",
+                        "embedding": self._normalize_vector_dimensions(hf_vec, target_dim),
+                        "model_id": self.hf_embed_model,
+                        "billable_tokens": 0,
+                    }
+                continue
 
-            zhipu_resp = await self._zhipu_embedding(text)
-            if zhipu_resp:
-                return {
-                    "provider": "zhipu",
-                    "embedding": self._normalize_vector_dimensions(zhipu_resp.get("embedding", []), target_dim),
-                    "model_id": self.zhipu_embed_model,
-                    "billable_tokens": int(zhipu_resp.get("billable_tokens") or 0),
-                    "usage": zhipu_resp.get("usage") or {},
-                }
-
-            hf_vec = await self._hf_embedding(text)
-            if hf_vec:
-                return {
-                    "provider": "huggingface",
-                    "embedding": self._normalize_vector_dimensions(hf_vec, target_dim),
-                    "model_id": self.hf_embed_model,
-                    "billable_tokens": 0,
-                }
-
-        if not self.hybrid_cfg.local_first and self.hybrid_cfg.enable_local_embedding:
-            local_vec = await self._local_embedding(text)
-            if local_vec:
-                local_dim = len(local_vec)
-                final_dim = dimensions or local_dim or target_dim
-                return {
-                    "provider": "transformers-local",
-                    "embedding": self._normalize_vector_dimensions(local_vec, final_dim),
-                    "model_id": self.hybrid_cfg.local_embedding_model_id,
-                    "billable_tokens": 0,
-                }
-
+        if mode in {"local", "api"}:
+            raise RuntimeError(f"embedding_mode={mode} 不可用：当前模式下未成功生成向量")
         if self.hybrid_cfg.enable_hash_fallback:
             return {
                 "provider": "hash-fallback",
@@ -187,7 +243,12 @@ class FreeAIRouter:
                 "model_id": "hash-embedding",
                 "billable_tokens": 0,
             }
-        return {"provider": "none", "embedding": self._hash_embedding(text, target_dim), "model_id": "hash-embedding", "billable_tokens": 0}
+        return {
+            "provider": "none",
+            "embedding": self._hash_embedding(text, target_dim),
+            "model_id": "hash-embedding",
+            "billable_tokens": 0,
+        }
 
     def _primary_remote_embed_model_id(self) -> Optional[str]:
         if not self.hybrid_cfg.enable_remote_fallback:
@@ -200,9 +261,14 @@ class FreeAIRouter:
             return self.hf_embed_model
         return None
 
-    def get_active_embedding_model_id(self) -> str:
+    def get_active_embedding_model_id(self, embedding_mode: Optional[str] = None) -> str:
+        mode = self.normalize_embedding_mode(embedding_mode)
         remote = self._primary_remote_embed_model_id()
         local_id = self.hybrid_cfg.local_embedding_model_id
+        if mode == "local":
+            return local_id if self.hybrid_cfg.enable_local_embedding else ""
+        if mode == "api":
+            return remote or ""
         if self.hybrid_cfg.local_first:
             if self.hybrid_cfg.enable_local_embedding:
                 return local_id

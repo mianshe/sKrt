@@ -14,6 +14,9 @@ import jwt
 from backend.services.email_sender import send_plain_email
 
 
+DEFAULT_LOCAL_ADMIN_EMAIL_DOMAIN = "sciomenihilscire.com"
+
+
 def password_pbkdf2_iterations() -> int:
     try:
         return max(120_000, int((os.getenv("AUTH_PASSWORD_PBKDF2_ITERATIONS") or "200000").strip() or "200000"))
@@ -88,6 +91,22 @@ def _ttl_seconds() -> int:
         return 604800
 
 
+def _split_csv_env(value: str) -> list[str]:
+    return [item.strip().lower() for item in str(value or "").split(",") if item.strip()]
+
+
+def local_admin_email_domains() -> list[str]:
+    raw = os.getenv("AUTH_LOCAL_ADMIN_EMAIL_DOMAINS")
+    if raw is None:
+        raw = DEFAULT_LOCAL_ADMIN_EMAIL_DOMAIN
+    domains = _split_csv_env(raw)
+    return domains or [DEFAULT_LOCAL_ADMIN_EMAIL_DOMAIN]
+
+
+def local_admin_emails() -> list[str]:
+    return _split_csv_env(os.getenv("AUTH_LOCAL_ADMIN_EMAILS") or "")
+
+
 def issue_local_access_token(*, user_id: str, email: str) -> str:
     """tenant_id = user_id，保证知识库按账号隔离。"""
     secret = local_jwt_secret()
@@ -95,14 +114,16 @@ def issue_local_access_token(*, user_id: str, email: str) -> str:
         raise RuntimeError("AUTH_LOCAL_JWT_SECRET 未配置")
     now = int(time.time())
     ttl = _ttl_seconds()
+    identity = local_identity_claims(email)
     payload = {
         "iss": _issuer(),
         "aud": _audience(),
         "sub": user_id,
         "tenant_id": user_id,
         "email": email,
-        "roles": ["tenant_admin"],
-        "permissions": ["tenant.*"],
+        "roles": list(identity.get("roles") or []),
+        "permissions": list(identity.get("permissions") or []),
+        "is_admin": bool(identity.get("is_admin")),
         "iat": now,
         "exp": now + ttl,
     }
@@ -151,6 +172,44 @@ def signup_max_free_grants_per_ip() -> int:
 
 def normalize_email(email: str) -> str:
     return str(email or "").strip().lower()[:320]
+
+
+def is_local_admin_email(email: str) -> bool:
+    normalized = normalize_email(email)
+    if not normalized or "@" not in normalized:
+        return False
+    if normalized in set(local_admin_emails()):
+        return True
+    domain = normalized.split("@", 1)[1]
+    return domain in set(local_admin_email_domains())
+
+
+def local_identity_claims(email: str) -> Dict[str, Any]:
+    normalized = normalize_email(email)
+    if is_local_admin_email(normalized):
+        return {
+            "roles": ["tenant_admin"],
+            "permissions": ["tenant.*"],
+            "is_admin": True,
+        }
+    return {
+        "roles": ["tenant_user"],
+        "permissions": [
+            "tenant.upload.write",
+            "tenant.upload.read",
+            "tenant.documents.read",
+            "tenant.documents.delete",
+            "tenant.knowledge.read",
+            "tenant.chat.write",
+            "tenant.chat.clear",
+            "tenant.insights.read",
+            "tenant.pipeline.write",
+            "tenant.pipeline.read",
+            "tenant.exam.write",
+            "tenant.generate.write",
+        ],
+        "is_admin": False,
+    }
 
 
 def _random_code() -> str:

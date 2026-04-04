@@ -56,6 +56,7 @@ from backend.services import knowledge_store
 from backend.services import gpu_ocr_billing
 from backend.services import ocr_token_billing
 from backend.services import embedding_token_billing
+from backend.services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
 from backend.services.knowledge_store import insert_returning_id
 from backend.services.upload_ingestion_service import UploadIngestionService
 from backend.services.payments.base import PaymentProvider
@@ -137,6 +138,7 @@ class ChatRequest(BaseModel):
     discipline: str = "all"
     mode: str = "free"
     session_id: Optional[str] = None
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class ChatMemoryClearRequest(BaseModel):
@@ -159,6 +161,7 @@ class SummaryRequest(BaseModel):
     document_id: Optional[int] = Field(default=None, ge=1)
     summary_compact_level: Optional[int] = None
     summary_mode: Optional[str] = None
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class ReportRequest(BaseModel):
@@ -167,6 +170,7 @@ class ReportRequest(BaseModel):
     document_id: Optional[int] = Field(default=None, ge=1)
     summary_compact_level: Optional[int] = None
     report_mode: Optional[str] = None
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class DeepReportStartRequest(BaseModel):
@@ -186,6 +190,7 @@ class ChunkInitRequest(BaseModel):
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
     ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class ChunkCompleteRequest(BaseModel):
@@ -195,6 +200,7 @@ class ChunkCompleteRequest(BaseModel):
     use_gpu_ocr: Optional[bool] = None
     ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
     external_ocr_confirmed: bool = False
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class UploadPresignInitRequest(BaseModel):
@@ -203,6 +209,7 @@ class UploadPresignInitRequest(BaseModel):
     document_type: Optional[str] = None
     use_gpu_ocr: bool = False
     ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
 
 
 class UploadPresignCompleteRequest(BaseModel):
@@ -210,6 +217,11 @@ class UploadPresignCompleteRequest(BaseModel):
     use_gpu_ocr: bool = False
     ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
     external_ocr_confirmed: bool = False
+    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+
+
+class UserBillingModeRequest(BaseModel):
+    provider_billing_mode: str = Field(pattern="^(default|internal|self_hosted)$")
 
 
 class ChunkUploadMeta(TypedDict):
@@ -220,6 +232,7 @@ class ChunkUploadMeta(TypedDict):
     purpose: str
     discipline: str
     document_type: str
+    embedding_mode: str
     use_gpu_ocr: bool
     ocr_mode: str
     received_chunks: int
@@ -284,6 +297,18 @@ def _normalize_ocr_mode(value: Optional[str], *, use_gpu_ocr: Optional[bool] = N
     if bool(use_gpu_ocr):
         return "complex_layout"
     return "standard"
+
+
+def _normalize_embedding_mode(value: Optional[str]) -> str:
+    return ai_router.normalize_embedding_mode(value)
+
+
+def _ensure_embedding_mode_available(embedding_mode: Optional[str]) -> str:
+    mode = _normalize_embedding_mode(embedding_mode)
+    try:
+        return ai_router.ensure_embedding_mode_available(mode)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 _jwt_validator: Optional[JwtValidator] = None
@@ -458,13 +483,67 @@ def _ocr_billing_tenant_client(request: Request) -> Tuple[str, str]:
 
 
 def _task_ocr_billing_from_request(request: Request) -> Tuple[Optional[str], bool]:
-    """写入 upload_tasks 的 OCR 计费 client_id（与余额表一致）及是否免扣费（特殊用户）。"""
-    exempt = _is_special_user(request)
+    """写入 upload_tasks 的 OCR 计费 client_id（与余额表一致）及是否跳过本地扣费。"""
+    exempt = _ocr_billing_exempt(request)
     try:
         _, cid = _ocr_billing_tenant_client(request)
     except HTTPException:
         _, cid = _billing_tenant_client(request)
     return (cid if cid else None), exempt
+
+
+def _normalize_provider_billing_mode(value: Any) -> str:
+    mode = str(value or "default").strip().lower()
+    if mode in {"internal", "self_hosted"}:
+        return mode
+    return "default"
+
+
+def _get_local_user_provider_billing_mode(user_id: str) -> str:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return "default"
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT provider_billing_mode FROM app_users WHERE id = ?", (uid,)).fetchone()
+        if not row:
+            return "default"
+        return _normalize_provider_billing_mode(row["provider_billing_mode"])
+    finally:
+        conn.close()
+
+
+def _get_request_provider_billing_mode(request: Request) -> str:
+    identity = _get_request_identity(request)
+    if identity.get("auth_source") == "local_jwt":
+        return _get_local_user_provider_billing_mode(str(identity.get("user_id") or ""))
+    return "default"
+
+
+def _request_ocr_internal_billing_enabled(request: Request) -> bool:
+    mode = _get_request_provider_billing_mode(request)
+    if mode == "self_hosted":
+        return False
+    if mode == "internal":
+        return True
+    return not is_self_hosted_ocr_billing()
+
+
+def _request_embedding_internal_billing_enabled(request: Request) -> bool:
+    mode = _get_request_provider_billing_mode(request)
+    if mode == "self_hosted":
+        return False
+    if mode == "internal":
+        return True
+    return not is_self_hosted_embedding_billing()
+
+
+def _ocr_billing_exempt(request: Request) -> bool:
+    return _is_special_user(request) or not _request_ocr_internal_billing_enabled(request)
+
+
+def _embedding_billing_exempt(request: Request) -> bool:
+    return _is_special_user(request) or not _request_embedding_internal_billing_enabled(request)
 
 
 def _has_role(identity: RequestIdentity, role: str) -> bool:
@@ -482,6 +561,15 @@ def _require_permission(identity: RequestIdentity, permission: str) -> None:
     if permission.startswith("tenant.") and _has_role(identity, "tenant_admin"):
         return
     raise HTTPException(status_code=403, detail=f"权限不足: {permission}")
+
+
+def _require_local_admin_identity(request: Request) -> RequestIdentity:
+    identity = _get_request_identity(request)
+    if identity.get("auth_source") != "local_jwt":
+        raise HTTPException(status_code=401, detail="需要本地管理员登录")
+    if not _has_role(identity, "tenant_admin"):
+        raise HTTPException(status_code=403, detail="仅管理员可操作")
+    return identity
 
 
 def _capacity_snapshot() -> Dict[str, Any]:
@@ -1419,10 +1507,14 @@ def _init_runtime_tables() -> None:
                 id TEXT PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
+                provider_billing_mode TEXT NOT NULL DEFAULT 'default',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        app_user_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(app_users)").fetchall()}
+        if "provider_billing_mode" not in app_user_columns:
+            conn.execute("ALTER TABLE app_users ADD COLUMN provider_billing_mode TEXT NOT NULL DEFAULT 'default'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS app_registration_codes (
@@ -1537,27 +1629,7 @@ def _make_special_cookie(secret: str, tenant_id: str, ttl_sec: int) -> str:
 
 
 def _is_special_user(request: Request) -> bool:
-    secret = (os.getenv("SPECIAL_OCR_SECRET") or "").strip()
-    if not secret:
-        return False
-    token = (request.cookies.get("special_ocr") or "").strip()
-    if not token:
-        return False
-    parts = token.split(".")
-    if len(parts) != 5:
-        return False
-    base = ".".join(parts[:4])
-    sig = parts[4]
-    expect = _hmac_sign(secret, base)
-    if not hmac.compare_digest(expect, sig):
-        return False
-    try:
-        exp = int(parts[2])
-    except ValueError:
-        return False
-    if exp <= int(time.time()):
-        return False
-    return True
+    return False
 
 
 def _gpu_daily_limit() -> int:
@@ -2305,7 +2377,7 @@ def _add_embedding_tokens(tenant_id: str, client_id: str, delta_tokens: int, rea
 
 def _ensure_gpu_calls_balance_covers_or_raise(request: Request, page_count: int) -> None:
     """上传阶段仅校验余额是否够覆盖预估 PDF 页数；实际扣减在解析完成后按成功 API 次数结算。"""
-    if _is_special_user(request):
+    if _ocr_billing_exempt(request):
         return
     call_units = max(1, int(page_count or 0))
     tenant_id, client_id = _ocr_billing_tenant_client(request)
@@ -2407,7 +2479,7 @@ def _external_ocr_scan_quota_result(
 
 
 def _consume_global_gpu_monthly_or_raise(request: Request) -> None:
-    if _is_special_user(request):
+    if _ocr_billing_exempt(request):
         return
     limit = _gpu_monthly_limit()
     if limit <= 0:
@@ -2438,7 +2510,7 @@ def _consume_global_gpu_monthly_or_raise(request: Request) -> None:
 
 
 def _consume_gpu_page_quota_or_raise(request: Request, page_count: int) -> None:
-    if _is_special_user(request):
+    if _ocr_billing_exempt(request):
         return
     pages = max(1, int(page_count or 0))
     daily_limit = _gpu_daily_call_limit()
@@ -2472,7 +2544,7 @@ def _consume_gpu_page_quota_or_raise(request: Request, page_count: int) -> None:
 
 
 def _consume_global_gpu_monthly_pages_or_raise(request: Request, page_count: int) -> None:
-    if _is_special_user(request):
+    if _ocr_billing_exempt(request):
         return
     pages = max(1, int(page_count or 0))
     limit = _gpu_monthly_global_call_limit()
@@ -2515,43 +2587,12 @@ app.add_middleware(
 
 @app.post("/auth/special-ocr/unlock")
 async def unlock_special_ocr(request: Request, body: Dict[str, Any] = Body(...)) -> JSONResponse:
-    raw_key = str(body.get("key") or "").strip()
-    if not raw_key:
-        raise HTTPException(status_code=400, detail="缺少随机码")
-    secret = (os.getenv("SPECIAL_OCR_SECRET") or "").strip()
-    if not secret:
-        raise HTTPException(status_code=503, detail="未配置 SPECIAL_OCR_SECRET")
-    try:
-        ttl = int((os.getenv("SPECIAL_OCR_TTL_SEC") or str(30 * 86400)).strip() or str(30 * 86400))
-    except ValueError:
-        ttl = 30 * 86400
-    tenant_id, client_id = _billing_tenant_client(request)
-    if not _verify_and_consume_random_code(tenant_id, client_id, "special_unlock", raw_key):
-        raise HTTPException(status_code=403, detail="随机码错误或已过期")
-    token = _make_special_cookie(secret, tenant_id, ttl_sec=ttl)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        "special_ocr",
-        token,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=max(60, ttl),
-        path="/",
-    )
-    return resp
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 @app.post("/auth/special-ocr/send-code")
 async def send_special_unlock_code(request: Request) -> Dict[str, Any]:
-    tenant_id, client_id = _billing_tenant_client(request)
-    try:
-        return _create_and_send_random_code(tenant_id, client_id, "special_unlock")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("send special unlock code failed")
-        raise HTTPException(status_code=502, detail=f"发送失败: {exc}")
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 @app.post("/auth/register/request-code")
@@ -2743,17 +2784,99 @@ async def auth_me(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     if identity.get("auth_source") != "local_jwt":
         raise HTTPException(status_code=401, detail="需要登录")
+    provider_billing_mode = _get_request_provider_billing_mode(request)
     return {
         "ok": True,
         "user_id": str(identity.get("user_id") or ""),
         "tenant_id": str(identity.get("tenant_id") or ""),
+        "roles": list(identity.get("roles", [])),
+        "permissions": list(identity.get("permissions", [])),
+        "is_admin": bool("tenant_admin" in set(identity.get("roles", []))),
+        "provider_billing_mode": provider_billing_mode,
+        "effective_provider_billing_mode": "internal"
+        if _request_ocr_internal_billing_enabled(request) and _request_embedding_internal_billing_enabled(request)
+        else "self_hosted",
+    }
+
+
+@app.get("/admin/local-users")
+async def admin_list_local_users(request: Request) -> Dict[str, Any]:
+    _require_local_admin_identity(request)
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, email, provider_billing_mode, created_at
+            FROM app_users
+            ORDER BY email ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    users: List[Dict[str, Any]] = []
+    for row in rows:
+        email = str(row["email"] or "").strip().lower()
+        configured_mode = _normalize_provider_billing_mode(row["provider_billing_mode"])
+        effective_mode = configured_mode
+        if effective_mode == "default":
+            effective_mode = (
+                "self_hosted"
+                if (is_self_hosted_ocr_billing() or is_self_hosted_embedding_billing())
+                else "internal"
+            )
+        users.append(
+            {
+                "user_id": str(row["id"] or ""),
+                "email": email,
+                "is_admin": bool(local_auth_service.is_local_admin_email(email)),
+                "provider_billing_mode": configured_mode,
+                "effective_provider_billing_mode": effective_mode,
+                "created_at": str(row["created_at"] or ""),
+            }
+        )
+    return {
+        "users": users,
+        "available_provider_billing_modes": ["default", "internal", "self_hosted"],
+    }
+
+
+@app.put("/admin/local-users/{user_id}/billing-mode")
+async def admin_update_local_user_billing_mode(user_id: str, body: UserBillingModeRequest, request: Request) -> Dict[str, Any]:
+    _require_local_admin_identity(request)
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id:
+        raise HTTPException(status_code=400, detail="user_id 无效")
+    next_mode = _normalize_provider_billing_mode(body.provider_billing_mode)
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT id, email FROM app_users WHERE id = ?", (normalized_user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        conn.execute(
+            "UPDATE app_users SET provider_billing_mode = ? WHERE id = ?",
+            (next_mode, normalized_user_id),
+        )
+        conn.commit()
+        email = str(row["email"] or "").strip().lower()
+    finally:
+        conn.close()
+    effective_mode = next_mode
+    if effective_mode == "default":
+        effective_mode = "self_hosted" if (is_self_hosted_ocr_billing() or is_self_hosted_embedding_billing()) else "internal"
+    return {
+        "ok": True,
+        "user_id": normalized_user_id,
+        "email": email,
+        "is_admin": bool(local_auth_service.is_local_admin_email(email)),
+        "provider_billing_mode": next_mode,
+        "effective_provider_billing_mode": effective_mode,
     }
 
 
 @app.get("/gpu/ocr/quota")
 async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
     tenant_id, client_id = _ocr_billing_tenant_client(request)
-    special = bool(_is_special_user(request))
+    special = bool(_ocr_billing_exempt(request))
     if not special and not local_auth_service.local_jwt_enabled():
         _ensure_gpu_ocr_initial_balance(tenant_id, client_id)
     paid_balance = _get_gpu_paid_calls_balance(tenant_id, client_id)
@@ -2773,7 +2896,7 @@ async def get_gpu_ocr_quota(request: Request) -> Dict[str, Any]:
 @app.get("/ocr/token/quota")
 async def get_complex_ocr_token_quota(request: Request) -> Dict[str, Any]:
     tenant_id, client_id = _ocr_billing_tenant_client(request)
-    special = bool(_is_special_user(request))
+    special = bool(_ocr_billing_exempt(request))
     if not special:
         _ensure_complex_ocr_initial_balance(tenant_id, client_id)
     balance = _get_complex_ocr_token_balance(tenant_id, client_id)
@@ -2789,7 +2912,7 @@ async def get_complex_ocr_token_quota(request: Request) -> Dict[str, Any]:
 @app.get("/embedding/token/quota")
 async def get_embedding_token_quota(request: Request) -> Dict[str, Any]:
     tenant_id, client_id = _billing_tenant_client(request)
-    special = bool(_is_special_user(request))
+    special = bool(_embedding_billing_exempt(request))
     balance = _get_embedding_token_balance(tenant_id, client_id)
     ledger = embedding_token_billing.recent_ledger(tenant_id, client_id, limit=12)
     return {
@@ -3319,6 +3442,8 @@ def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "file_size_bytes": int(task.get("file_size_bytes", 0) or 0),
         "use_gpu_ocr": bool(int(task.get("use_gpu_ocr", 0) or 0) == 1),
         "ocr_mode": str(task.get("ocr_mode", "standard") or "standard"),
+        "embedding_mode": str(task.get("embedding_mode", "auto") or "auto"),
+        "embedding_model": str(task.get("embedding_model", "") or ""),
         "ocr_provider": str(task.get("ocr_provider", "") or ""),
         "ocr_call_units": int(task.get("ocr_call_units", 0) or 0),
         "ocr_billable_tokens": int(task.get("ocr_billable_tokens", 0) or 0),
@@ -3496,6 +3621,7 @@ async def _handle_completed_chunked_upload(
     tenant_id: str,
     use_gpu_ocr: bool,
     ocr_mode: str,
+    embedding_mode: str,
     *,
     ocr_billing_client_id: Optional[str] = None,
     ocr_billing_exempt: bool = False,
@@ -3510,11 +3636,17 @@ async def _handle_completed_chunked_upload(
             storage_basename=target_path.name,
             tenant_id=tenant_id,
             ocr_mode=ocr_mode,
+            embedding_mode=embedding_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(use_gpu_ocr))
         upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
+        upload_ingestion_service.update_task_embedding_config(
+            int(task.get("id", 0)),
+            embedding_mode,
+            ai_router.get_active_embedding_model_id(embedding_mode),
+        )
         _spawn_ingestion_worker(int(task.get("id", 0)), tenant_id=tenant_id)
         return {"tasks": [_normalize_task(task)]}
 
@@ -3580,6 +3712,9 @@ async def health() -> Dict[str, Any]:
         "baidu_ocr_configured": baidu_ocr_ok,
         "pdf_ocr_engine": pdf_ocr_engine,
         "pdf_ocr_remote_first": _env_bool("PDF_OCR_REMOTE_FIRST", True) if baidu_ocr_ok else False,
+        "self_hosted_provider_billing": bool(is_self_hosted_ocr_billing() or is_self_hosted_embedding_billing()),
+        "ocr_internal_billing_enabled": not is_self_hosted_ocr_billing(),
+        "embedding_internal_billing_enabled": not is_self_hosted_embedding_billing(),
         "tenant_header_name": RUNTIME_CONFIG.tenant.header_name,
         "tenant_require_header": RUNTIME_CONFIG.tenant.require_header,
         "auth_jwt_enabled": bool(RUNTIME_CONFIG.auth.enabled),
@@ -3645,6 +3780,7 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
         raise HTTPException(status_code=400, detail="分片数量过大，请增大分片大小")
 
     ocr_mode = _normalize_ocr_mode(req.ocr_mode, use_gpu_ocr=req.use_gpu_ocr)
+    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     upload_id = uuid.uuid4().hex
     temp_dir = CHUNK_TEMP_DIR / upload_id
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -3656,6 +3792,7 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
         "purpose": req.purpose,
         "discipline": req.discipline,
         "document_type": req.document_type,
+        "embedding_mode": embedding_mode,
         "use_gpu_ocr": bool(req.use_gpu_ocr),
         "ocr_mode": ocr_mode,
         "received_chunks": 0,
@@ -3701,6 +3838,7 @@ async def complete_chunk_upload(
     purpose = (req.purpose if req else meta["purpose"]) if req else meta["purpose"]
     discipline = (req.discipline if req else meta["discipline"]) if req else meta["discipline"]
     document_type = (req.document_type if req else meta["document_type"]) if req else meta["document_type"]
+    embedding_mode = _ensure_embedding_mode_available((req.embedding_mode if req else meta.get("embedding_mode")) if req else meta.get("embedding_mode"))
     ocr_mode = _normalize_ocr_mode((req.ocr_mode if req else meta.get("ocr_mode")), use_gpu_ocr=(req.use_gpu_ocr if req else None))
     external_ocr_confirmed = bool(req.external_ocr_confirmed) if req else False
 
@@ -3769,7 +3907,7 @@ async def complete_chunk_upload(
             logger.exception("upload to r2 failed for chunked upload (fallback to local file_path)")
 
     _btid, client_id = _billing_tenant_client(request)
-    vector_exempt = _is_special_user(request)
+    vector_exempt = _embedding_billing_exempt(request)
     if purpose == "docs":
         conn_th = _conn()
         try:
@@ -3795,6 +3933,7 @@ async def complete_chunk_upload(
         tenant_id=tenant_id,
         use_gpu_ocr=use_gpu_ocr,
         ocr_mode=ocr_mode,
+        embedding_mode=embedding_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
         embedding_billing_client_id=client_id,
@@ -3846,6 +3985,7 @@ async def upload_documents(
     files: List[UploadFile] = File(...),
     discipline: str = "general",
     document_type: Optional[str] = None,
+    embedding_mode: str = "auto",
 ) -> Dict[str, Any]:
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
@@ -3854,6 +3994,7 @@ async def upload_documents(
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
 
+    normalized_embedding_mode = _ensure_embedding_mode_available(embedding_mode)
     result = []
     for f in files:
         if not f.filename:
@@ -3874,7 +4015,8 @@ async def upload_documents(
         merged_meta = dict(parsed.metadata)
         merged_meta["source_file_size"] = sz
         merged_meta["discipline"] = discipline if discipline != "auto" else parsed.metadata.get("discipline", "general")
-        merged_meta["embedding_model"] = ai_router.get_active_embedding_model_id()
+        merged_meta["embedding_mode"] = normalized_embedding_mode
+        merged_meta["embedding_model"] = ai_router.get_active_embedding_model_id(normalized_embedding_mode)
         chunks = chunker.chunk_document(parsed.text, dtype, parsed.metadata.get("title", f.filename))
 
         conn = _conn()
@@ -3898,7 +4040,19 @@ async def upload_documents(
         finally:
             conn.close()
 
-        await rag_engine.index_chunks_for_tenant(doc_id, chunks, tenant_id=tenant_id)
+        embedding_resp = await rag_engine.index_chunks_for_tenant(
+            doc_id,
+            chunks,
+            tenant_id=tenant_id,
+            embedding_mode=normalized_embedding_mode,
+        )
+        upload_ingestion_service.update_document_embedding_metadata(
+            doc_id,
+            tenant_id=tenant_id,
+            embedding_mode=normalized_embedding_mode,
+            embedding_model=str(embedding_resp.get("model_id") or "").strip(),
+            embedding_provider=str(embedding_resp.get("provider") or "").strip(),
+        )
         result.append(
             {
                 "document_id": doc_id,
@@ -3920,6 +4074,7 @@ async def create_upload_tasks(
     files: List[UploadFile] = File(...),
     discipline: str = "general",
     document_type: Optional[str] = None,
+    embedding_mode: str = "auto",
     use_gpu_ocr: bool = False,
     ocr_mode: str = "standard",
     external_ocr_confirmed: bool = False,
@@ -3956,6 +4111,7 @@ async def create_upload_tasks(
         conn_th.close()
 
     normalized_ocr_mode = _normalize_ocr_mode(ocr_mode, use_gpu_ocr=use_gpu_ocr)
+    normalized_embedding_mode = _ensure_embedding_mode_available(embedding_mode)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     if normalized_ocr_mode == "complex_layout" and ocr_cid:
         _ensure_complex_ocr_initial_balance(tenant_id, ocr_cid)
@@ -3991,11 +4147,17 @@ async def create_upload_tasks(
             storage_basename=storage,
             tenant_id=tenant_id,
             ocr_mode=normalized_ocr_mode,
+            embedding_mode=normalized_embedding_mode,
             ocr_billing_client_id=ocr_cid,
             ocr_billing_exempt=ocr_ex,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
         upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), normalized_ocr_mode)
+        upload_ingestion_service.update_task_embedding_config(
+            int(task.get("id", 0)),
+            normalized_embedding_mode,
+            ai_router.get_active_embedding_model_id(normalized_embedding_mode),
+        )
         # 优先：R2（S3 兼容）持久化，并把 upload_tasks.file_path 指向 r2://bucket/key
         if r2_cfg:
             object_key = f"{r2_prefix}/{tenant_id}/{storage}".strip("/")
@@ -4097,6 +4259,7 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     dtype = body.document_type or _guess_doc_type(filename)
     disc = body.discipline if body.discipline != "auto" else "all"
     ocr_mode = _normalize_ocr_mode(body.ocr_mode, use_gpu_ocr=body.use_gpu_ocr)
+    embedding_mode = _ensure_embedding_mode_available(body.embedding_mode)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     if ocr_mode == "complex_layout" and ocr_cid:
         _ensure_complex_ocr_initial_balance(tenant_id, ocr_cid)
@@ -4107,11 +4270,17 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
         tenant_id=tenant_id,
         storage_basename=storage,
         ocr_mode=ocr_mode,
+        embedding_mode=embedding_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
     )
     upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), False)
     upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
+    upload_ingestion_service.update_task_embedding_config(
+        int(task.get("id", 0)),
+        embedding_mode,
+        ai_router.get_active_embedding_model_id(embedding_mode),
+    )
 
     conn_rec = _conn()
     try:
@@ -4162,6 +4331,12 @@ async def upload_tasks_presign_complete(
     if str(task.get("status")) != "queued":
         raise HTTPException(status_code=400, detail="任务状态不允许完成直传（需为 queued）")
 
+    embedding_mode = _ensure_embedding_mode_available(body.embedding_mode or task.get("embedding_mode"))
+    upload_ingestion_service.update_task_embedding_config(
+        task_id,
+        embedding_mode,
+        ai_router.get_active_embedding_model_id(embedding_mode),
+    )
     object_key = (body.object_key or "").strip().lstrip("/")
     if not object_key:
         raise HTTPException(status_code=400, detail="object_key 无效")
@@ -4492,6 +4667,7 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     _require_permission(identity, "tenant.chat.write")
     tenant_id = str(identity.get("tenant_id", "public"))
     user_id = str(identity.get("user_id", "anonymous"))
+    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     session_id = _normalize_tenant_id(req.session_id or "") or "default"
     memory_rows = _load_chat_memory_context(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
     memory_context_lines: List[str] = []
@@ -4504,11 +4680,12 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     if memory_context_lines:
         enriched_query = f"{req.query}\n\n[历史工作记忆]\n" + "\n\n".join(memory_context_lines[-_chat_memory_recent_limit():])
     _, billing_client_id = _billing_tenant_client(request)
-    billing_exempt = _is_special_user(request)
+    billing_exempt = _embedding_billing_exempt(request)
     graph_result = await agent_chains.run_chat_graph(
         query=enriched_query,
         discipline=req.discipline,
         mode=req.mode,
+        embedding_mode=embedding_mode,
         tenant_id=tenant_id,
         billing_client_id=billing_client_id,
         billing_exempt=bool(billing_exempt),
@@ -4540,6 +4717,7 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
         "agent_trace": graph_result.get("agent_trace", []),
         "cost_profile": graph_result.get("cost_profile", {}),
         "session_id": session_id,
+        "embedding_mode": embedding_mode,
     }
 
 
@@ -4595,8 +4773,9 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
     tenant_id = str(identity.get("tenant_id", "public"))
+    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
-    billing_exempt = _is_special_user(request)
+    billing_exempt = _embedding_billing_exempt(request)
     summary_debug_passthrough = _env_bool("SUMMARY_DEBUG_PASSTHROUGH", False)
     summary_compact_level = 0
     summary_mode = "full"
@@ -4604,6 +4783,7 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
         query=req.query,
         discipline=req.discipline,
         document_id=req.document_id,
+        embedding_mode=embedding_mode,
         tenant_id=tenant_id,
         billing_client_id=billing_client_id,
         billing_exempt=bool(billing_exempt),
@@ -4635,6 +4815,7 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
             "document_id": req.document_id,
             "agent_trace": graph_result.get("agent_trace", []),
             "cost_profile": graph_result.get("cost_profile", {}),
+            "embedding_mode": embedding_mode,
             **debug_payload,
         }
     summary = graph_result.get("summary", {})
@@ -4663,6 +4844,7 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
             "document_id": req.document_id,
             "agent_trace": graph_result.get("agent_trace", []),
             "cost_profile": graph_result.get("cost_profile", {}),
+            "embedding_mode": embedding_mode,
             **debug_payload,
         }
     return {
@@ -4682,6 +4864,7 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
         "document_id": req.document_id,
         "agent_trace": graph_result.get("agent_trace", []),
         "cost_profile": graph_result.get("cost_profile", {}),
+        "embedding_mode": embedding_mode,
         **debug_payload,
     }
 
@@ -4691,8 +4874,9 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
     tenant_id = str(identity.get("tenant_id", "public"))
+    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
-    billing_exempt = _is_special_user(request)
+    billing_exempt = _embedding_billing_exempt(request)
     default_summary_compact_level = _resolve_summary_compact_level(os.getenv("SUMMARY_COMPACT_LEVEL"), default=1)
     summary_compact_level = _resolve_summary_compact_level(req.summary_compact_level, default=default_summary_compact_level)
     report_mode = _resolve_summary_mode(req.report_mode, default="full")
@@ -4700,6 +4884,7 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
         query=req.query,
         discipline=req.discipline,
         document_id=req.document_id,
+        embedding_mode=embedding_mode,
         tenant_id=tenant_id,
         billing_client_id=billing_client_id,
         billing_exempt=bool(billing_exempt),
@@ -4755,6 +4940,7 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
         "document_id": req.document_id,
         "agent_trace": graph_result.get("agent_trace", []),
         "cost_profile": graph_result.get("cost_profile", {}),
+        "embedding_mode": embedding_mode,
     }
 
 
@@ -4887,7 +5073,7 @@ async def exam_upload(
     _require_permission(identity, "tenant.exam.write")
     tenant_id = str(identity.get("tenant_id", "public"))
     _, billing_client_id = _billing_tenant_client(request)
-    billing_exempt = _is_special_user(request)
+    billing_exempt = _embedding_billing_exempt(request)
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     suffix = Path(file.filename).suffix.lower()

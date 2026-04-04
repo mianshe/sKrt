@@ -22,6 +22,7 @@ import {
 } from "../lib/clientPersistence";
 import { localDraftProcessJson, type LocalUserBackupRecord } from "../lib/localUserBackup";
 import type { LocalGuestDoc } from "../lib/localGuestDocuments";
+import { useEmbeddingModePreference, type EmbeddingMode } from "../lib/embeddingMode";
 
 type Props = {
   documents: DocumentItem[];
@@ -32,7 +33,7 @@ type Props = {
     discipline: string,
     documentType: string,
     onUploadProgress?: (percent: number) => void,
-    options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean }
+    options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean; embedding_mode?: EmbeddingMode }
   ) => Promise<UploadTaskItem[]>;
   onGetTask: (taskId: number) => Promise<UploadTaskItem>;
   onDelete: (id: number) => Promise<void>;
@@ -115,6 +116,7 @@ function UploadTab({
   const [localInfo, setLocalInfo] = useState("");
   const [dragging, setDragging] = useState(false);
   const [ocrMode, setOcrMode] = useState<OcrMode>("standard");
+  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
   const [uploadToCloud, setUploadToCloud] = useState(true);
   const [guestLocalDocs, setGuestLocalDocs] = useState<LocalGuestDoc[]>([]);
   const [userBackups, setUserBackups] = useState<LocalUserBackupRecord[]>([]);
@@ -265,6 +267,7 @@ function UploadTab({
 
     try {
       const tasks = await onCreateUploadTasks(filesToUpload, "all", "academic", setUploadProgress, {
+        embedding_mode: embeddingMode,
         ocr_mode: ocrMode,
         external_ocr_confirmed: false,
       });
@@ -345,6 +348,53 @@ function UploadTab({
             <span className="block text-xs text-slate-500">默认开启。网页端检索问答依赖云端解析、向量化和建索引结果。</span>
           </span>
         </label>
+        <div className="mb-3 rounded-2xl bg-white/75 p-3 ring-1 ring-slate-200">
+          <p className="text-sm font-semibold text-slate-800">向量模式</p>
+          <div className="mt-2 space-y-2 text-sm">
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="embedding-mode"
+                className="mt-0.5"
+                checked={embeddingMode === "auto"}
+                onChange={() => setEmbeddingMode("auto")}
+              />
+              <span>
+                <span className="font-medium text-slate-800">自动</span>
+                <span className="block text-xs text-slate-500">沿用服务端当前优先级，兼容现有部署。</span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="embedding-mode"
+                className="mt-0.5"
+                checked={embeddingMode === "local"}
+                onChange={() => setEmbeddingMode("local")}
+              />
+              <span>
+                <span className="font-medium text-slate-800">本地向量</span>
+                <span className="block text-xs text-slate-500">强制走本地 embedding，不消耗云端 embedding token。</span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="embedding-mode"
+                className="mt-0.5"
+                checked={embeddingMode === "api"}
+                onChange={() => setEmbeddingMode("api")}
+              />
+              <span>
+                <span className="font-medium text-slate-800">API 向量</span>
+                <span className="block text-xs text-slate-500">强制走远程 embedding，可能产生云端费用。</span>
+              </span>
+            </label>
+          </div>
+          <p className="mt-2 text-xs text-amber-700">
+            切换模式后，旧文档如果不是同一向量模型，检索结果可能为空；这类文档需要按当前模式重新上传。
+          </p>
+        </div>
         <div className="mb-3 rounded-2xl bg-white/75 p-3 ring-1 ring-slate-200">
           <p className="text-sm font-semibold text-slate-800">OCR 模式</p>
           <div className="mt-2 space-y-2 text-sm">

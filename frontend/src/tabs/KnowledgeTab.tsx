@@ -8,6 +8,7 @@ import {
   suggestedGlobalSummaryFilename,
 } from "../lib/exportSummaryDocx";
 import { API_BASE } from "../config/apiBase";
+import { useEmbeddingModePreference } from "../lib/embeddingMode";
 
 const TENANT_KEY = "xm_tenant_id";
 
@@ -45,6 +46,7 @@ type Props = {
 function KnowledgeTab({}: Props) {
   const summaryCompactLevel = 0;
   const summaryMode: "full" = "full";
+  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
   const [highlights, setHighlights] = useState<{ items: string[]; conclusions: string[]; actions: string[] } | null>(null);
   const [highlightsLoading, setHighlightsLoading] = useState(false);
   const [highlightsError, setHighlightsError] = useState("");
@@ -87,7 +89,7 @@ function KnowledgeTab({}: Props) {
     fetch(`${API_BASE}/insights/summary`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
-      body: JSON.stringify({ query: "全局提炼", discipline: "all", summary_compact_level: summaryCompactLevel, summary_mode: summaryMode }),
+      body: JSON.stringify({ query: "全局提炼", discipline: "all", summary_compact_level: summaryCompactLevel, summary_mode: summaryMode, embedding_mode: embeddingMode }),
       signal: controller.signal,
     })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("要点摘要请求失败"))))
@@ -103,7 +105,7 @@ function KnowledgeTab({}: Props) {
       })
       .finally(() => { if (!controller.signal.aborted) setHighlightsLoading(false); });
     return () => controller.abort();
-  }, []);
+  }, [embeddingMode]);
   useEffect(() => {
     const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
     const load = async () => {
@@ -154,6 +156,7 @@ function KnowledgeTab({}: Props) {
             discipline: "all",
             summary_compact_level: summaryCompactLevel,
             summary_mode: summaryMode,
+            embedding_mode: embeddingMode,
           }),
           signal: controller.signal,
         });
@@ -194,11 +197,35 @@ function KnowledgeTab({}: Props) {
 
     void loadSummary();
     return () => controller.abort();
-  }, []);
+  }, [embeddingMode]);
 
   return (
     <section className="space-y-3">
       <div className="card p-4">
+        <div className="mb-2 flex flex-wrap gap-2 text-xs">
+          <button
+            type="button"
+            className={`rounded-full px-3 py-1 ${embeddingMode === "auto" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+            onClick={() => setEmbeddingMode("auto")}
+          >
+            自动向量
+          </button>
+          <button
+            type="button"
+            className={`rounded-full px-3 py-1 ${embeddingMode === "local" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+            onClick={() => setEmbeddingMode("local")}
+          >
+            本地向量
+          </button>
+          <button
+            type="button"
+            className={`rounded-full px-3 py-1 ${embeddingMode === "api" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
+            onClick={() => setEmbeddingMode("api")}
+          >
+            API 向量
+          </button>
+        </div>
+        <p className="mb-2 text-xs text-amber-700">全局总结和报告会按当前向量模式检索；模式切换后旧索引可能不再命中。</p>
         <div className="mb-2 flex flex-wrap items-center gap-2">
           <h2 className="text-sm font-semibold text-violet-600">✦ 要点总结</h2>
         </div>
