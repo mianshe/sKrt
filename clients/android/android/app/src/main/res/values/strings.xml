@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">sKrt</string>
+    <string name="title_activity_main">sKrt</string>
+    <string name="package_name">com.sciomenihilscire.skrt.android</string>
+    <string name="custom_url_scheme">com.sciomenihilscire.skrt.android</string>
+</resources>

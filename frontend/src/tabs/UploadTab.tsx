@@ -12,18 +12,16 @@ import {
 } from "../hooks/useDocuments";
 import { getAccessToken, useAccessToken } from "../lib/auth";
 import {
-  listLocalGuestDocuments,
-  putLocalGuestDocument,
-  deleteLocalGuestDocument,
-  type LocalGuestDoc,
-} from "../lib/localGuestDocuments";
-import {
-  deleteLocalUserBackup,
-  listLocalUserBackups,
-  putLocalUserBackup,
-  localDraftProcessJson,
-  type LocalUserBackupRecord,
-} from "../lib/localUserBackup";
+  deleteClientGuestDocument,
+  deleteClientUserBackup,
+  getClientPersistenceInfo,
+  listClientGuestDocuments,
+  listClientUserBackups,
+  putClientGuestDocument,
+  putClientUserBackup,
+} from "../lib/clientPersistence";
+import { localDraftProcessJson, type LocalUserBackupRecord } from "../lib/localUserBackup";
+import type { LocalGuestDoc } from "../lib/localGuestDocuments";
 
 type Props = {
   documents: DocumentItem[];
@@ -82,7 +80,7 @@ async function mergeCloudIntoLocalBackups(
     const localId = localIdByKey.get(k);
     if (!localId) continue;
     const snapshot = await buildLocalProcessSnapshot(task.task_id);
-    await putLocalUserBackup({
+    await putClientUserBackup({
       id: localId,
       taskId: task.task_id,
       filename: file.name,
@@ -117,17 +115,19 @@ function UploadTab({
   const [localInfo, setLocalInfo] = useState("");
   const [dragging, setDragging] = useState(false);
   const [ocrMode, setOcrMode] = useState<OcrMode>("standard");
-  const [uploadToCloud, setUploadToCloud] = useState(false);
+  const [uploadToCloud, setUploadToCloud] = useState(true);
   const [guestLocalDocs, setGuestLocalDocs] = useState<LocalGuestDoc[]>([]);
   const [userBackups, setUserBackups] = useState<LocalUserBackupRecord[]>([]);
   const [quota, setQuota] = useState<TenantQuotaStatus | null>(null);
   const accessToken = useAccessToken();
   const loggedIn = Boolean(accessToken);
+  const storageInfo = getClientPersistenceInfo();
+  const localStorageName = storageInfo.storageTarget === "device-native" ? "本机设备" : "浏览器";
 
   const localIdMapRef = useRef<Map<string, string>>(new Map());
 
   const refreshLocalLists = useCallback(async () => {
-    const [g, u] = await Promise.all([listLocalGuestDocuments(), listLocalUserBackups()]);
+    const [g, u] = await Promise.all([listClientGuestDocuments(), listClientUserBackups()]);
     setGuestLocalDocs(g);
     setUserBackups(u);
   }, []);
@@ -210,7 +210,7 @@ function UploadTab({
       const id = getOrCreateLocalId(file);
       const token = getAccessToken();
       if (token) {
-        await putLocalUserBackup({
+        await putClientUserBackup({
           id,
           taskId: 0,
           filename: file.name,
@@ -219,7 +219,7 @@ function UploadTab({
           processJson: localDraftProcessJson(),
         });
       } else {
-        await putLocalGuestDocument({
+        await putClientGuestDocument({
           id,
           filename: file.name,
           size: file.size,
@@ -248,7 +248,7 @@ function UploadTab({
     const filesToUpload = uploadToCloud ? selectedFiles : failedLocalFiles;
 
     if (filesToUpload.length === 0) {
-      setLocalInfo("已保存到本机（浏览器），未上传云端。");
+      setLocalInfo(`已保存到${localStorageName}，未上传云端。`);
       await refreshLocalLists();
       setSelectedFiles([]);
       return;
@@ -320,16 +320,19 @@ function UploadTab({
     <section className="space-y-3">
       <div className="card p-4">
         <p className="mb-2 text-xs text-slate-600">
-          默认先写入本机（IndexedDB）。勾选「上传云端」后所选文件会参与服务端解析与知识库检索；未勾选时，仅在本机保存失败时自动上传对应文件。
-        </p>
-        <p className="mb-2 text-xs font-medium text-amber-700">
-          未勾选「上传云端」且本机保存成功时，只会保存原件，不会开始云端解析、向量化和建索引。
+          网页默认过程+原件保存云端以供语言模型检索，云端每人只有100MB使用额度。
         </p>
         {authLocalEnabled && (
           <p className="mb-2 text-xs text-violet-700">
-            登录后可使用「用户本机备份」库；未登录时使用游客本机存储，数据仅存于当前浏览器。
+            想要继续使用请下载 exe / app，可以将数据存本地。
           </p>
         )}
+        <p className="mb-2 text-xs text-slate-500">
+          当前环境：{storageInfo.label}。
+          {storageInfo.storageTarget === "device-native"
+            ? `本机副本会直接保存到${storageInfo.storageLabel}。`
+            : `当前“本机副本”仍保存在${storageInfo.storageLabel}；等 exe / app 接入原生存储桥后再切到真正的设备目录。`}
+        </p>
         <label className="mb-3 flex cursor-pointer items-start gap-2 text-sm">
           <input
             type="checkbox"
@@ -338,8 +341,8 @@ function UploadTab({
             onChange={(e) => setUploadToCloud(e.target.checked)}
           />
           <span>
-            <span className="font-semibold text-slate-800">上传云端</span>
-            <span className="block text-xs text-slate-500">勾选后全部所选文件上传并解析；不勾选则仅本机失败时自动上传。</span>
+            <span className="font-semibold text-slate-800">同步到网页云端知识库</span>
+            <span className="block text-xs text-slate-500">默认开启。网页端检索问答依赖云端解析、向量化和建索引结果。</span>
           </span>
         </label>
         <div className="mb-3 rounded-2xl bg-white/75 p-3 ring-1 ring-slate-200">
@@ -516,7 +519,9 @@ function UploadTab({
       </div>
 
       <div className="card p-4">
-        <h3 className="mb-2 text-sm font-semibold text-slate-700">本机副本（仅当前浏览器）</h3>
+        <h3 className="mb-2 text-sm font-semibold text-slate-700">
+          本机副本（{storageInfo.storageTarget === "device-native" ? "当前设备" : "仅当前浏览器"}）
+        </h3>
         {loggedIn ? (
           <div className="space-y-2">
             {userBackups.map((b) => (
@@ -533,9 +538,9 @@ function UploadTab({
                 <button
                   type="button"
                   className="text-xs text-rose-600 hover:underline"
-                  onClick={() => void deleteLocalUserBackup(b.id).then(() => refreshLocalLists())}
+                  onClick={() => void deleteClientUserBackup(b.id).then(() => refreshLocalLists())}
                 >
-                  删除本机
+                  删除本机副本
                 </button>
               </div>
             ))}
@@ -557,7 +562,7 @@ function UploadTab({
                 <button
                   type="button"
                   className="text-xs text-rose-600 hover:underline"
-                  onClick={() => void deleteLocalGuestDocument(g.id).then(() => refreshLocalLists())}
+                  onClick={() => void deleteClientGuestDocument(g.id).then(() => refreshLocalLists())}
                 >
                   删除
                 </button>

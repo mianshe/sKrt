@@ -9,6 +9,9 @@ import ModalShell from "./ModalShell";
 const GPU_QUOTA_REFRESH_EVENT = "gpu-ocr-quota-refresh";
 const PENDING_PAY_ORDER_STORAGE_KEY = "gpu-ocr-pending-pay-order-v2";
 const PENDING_PAY_ORDER_MAX_AGE_MS = 30 * 60 * 1000;
+const EXE_DOWNLOAD_URL = "https://github.com/mianshe/sKrt/releases/latest/download/sKrt-setup.exe";
+const APK_DOWNLOAD_URL = "https://github.com/mianshe/sKrt/releases/latest/download/sKrt.apk";
+const CLIENT_RELEASES_URL = "https://github.com/mianshe/sKrt/releases";
 
 type DeferredInstallPrompt = Event & {
   prompt: () => Promise<void>;
@@ -134,6 +137,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [installHintOpen, setInstallHintOpen] = useState(false);
   const [installHintText, setInstallHintText] = useState("");
   const [installMessage, setInstallMessage] = useState("");
+  const [primaryDownloadLabel, setPrimaryDownloadLabel] = useState("下载 exe / app");
   const [isInstalled, setIsInstalled] = useState(false);
 
   const [payOpen, setPayOpen] = useState(false);
@@ -186,11 +190,27 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     const isAndroidChromeLike = isAndroid && (isChrome || isEdge) && !isWechat && !isQq && !isQuark && !isMiuiBrowser;
     const isUnsupportedInstallBrowser = isAndroid && (isQuark || isMiuiBrowser || isWechat || isQq);
     return {
+      isAndroid,
       isAndroidChromeLike,
       isDesktopChromium,
       isUnsupportedInstallBrowser,
     };
   }, []);
+
+  const preferredDownload = useMemo(() => {
+    if (installEnv.isAndroid) {
+      return {
+        url: APK_DOWNLOAD_URL,
+        label: "已开始下载 apk",
+        hint: "当前检测到 Android 设备，已直接开始下载 apk。若没有反应，可手动点下方“下载 Android apk”。",
+      };
+    }
+    return {
+      url: EXE_DOWNLOAD_URL,
+      label: "已开始下载 exe",
+      hint: "当前默认按桌面端处理，已直接开始下载 exe。若你要装到手机，请改用下方“下载 Android apk”。",
+    };
+  }, [installEnv.isAndroid]);
 
   const recommendedPayChannel = useMemo<PayChannel>(() => {
     if (payProvider === "paypal") return "paypal";
@@ -406,7 +426,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     const onInstalled = () => {
       setIsInstalled(true);
       setDeferredPrompt(null);
-      setInstallMessage("已安装到桌面");
+      setInstallMessage("已安装网页版");
     };
 
     window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
@@ -521,46 +541,11 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
 
   const onInstallClick = async () => {
     setInstallMessage("");
-
-    if (isInstalled) {
-      setInstallMessage("应用已安装");
-      return;
-    }
-
-    if (deferredPrompt) {
-      await deferredPrompt.prompt();
-      const choice = await deferredPrompt.userChoice;
-      setInstallMessage(choice.outcome === "accepted" ? "已发起安装" : "已取消安装");
-      setDeferredPrompt(null);
-      return;
-    }
-
-    if (isIosSafari) {
-      setInstallHintText("iPhone 或 iPad 请点 Safari 底部“分享”，再选择“添加到主屏幕”。");
-      setInstallHintOpen(true);
-      return;
-    }
-
-    if (installEnv.isAndroidChromeLike) {
-      setInstallHintText("Android 请点浏览器右上角菜单，选择“安装应用”或“添加到主屏幕”。");
-      setInstallHintOpen(true);
-      return;
-    }
-
-    if (installEnv.isUnsupportedInstallBrowser) {
-      setInstallHintText("当前安卓浏览器通常不支持安装，请改用 Chrome 或 Edge 打开后再安装。");
-      setInstallHintOpen(true);
-      return;
-    }
-
-    if (installEnv.isDesktopChromium) {
-      setInstallHintText("桌面 Chrome 或 Edge 请点击地址栏右侧安装图标，或从浏览器菜单中选择“安装 sKrt”。");
-      setInstallHintOpen(true);
-      return;
-    }
-
-    setInstallHintText("当前环境暂不支持一键安装，请使用 HTTPS 下的 Chrome、Edge 或 Safari 再试。");
+    setPrimaryDownloadLabel(preferredDownload.label);
+    setInstallHintText(preferredDownload.hint);
     setInstallHintOpen(true);
+    window.open(preferredDownload.url, "_blank", "noopener,noreferrer");
+    setInstallMessage(preferredDownload.label);
   };
 
   const onQuotaTap = () => {
@@ -748,15 +733,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   return (
     <>
       <div className="flex flex-wrap items-center justify-end gap-1.5 text-right text-[11px] text-slate-500">
-        {!isInstalled && (
-          <button
-            type="button"
-            className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-indigo-600 ring-1 ring-indigo-200 transition hover:bg-indigo-50"
-            onClick={onInstallClick}
-          >
-            安装到桌面
-          </button>
-        )}
+        <button
+          type="button"
+          className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-indigo-600 ring-1 ring-indigo-200 transition hover:bg-indigo-50"
+          onClick={onInstallClick}
+        >
+          下载 exe / app
+        </button>
 
         <button
           type="button"
@@ -808,8 +791,33 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         onClose={() => setInstallHintOpen(false)}
         panelClassName="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
       >
-        <p className="text-sm font-semibold text-slate-800">安装到桌面</p>
-        <p className="mt-1 text-xs text-slate-500">{installHintText || "请在浏览器菜单中选择安装或添加到主屏幕。"}</p>
+        <p className="text-sm font-semibold text-slate-800">下载 exe / app</p>
+        <p className="mt-1 text-xs text-slate-500">
+          {installHintText || "桌面端请下载 exe，Android 请下载 apk / app。"}
+        </p>
+        <div className="mt-3 grid grid-cols-1 gap-2">
+          <button
+            type="button"
+            className="rounded-2xl bg-indigo-50 px-3 py-2 text-sm font-semibold text-indigo-700 ring-1 ring-indigo-200 transition hover:bg-indigo-100"
+            onClick={() => window.open(EXE_DOWNLOAD_URL, "_blank", "noopener,noreferrer")}
+          >
+            下载 Windows exe
+          </button>
+          <button
+            type="button"
+            className="rounded-2xl bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700 ring-1 ring-emerald-200 transition hover:bg-emerald-100"
+            onClick={() => window.open(APK_DOWNLOAD_URL, "_blank", "noopener,noreferrer")}
+          >
+            下载 Android apk
+          </button>
+          <button
+            type="button"
+            className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
+            onClick={() => window.open(CLIENT_RELEASES_URL, "_blank", "noopener,noreferrer")}
+          >
+            打开 Releases
+          </button>
+        </div>
         <div className="mt-3 flex justify-end">
           <button
             className="rounded-2xl bg-white/85 px-3 py-2 text-sm text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"

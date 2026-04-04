@@ -32,13 +32,14 @@ Thumbs.db
 data/uploads/
 *.zip
 
-# Android / TWA local environment
-twa-skrt/android-sdk/
-twa-skrt/jdk17/
-twa-skrt/*.tmp
-twa-skrt/skrt-twa/.gradle/
-twa-skrt/skrt-twa/**/build/
-twa-skrt/skrt-twa/*.apk
-twa-skrt/skrt-twa/*.aab
-twa-skrt/skrt-twa/*.idsig
-twa-skrt/skrt-twa/*.jks
+# Future clients
+clients/desktop/node_modules/
+clients/desktop/src-tauri/target/
+clients/android/node_modules/
+clients/android/android/.gradle/
+clients/android/android/local.properties
+clients/android/android/**/build/
+clients/android/android/*.apk
+clients/android/android/*.aab
+clients/android/android/*.idsig
+clients/artifacts/
