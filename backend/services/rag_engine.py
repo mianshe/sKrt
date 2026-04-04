@@ -168,17 +168,23 @@ class RAGEngine:
         }
 
     def estimate_document_chunk_count(self, document_id: Optional[int], tenant_id: Optional[str] = None) -> int:
-        if not isinstance(document_id, int) or document_id <= 0:
-            return 0
         conn = knowledge_store.connect()
         try:
-            if tenant_id:
+            has_doc_id = isinstance(document_id, int) and document_id > 0
+            if has_doc_id and tenant_id:
                 row = conn.execute(
                     "SELECT COUNT(1) AS cnt FROM vectors WHERE document_id = ? AND tenant_id = ?",
                     (document_id, tenant_id),
                 ).fetchone()
-            else:
+            elif has_doc_id:
                 row = conn.execute("SELECT COUNT(1) AS cnt FROM vectors WHERE document_id = ?", (document_id,)).fetchone()
+            elif tenant_id:
+                row = conn.execute(
+                    "SELECT COUNT(1) AS cnt FROM vectors WHERE tenant_id = ?",
+                    (tenant_id,),
+                ).fetchone()
+            else:
+                return 0
             if not row:
                 return 0
             return max(0, int(row["cnt"] or 0))
@@ -224,11 +230,9 @@ class RAGEngine:
         tenant_id: Optional[str] = None,
         embedding_model_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        if not isinstance(document_id, int) or document_id <= 0:
-            return []
         rows = self._fetch_rows(
             discipline_filter,
-            document_id=document_id,
+            document_id=document_id if isinstance(document_id, int) and document_id > 0 else None,
             tenant_id=tenant_id,
             embedding_model_id=embedding_model_id,
         )

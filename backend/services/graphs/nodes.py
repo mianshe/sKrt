@@ -84,10 +84,11 @@ class GraphNodes:
         percent_cfg = _summary_percent_config_by_compact_level(compact_level)
         preferred_top_k = int(percent_cfg["retrieval_top_k"])
         estimated_doc_chunks = self.rag_engine.estimate_document_chunk_count(document_id, tenant_id=tenant_id)
-        if summary_mode == "full" and isinstance(document_id, int) and document_id > 0:
-            full_limit = _full_mode_doc_limit(estimated_doc_chunks)
+        if summary_mode == "full":
+            has_doc_id = isinstance(document_id, int) and document_id > 0
+            full_limit = _full_mode_doc_limit(estimated_doc_chunks if estimated_doc_chunks > 0 else 480)
             doc_rows = self.rag_engine.load_document_chunks(
-                document_id=document_id,
+                document_id=document_id if has_doc_id else None,
                 discipline_filter=discipline,
                 limit=full_limit,
                 tenant_id=tenant_id,
@@ -98,7 +99,7 @@ class GraphNodes:
                     "focus_blocks": [],
                     "cross_discipline": [],
                     "evidence": normalize_evidence(doc_rows, limit=6),
-                    "estimated_doc_chunks": estimated_doc_chunks,
+                    "estimated_doc_chunks": estimated_doc_chunks or len(doc_rows),
                 }
         retrieval = await self.rag_engine.summary_search_with_qa_focus(
             query=query,
