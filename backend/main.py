@@ -3699,12 +3699,17 @@ async def health() -> Dict[str, Any]:
     )
     pdf_ocr_engine = (os.getenv("PDF_OCR_ENGINE", "auto") or "auto").strip().lower()
     capacity = _capacity_snapshot()
+    local_embedding_ready = bool(ai_router._load_local_embedding_runtime()) if ai_router.hybrid_cfg.enable_local_embedding else False
     return {
         "status": "ok",
         "database": knowledge_store.health_database_label(),
         "storage": str(UPLOAD_DIR),
         "hybrid_local_first": RUNTIME_CONFIG.hybrid.local_first,
         "active_embedding_model": ai_router.get_active_embedding_model_id(),
+        "local_embedding_enabled": bool(ai_router.hybrid_cfg.enable_local_embedding),
+        "local_embedding_model": ai_router.hybrid_cfg.local_embedding_model_id,
+        "local_embedding_ready": local_embedding_ready,
+        "local_embedding_error": "" if local_embedding_ready else ai_router.get_local_embedding_unavailable_reason(),
         "llamaindex_enabled": RUNTIME_CONFIG.llama_index.enabled,
         "langchain_enabled": RUNTIME_CONFIG.langchain.enabled,
         "agent_graph_enabled": True,

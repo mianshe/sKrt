@@ -28,6 +28,8 @@ class FreeAIRouter:
 
         self._local_chat_runtime: Optional[Tuple[Any, Any]] = None
         self._local_embed_runtime: Optional[Tuple[Any, Any, Any]] = None
+        self._local_chat_runtime_error: str = ""
+        self._local_embed_runtime_error: str = ""
 
     @staticmethod
     def normalize_embedding_mode(value: Optional[str]) -> str:
@@ -47,6 +49,8 @@ class FreeAIRouter:
             raise RuntimeError("当前未启用本地 embedding")
         if mode == "api" and not self.has_remote_embedding_provider():
             raise RuntimeError("当前未配置可用的远程 embedding API")
+        if mode == "local" and self._load_local_embedding_runtime() is None:
+            raise RuntimeError(f"当前本地 embedding 不可用: {self.get_local_embedding_unavailable_reason()}")
         return mode
 
     def _embedding_provider_order(self, embedding_mode: str) -> List[str]:
@@ -68,6 +72,12 @@ class FreeAIRouter:
         if self.hybrid_cfg.enable_local_embedding:
             order.append("transformers-local")
         return order
+
+    def get_local_embedding_unavailable_reason(self) -> str:
+        detail = str(self._local_embed_runtime_error or "").strip()
+        if detail:
+            return detail
+        return "本地模型运行时未初始化，请检查 transformers/torch、模型名和网络下载权限"
 
     def _local_embedding_response(self, embedding: List[float], dimensions: Optional[int], target_dim: int) -> Dict[str, Any]:
         local_dim = len(embedding)
@@ -235,6 +245,8 @@ class FreeAIRouter:
                 continue
 
         if mode in {"local", "api"}:
+            if mode == "local":
+                raise RuntimeError(f"embedding_mode={mode} 不可用：{self.get_local_embedding_unavailable_reason()}")
             raise RuntimeError(f"embedding_mode={mode} 不可用：当前模式下未成功生成向量")
         if self.hybrid_cfg.enable_hash_fallback:
             return {
@@ -442,7 +454,8 @@ class FreeAIRouter:
     async def _local_embedding(self, text: str) -> Optional[List[float]]:
         try:
             return await asyncio.to_thread(self._local_embedding_blocking, text)
-        except Exception:
+        except Exception as exc:
+            self._local_embed_runtime_error = str(exc)[:1000]
             return None
 
     def _local_embedding_blocking(self, text: str) -> Optional[List[float]]:
@@ -476,7 +489,9 @@ class FreeAIRouter:
             device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
             model = model.to(device)
             self._local_chat_runtime = (tokenizer, model)
-        except Exception:
+            self._local_chat_runtime_error = ""
+        except Exception as exc:
+            self._local_chat_runtime_error = str(exc)[:1000]
             self._local_chat_runtime = None
         return self._local_chat_runtime
 
@@ -492,7 +507,9 @@ class FreeAIRouter:
             device = "cuda" if getattr(torch, "cuda", None) and torch.cuda.is_available() else "cpu"
             model = model.to(device)
             self._local_embed_runtime = (torch, tokenizer, model)
-        except Exception:
+            self._local_embed_runtime_error = ""
+        except Exception as exc:
+            self._local_embed_runtime_error = str(exc)[:1000]
             self._local_embed_runtime = None
         return self._local_embed_runtime
 
