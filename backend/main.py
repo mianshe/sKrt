@@ -4786,18 +4786,22 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
     summary_debug_passthrough = _env_bool("SUMMARY_DEBUG_PASSTHROUGH", False)
     summary_compact_level = 0
     summary_mode = "full"
-    graph_result = await agent_chains.run_summary_graph(
-        query=req.query,
-        discipline=req.discipline,
-        document_id=req.document_id,
-        embedding_mode=embedding_mode,
-        tenant_id=tenant_id,
-        billing_client_id=billing_client_id,
-        billing_exempt=bool(billing_exempt),
-        summary_debug_passthrough=summary_debug_passthrough,
-        summary_compact_level=summary_compact_level,
-        summary_mode=summary_mode,
-    )
+    try:
+        graph_result = await agent_chains.run_summary_graph(
+            query=req.query,
+            discipline=req.discipline,
+            document_id=req.document_id,
+            embedding_mode=embedding_mode,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=bool(billing_exempt),
+            summary_debug_passthrough=summary_debug_passthrough,
+            summary_compact_level=summary_compact_level,
+            summary_mode=summary_mode,
+        )
+    except Exception as exc:
+        logger.exception("insights/summary graph failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"摘要生成失败: {exc}") from exc
     debug_payload: Dict[str, Any] = {}
     if summary_debug_passthrough:
         debug_payload = {
