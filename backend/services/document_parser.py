@@ -374,6 +374,109 @@ class DocumentParser:
                 pass
         return 0
 
+    def _extract_pdf_toc(self, file_path: str) -> List[Dict[str, Any]]:
+        """
+        Best-effort PDF outline extraction. Failures should not block parsing.
+        """
+        try:
+            reader = PdfReader(file_path)
+        except Exception:
+            return []
+
+        outlines: Any = None
+        for attr_name in ("outline", "outlines"):
+            try:
+                outlines = getattr(reader, attr_name)
+                if outlines:
+                    break
+            except Exception:
+                outlines = None
+
+        if not outlines:
+            for method_name in ("get_outlines", "getOutlines"):
+                method = getattr(reader, method_name, None)
+                if callable(method):
+                    try:
+                        outlines = method()
+                        if outlines:
+                            break
+                    except Exception:
+                        outlines = None
+
+        if not outlines:
+            return []
+
+        items: List[Dict[str, Any]] = []
+        self._flatten_pdf_toc(reader, outlines, items, level=1)
+        return items
+
+    def _flatten_pdf_toc(
+        self,
+        reader: PdfReader,
+        outlines: Any,
+        items: List[Dict[str, Any]],
+        *,
+        level: int,
+    ) -> None:
+        if isinstance(outlines, list):
+            for entry in outlines:
+                if isinstance(entry, list):
+                    self._flatten_pdf_toc(reader, entry, items, level=level + 1)
+                    continue
+                item = self._pdf_toc_entry_to_dict(reader, entry, level=level)
+                if item is not None:
+                    items.append(item)
+            return
+
+        item = self._pdf_toc_entry_to_dict(reader, outlines, level=level)
+        if item is not None:
+            items.append(item)
+
+    def _pdf_toc_entry_to_dict(self, reader: PdfReader, entry: Any, *, level: int) -> Optional[Dict[str, Any]]:
+        try:
+            title = getattr(entry, "title", None)
+            if title is None and isinstance(entry, dict):
+                title = entry.get("/Title") or entry.get("title")
+            title_text = str(title or "").strip()
+            if not title_text:
+                return None
+
+            payload: Dict[str, Any] = {"title": title_text, "level": int(level)}
+            page_num = self._resolve_pdf_toc_page(reader, entry)
+            if page_num is not None:
+                payload["page"] = int(page_num)
+            return payload
+        except Exception:
+            return None
+
+    def _resolve_pdf_toc_page(self, reader: PdfReader, entry: Any) -> Optional[int]:
+        for method_name in ("get_destination_page_number", "getDestinationPageNumber"):
+            method = getattr(reader, method_name, None)
+            if callable(method):
+                try:
+                    page_index = method(entry)
+                    if isinstance(page_index, int) and page_index >= 0:
+                        return page_index + 1
+                except Exception:
+                    pass
+
+        direct_page = None
+        for attr_name in ("page", "page_number", "/Page"):
+            try:
+                if isinstance(entry, dict):
+                    direct_page = entry.get(attr_name)
+                else:
+                    direct_page = getattr(entry, attr_name, None)
+                if direct_page is not None:
+                    break
+            except Exception:
+                pass
+
+        if isinstance(direct_page, int) and direct_page >= 0:
+            return direct_page + 1
+
+        return None
+
     def _iter_pdf_page_images(self, file_path: str, dpi: int, max_pages: int) -> Iterator[Any]:
         """
         逐页产出 PIL.Image，避免一次性加载整本扫描件导致内存暴涨或进程被系统终止。
