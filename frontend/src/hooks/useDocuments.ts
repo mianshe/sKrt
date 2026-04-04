@@ -272,6 +272,13 @@ function backendHint(): string {
   return `请确认后端已启动并可打开 ${API_BASE}/docs；从手机/其他电脑访问时请设置环境变量 VITE_API_BASE 为可访问的后端地址。`;
 }
 
+function buildApiUrl(path: string): URL {
+  const normalizedBase = API_BASE.endsWith("/") ? API_BASE.slice(0, -1) : API_BASE;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const currentOrigin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+  return new URL(`${normalizedBase}${normalizedPath}`, currentOrigin);
+}
+
 function payloadToIngestionPoll(t: UploadTaskPayload): IngestionTaskPoll {
   const ex = typeof t.extract_progress_percent === "number" ? t.extract_progress_percent : 0;
   const ix = typeof t.index_progress_percent === "number" ? t.index_progress_percent : 0;
@@ -344,7 +351,7 @@ async function createSingleFileTask(
 ): Promise<UploadTaskItem> {
   const form = new FormData();
   form.append("files", file);
-  const url = new URL(`${API_BASE}/upload/tasks`);
+  const url = buildApiUrl("/upload/tasks");
   url.searchParams.set("discipline", discipline);
   url.searchParams.set("document_type", documentType);
   url.searchParams.set("embedding_mode", embeddingMode);
@@ -549,7 +556,7 @@ export async function uploadExamByChunks(
     onProgress?.(10);
     const form = new FormData();
     form.append("file", file);
-    const url = new URL(`${API_BASE}/exam/upload`);
+    const url = buildApiUrl("/exam/upload");
     url.searchParams.set("discipline", disc);
     let resp: Response;
     try {
