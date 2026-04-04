@@ -21,6 +21,10 @@ function App() {
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
+  const knowledgeRefreshKey = `${authSession}:${documents
+    .map((doc) => String(doc.id))
+    .sort()
+    .join(",")}`;
   const accessToken = useAccessToken();
   const didInitAuthSyncRef = useRef(false);
 
@@ -211,7 +215,7 @@ function App() {
         </div>
 
         <div className={tab === "knowledge" ? "block" : "hidden"}>
-          <KnowledgeTab />
+          <KnowledgeTab refreshKey={knowledgeRefreshKey} />
         </div>
 
         <div className={tab === "chat" ? "block" : "hidden"}>

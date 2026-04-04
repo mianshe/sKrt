@@ -8,6 +8,7 @@ import {
   suggestedGlobalSummaryFilename,
 } from "../lib/exportSummaryDocx";
 import { API_BASE } from "../config/apiBase";
+import { useAccessToken } from "../lib/auth";
 import { useEmbeddingModePreference } from "../lib/embeddingMode";
 
 const TENANT_KEY = "xm_tenant_id";
@@ -40,13 +41,15 @@ type DocSummary = {
 };
 
 type Props = {
-  // no props
+  refreshKey: string;
 };
 
-function KnowledgeTab({}: Props) {
+function KnowledgeTab({ refreshKey }: Props) {
   const summaryCompactLevel = 0;
   const summaryMode: "full" = "full";
   const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
+  const accessToken = useAccessToken();
+  const loggedIn = Boolean(accessToken);
   const [highlights, setHighlights] = useState<{ items: string[]; conclusions: string[]; actions: string[] } | null>(null);
   const [highlightsLoading, setHighlightsLoading] = useState(false);
   const [highlightsError, setHighlightsError] = useState("");
@@ -82,6 +85,12 @@ function KnowledgeTab({}: Props) {
 
   // ── 加载全局要点摘要（highlights/conclusions/actions）──────────
   useEffect(() => {
+    if (!loggedIn) {
+      setHighlights(null);
+      setHighlightsError("");
+      setHighlightsLoading(false);
+      return;
+    }
     const controller = new AbortController();
     const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
     setHighlightsLoading(true);
@@ -105,8 +114,13 @@ function KnowledgeTab({}: Props) {
       })
       .finally(() => { if (!controller.signal.aborted) setHighlightsLoading(false); });
     return () => controller.abort();
-  }, [embeddingMode]);
+  }, [embeddingMode, refreshKey, loggedIn]);
   useEffect(() => {
+    if (!loggedIn) {
+      setDocSummaries([]);
+      setDocSummaryLoading(false);
+      return;
+    }
     const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
     const load = async () => {
       setDocSummaryLoading(true);
@@ -139,9 +153,15 @@ function KnowledgeTab({}: Props) {
       }
     };
     load();
-  }, []);
+  }, [refreshKey, loggedIn]);
 
   useEffect(() => {
+    if (!loggedIn) {
+      setSummary(null);
+      setSummaryError("");
+      setSummaryLoading(false);
+      return;
+    }
     const controller = new AbortController();
     const loadSummary = async () => {
       setSummaryLoading(true);
@@ -197,7 +217,7 @@ function KnowledgeTab({}: Props) {
 
     void loadSummary();
     return () => controller.abort();
-  }, [embeddingMode]);
+  }, [embeddingMode, refreshKey, loggedIn]);
 
   return (
     <section className="space-y-3">

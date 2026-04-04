@@ -4777,6 +4777,8 @@ async def clear_chat_memory(req: ChatMemoryClearRequest, request: Request) -> Di
 async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        raise HTTPException(status_code=401, detail="请先登录后查看要点总结")
     tenant_id = str(identity.get("tenant_id", "public"))
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
@@ -4878,6 +4880,8 @@ async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, A
 async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
+    if local_auth_service.is_anonymous_local_guest(identity):
+        raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
     tenant_id = str(identity.get("tenant_id", "public"))
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
