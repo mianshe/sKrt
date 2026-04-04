@@ -101,7 +101,7 @@ function KnowledgeTab({ refreshKey }: Props) {
       body: JSON.stringify({ query: "全局提炼", discipline: "all", summary_compact_level: summaryCompactLevel, summary_mode: summaryMode, embedding_mode: embeddingMode }),
       signal: controller.signal,
     })
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("要点摘要请求失败"))))
+      .then((r) => r.ok ? r.json() : r.json().catch(() => ({})).then((b: any) => Promise.reject(new Error(b?.detail || `要点摘要请求失败 (${r.status})`))))
       .then((data) => {
         setHighlights({
           items: Array.isArray(data.highlights) ? data.highlights : [],
