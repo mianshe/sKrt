@@ -10,6 +10,7 @@ import {
 import { API_BASE } from "../config/apiBase";
 import { useAccessToken } from "../lib/auth";
 import { useEmbeddingModePreference } from "../lib/embeddingMode";
+import { withTenantHeaders } from "../hooks/useDocuments";
 
 const TENANT_KEY = "xm_tenant_id";
 
@@ -92,12 +93,11 @@ function KnowledgeTab({ refreshKey }: Props) {
       return;
     }
     const controller = new AbortController();
-    const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
     setHighlightsLoading(true);
     setHighlightsError("");
     fetch(`${API_BASE}/insights/summary`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
+      headers: withTenantHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ query: "全局提炼", discipline: "all", summary_compact_level: summaryCompactLevel, summary_mode: summaryMode, embedding_mode: embeddingMode }),
       signal: controller.signal,
     })
@@ -121,12 +121,11 @@ function KnowledgeTab({ refreshKey }: Props) {
       setDocSummaryLoading(false);
       return;
     }
-    const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
     const load = async () => {
       setDocSummaryLoading(true);
       try {
         const listResp = await fetch(`${API_BASE}/documents`, {
-          headers: { "X-Tenant-Id": tenantId },
+          headers: withTenantHeaders(),
         });
         if (!listResp.ok) return;
         const listData = await listResp.json();
@@ -136,7 +135,7 @@ function KnowledgeTab({ refreshKey }: Props) {
           withSummary.map(async (d) => {
             try {
               const r = await fetch(`${API_BASE}/documents/${d.id}/summary`, {
-                headers: { "X-Tenant-Id": tenantId },
+                headers: withTenantHeaders(),
               });
               if (!r.ok) return { document_id: d.id, summary: null };
               return (await r.json()) as DocSummary;
@@ -167,10 +166,9 @@ function KnowledgeTab({ refreshKey }: Props) {
       setSummaryLoading(true);
       setSummaryError("");
       try {
-        const tenantId = localStorage.getItem(TENANT_KEY)?.trim() || "public";
         const resp = await fetch(`${API_BASE}/insights/report`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
+          headers: withTenantHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             query: "全局提炼",
             discipline: "all",
