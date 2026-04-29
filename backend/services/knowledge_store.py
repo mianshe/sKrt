@@ -92,7 +92,7 @@ def connect() -> Union[sqlite3.Connection, PgCompatConnection]:
 
 def init_application_schema() -> None:
     """在 PostgreSQL 上创建知识库表。"""
-    from backend.services.pipeline import postgres_store as pg_store
+    from .pipeline import postgres_store as pg_store
 
     if not _pg_url:
         raise RuntimeError("DATABASE_URL 未配置，无法初始化 PostgreSQL 知识库")

@@ -46,7 +46,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": f"unsupported engine: {engine}"}, ensure_ascii=False), flush=True)
         return 1
 
-    from backend.services.document_parser import DocumentParser
+    from .document_parser import DocumentParser
 
     parser = DocumentParser()
     txt, err = parser._ocr_pdf_pages_paddle_inprocess(file_path=file_path, dpi=dpi, max_pages=max_pages)

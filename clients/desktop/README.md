@@ -25,12 +25,13 @@ Validation already completed in this repo:
   - `rustc` / `cargo` not installed
   - missing Visual Studio Build Tools with MSVC and Windows SDK
 
-## Planned Local-First Work
+## Current Local-First Work
 
-- local original-file storage
-- local process-file storage
-- local cache and sync policy
-- client-side update reminder dialog
+- guest document copies are persisted to local desktop app data
+- logged-in user process backups are persisted to local desktop app data
+- the shared frontend uses a Tauri native storage bridge when available
+
+If the native bridge is unavailable for any reason, the app falls back to browser IndexedDB inside the embedded web runtime.
 
 ## Useful Commands
 

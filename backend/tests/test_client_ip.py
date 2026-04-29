@@ -4,7 +4,7 @@ import os
 import pytest
 from starlette.requests import Request
 
-from backend.services.client_ip import client_ip_from_request, normalized_signup_ip
+from .client_ip import client_ip_from_request, normalized_signup_ip
 
 
 class _DummyClient:

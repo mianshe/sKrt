@@ -1,15 +1,108 @@
 import asyncio
+import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from .state import build_reasoning_gates, normalize_evidence, parse_json_object, sanitize_answer, sanitize_brief_reasoning
+from ..teaching_optimizer import TeachingOptimizer, create_teaching_optimizer
+
+logger = logging.getLogger(__name__)
+
+# 教学优化配置
+ENABLE_TEACHING_OPTIMIZATION = os.getenv("ENABLE_TEACHING_OPTIMIZATION", "true").lower() == "true"
+TEACHING_OPTIMIZATION_TIMEOUT = float(os.getenv("TEACHING_OPTIMIZATION_TIMEOUT", "2.0"))
+MIN_ITEMS_FOR_OPTIMIZATION = int(os.getenv("MIN_ITEMS_FOR_OPTIMIZATION", "2"))
 
 
 class GraphNodes:
-    def __init__(self, ai_router: Any, rag_engine: Any) -> None:
+    def __init__(self, ai_router: Any, rag_engine: Any, memory_hook: Any = None) -> None:
         self.ai_router = ai_router
         self.rag_engine = rag_engine
+        self.memory_hook = memory_hook
+        self.teaching_optimizer = create_teaching_optimizer(ai_router)
+    
+    async def _optimize_with_timeout(self, concept: str, text: str, context: str) -> str:
+        """带超时保护的教学优化"""
+        if not ENABLE_TEACHING_OPTIMIZATION or not text.strip():
+            return text
+            
+        try:
+            # 使用异步超时包装
+            optimized = await asyncio.wait_for(
+                asyncio.to_thread(self.teaching_optimizer.optimize_explanation, concept, text, context),
+                timeout=TEACHING_OPTIMIZATION_TIMEOUT
+            )
+            return optimized
+        except asyncio.TimeoutError:
+            logger.warning(f"TeachingOptimizer超时: concept={concept}, context={context[:50]}...")
+            return text  # 超时回退到原始文本
+        except Exception as e:
+            logger.warning(f"TeachingOptimizer异常: {e}, concept={concept}")
+            return text  # 异常回退到原始文本
+    
+    async def _normalize_chapter_summary_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        chapter_title = str(item.get("chapter_title", "章节")).strip() or "章节"
+        key_points = _to_list(item.get("key_points"))
+        analysis = _to_list(item.get("analysis"))
+        recommendations = _to_list(item.get("recommendations"))
+        risks = _to_list(item.get("risks"))
+
+        def _normalize_lines(items: List[str], *, max_items: int = 8) -> List[str]:
+            normalized: List[str] = []
+            for raw in items[:max_items]:
+                text = re.sub(r"^(\d+)[\.、]?\s+", "", str(raw or "").strip())
+                if text:
+                    normalized.append(text)
+            return normalized
+
+        async def _build_section(title: str, items: List[str], fallback: str) -> Dict[str, Any]:
+            lines = _normalize_lines(items)
+            content = "\n".join([f"- {line}" for line in lines]) if lines else fallback
+            
+            # 当条目数达到优化阈值时触发教学优化
+            if len(lines) >= MIN_ITEMS_FOR_OPTIMIZATION and content and content != fallback:
+                try:
+                    # 构建优化上下文
+                    context = f"章节: {chapter_title}, 部分: {title}"
+                    optimized_content = await self._optimize_with_timeout(
+                        concept=title,
+                        text=content,
+                        context=context
+                    )
+                    if optimized_content and optimized_content != content:
+                        content = optimized_content + " [教学优化后]"
+                except Exception as e:
+                    logger.debug(f"教学优化失败: {e}, title={title}, items_count={len(lines)}")
+                    # 失败时保持原内容
+            
+            return {
+                "title": title,
+                "content": content,
+                "metadata": {
+                    "line_count": len(lines),
+                    "optimized": len(lines) >= MIN_ITEMS_FOR_OPTIMIZATION,
+                },
+            }
+
+        sections: List[Dict[str, str]] = []
+
+        # 始终生成四个section，确保Tab2完整显示四个质量维度
+        sections.append(await _build_section("核心要点", key_points, "暂无要点"))
+        sections.append(await _build_section("章节分析", analysis, "暂无分析"))
+        sections.append(await _build_section("建议与启发", recommendations, "暂无建议"))
+        sections.append(await _build_section("风险与注意", risks, "暂无风险"))
+
+        content_parts: List[str] = [str(section.get("content", "")).strip() for section in sections if str(section.get("content", "")).strip()]
+
+        return {
+            "chapter_key": str(item.get("chapter_key", "")).strip(),
+            "chapter_title": chapter_title,
+            "page_start": item.get("page_start"),
+            "page_end": item.get("page_end"),
+            "sections": sections,
+            "content": "\n\n".join(content_parts).strip(),
+        }
 
     async def retrieve_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
         query = str(state.get("query", "")).strip()
@@ -32,9 +125,29 @@ class GraphNodes:
             embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
+        compressed_context = retrieval.get("compressed_context", "")
+
+        # ── CA3 Pattern Completion: associative spread from top-k results ──
+        if self.memory_hook:
+            try:
+                completer = self.memory_hook.get_completer()
+                if completer and rows:
+                    completed = completer.complete(
+                        seed_chunks=rows[:3],
+                        seed_embedding=None,
+                        tenant_id=tenant_id or "public",
+                        session_id=str(state.get("session_id", "default")),
+                        top_k=4,
+                    )
+                    for cp in completed:
+                        if cp.completed_text and cp.completed_text.strip():
+                            compressed_context += f"\n\n[关联记忆]\n{cp.completed_text.strip()[:600]}"
+            except Exception:
+                pass  # pattern completion is best-effort
+
         return {
             "retrieved": rows,
-            "compressed_context": retrieval.get("compressed_context", ""),
+            "compressed_context": compressed_context,
             "cross_discipline": retrieval.get("cross_discipline", []),
             "evidence": normalize_evidence(rows, limit=6),
         }
@@ -63,9 +176,29 @@ class GraphNodes:
             embedding_mode=embedding_mode,
         )
         rows = retrieval.get("results", [])
+        fallback_context = retrieval.get("compressed_context", state.get("compressed_context", ""))
+
+        # ── CA3 Pattern Completion: associative spread from recovery results ──
+        if self.memory_hook:
+            try:
+                completer = self.memory_hook.get_completer()
+                if completer and rows:
+                    completed = completer.complete(
+                        seed_chunks=rows[:3],
+                        seed_embedding=None,
+                        tenant_id=tenant_id or "public",
+                        session_id=str(state.get("session_id", "default")),
+                        top_k=4,
+                    )
+                    for cp in completed:
+                        if cp.completed_text and cp.completed_text.strip():
+                            fallback_context += f"\n\n[关联记忆]\n{cp.completed_text.strip()[:600]}"
+            except Exception:
+                pass
+
         return {
             "retrieved": rows,
-            "compressed_context": retrieval.get("compressed_context", state.get("compressed_context", "")),
+            "compressed_context": fallback_context,
             "cross_discipline": retrieval.get("cross_discipline", state.get("cross_discipline", [])),
             "evidence": normalize_evidence(rows, limit=6),
             "fallback_reason": "retry_retrieval",
@@ -179,8 +312,10 @@ class GraphNodes:
         }
 
     async def internal_reasoning_step(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        question_context = str(state.get("question_context", "")).strip()
         prompt = (
-            "你是内部推理节点。只返回JSON对象，字段: claim, evidence_summary, counterexample_check, consistency_check。\n"
+            "你是内部推理节点。只返回JSON对象，字段: prediction, claim, evidence_summary, counterexample_check, consistency_check。\n"
+            "prediction: 在看到证据前，基于你的内部知识库预测答案方向（一句话）。\n"
             "要求：每个字段一句话，不输出多余解释。\n"
             f"问题：{state.get('query', '')}\n"
             f"证据上下文：\n{state.get('compressed_context', '')}"
@@ -188,7 +323,7 @@ class GraphNodes:
         resp = await self.ai_router.chat_with_task(
             [{"role": "user", "content": prompt}],
             task_type="reason",
-            max_tokens=420,
+            max_tokens=520,
             temperature=0.2,
             prefer_free=True,
         )
@@ -199,8 +334,9 @@ class GraphNodes:
             "counterexample_check": str(parsed.get("counterexample_check", "")).strip()[:220],
             "consistency_check": str(parsed.get("consistency_check", "")).strip()[:180],
         }
+        prediction = str(parsed.get("prediction", "")).strip()[:180]
         provider = str(resp.get("provider", state.get("provider", "unknown")))
-        return {"internal_reasoning": reasoning, "provider": provider}
+        return {"internal_reasoning": reasoning, "provider": provider, "prediction": prediction, "predicted_answer": prediction}
 
     async def check_chat_quality(self, state: Dict[str, Any]) -> Dict[str, Any]:
         answer = str(state.get("answer", "")).strip()
@@ -398,8 +534,12 @@ class GraphNodes:
         groups = _chunk_rows(candidate_rows, size=group_size)
         max_concurrency = max(1, min(4, int(state.get("map_max_concurrency", 3) or 3)))
         semaphore = asyncio.Semaphore(max_concurrency)
+        progress_cb = state.get("_progress_callback")
+        map_done_count = 0
+        total_groups = len(groups)
 
         async def _run_map_group(idx: int, group: List[Any]) -> Dict[str, Any]:
+            nonlocal map_done_count
             group_blocks = []
             for row in group:
                 group_blocks.append(
@@ -424,6 +564,12 @@ class GraphNodes:
                 )
             parsed = parse_json_object(str(map_resp.get("content", "")))
             map_item_limit = int(map_reduce_cfg["map_item_limit"])
+            map_done_count += 1
+            if callable(progress_cb):
+                try:
+                    progress_cb({"stage": "map", "current": map_done_count, "total": total_groups, "message": f"Map 分组 {map_done_count}/{total_groups}"})
+                except Exception:
+                    pass
             return {
                 "provider": str(map_resp.get("provider", "unknown")),
                 "highlights": _to_list(parsed.get("highlights") if isinstance(parsed, dict) else [])[:map_item_limit],
@@ -492,6 +638,11 @@ class GraphNodes:
             f"问题：{state.get('query', '')}\n"
             f"Map结果：\n{chr(10).join(reduce_input_blocks)}"
         )
+        if callable(progress_cb):
+            try:
+                progress_cb({"stage": "reduce", "message": "聚合 Map 结果..."})
+            except Exception:
+                pass
         reduce_resp = await self.ai_router.chat_with_task(
             [{"role": "user", "content": reduce_prompt}],
             task_type="summarize",
@@ -534,63 +685,37 @@ class GraphNodes:
         embedding_mode = str(state.get("embedding_mode", "auto")).strip() or "auto"
         document_id = int(state.get("document_id", 0) or 0) or None
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
-        report_mode = str(state.get("report_mode", "full")).strip().lower() or "full"
         tenant_id = str(state.get("tenant_id", "")).strip() or None
         billing_client_id = str(state.get("billing_client_id", "")).strip() or None
         billing_exempt = bool(state.get("billing_exempt", False))
         report_cfg = _report_config_by_compact_level(compact_level)
         estimated_doc_chunks = self.rag_engine.estimate_document_chunk_count(document_id, tenant_id=tenant_id)
-        sampling_strategy = "coverage" if report_mode == "full" else "head"
-        if isinstance(document_id, int) and document_id > 0:
-            full_runtime = _report_full_runtime_config()
-            if report_mode == "full":
-                doc_rows = self.rag_engine.load_document_chunks(
-                    document_id=document_id,
-                    discipline_filter=discipline,
-                    limit=None,
-                    sampling_strategy="head",
-                    tenant_id=tenant_id,
-                )
-                raw_total = len(doc_rows)
-                return {
-                    "retrieved": doc_rows,
-                    "focus_blocks": [],
-                    "cross_discipline": [],
-                    "evidence": normalize_evidence(doc_rows, limit=8),
-                    "estimated_doc_chunks": estimated_doc_chunks,
-                    "retrieval_stats": {
-                        "retrieval_strategy": "doc_chunks_full_scan",
-                        "doc_limit": 0,
-                        "retrieved_rows": raw_total,
-                        "raw_total_chunks": raw_total,
-                        "estimated_doc_chunks": estimated_doc_chunks,
-                        "full_require_complete": bool(full_runtime["require_complete"]),
-                    },
-                }
-            doc_limit = int(report_cfg["doc_limit"])
-            if report_mode == "full" and compact_level == 0:
-                doc_limit = int(max(doc_limit, min(estimated_doc_chunks, doc_limit * 2)))
-            doc_rows = self.rag_engine.load_document_chunks(
-                document_id=document_id,
-                discipline_filter=discipline,
-                limit=doc_limit,
-                sampling_strategy=sampling_strategy,
-                tenant_id=tenant_id,
-            )
-            if doc_rows:
-                return {
-                    "retrieved": doc_rows,
-                    "focus_blocks": [],
-                    "cross_discipline": [],
-                    "evidence": normalize_evidence(doc_rows, limit=8),
-                    "estimated_doc_chunks": estimated_doc_chunks,
-                    "retrieval_stats": {
-                        "retrieval_strategy": f"doc_chunks_{sampling_strategy}",
-                        "doc_limit": doc_limit,
-                        "retrieved_rows": len(doc_rows),
-                        "estimated_doc_chunks": estimated_doc_chunks,
-                    },
-                }
+        has_doc_id = isinstance(document_id, int) and document_id > 0
+        full_runtime = _report_full_runtime_config()
+        doc_rows = self.rag_engine.load_document_chunks(
+            document_id=document_id if has_doc_id else None,
+            discipline_filter=discipline,
+            limit=None,
+            sampling_strategy="head",
+            tenant_id=tenant_id,
+        )
+        if doc_rows:
+            raw_total = len(doc_rows)
+            return {
+                "retrieved": doc_rows,
+                "focus_blocks": [],
+                "cross_discipline": [],
+                "evidence": normalize_evidence(doc_rows, limit=8),
+                "estimated_doc_chunks": estimated_doc_chunks or raw_total,
+                "retrieval_stats": {
+                    "retrieval_strategy": "doc_chunks_full_scan",
+                    "doc_limit": 0,
+                    "retrieved_rows": raw_total,
+                    "raw_total_chunks": raw_total,
+                    "estimated_doc_chunks": estimated_doc_chunks or raw_total,
+                    "full_require_complete": bool(full_runtime["require_complete"]),
+                },
+            }
         retrieval = await self.rag_engine.summary_search_with_qa_focus(
             query=query,
             discipline_filter=discipline,
@@ -617,32 +742,28 @@ class GraphNodes:
             },
         }
 
-    async def map_reduce_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    async def _legacy_map_reduce_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
         rows = state.get("retrieved", [])
         if not isinstance(rows, list) or not rows:
             return {"report_reduce_context": "", "coverage_stats": {"mode": "full", "processed_rows": 0, "total_rows": 0, "coverage_ratio": 0.0, "map_groups": 0}}
         compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
-        report_mode = str(state.get("report_mode", "full")).strip().lower() or "full"
         report_cfg = _report_config_by_compact_level(compact_level)
         estimated_total = _estimate_summary_scale(state, rows)
         full_runtime = _report_full_runtime_config()
         detail_runtime = _detail_first_runtime_config()
-        if report_mode == "full":
-            candidate_rows = rows
-            batch_size = int(full_runtime["batch_size"])
-            groups = _chunk_rows(candidate_rows, size=batch_size)
-        else:
-            candidate_limit = max(1, min(len(rows), int(report_cfg["coverage_floor"])))
-            if estimated_total > 0:
-                candidate_limit = max(candidate_limit, min(len(rows), int(round(estimated_total * float(report_cfg["coverage_ratio"])))))
-            candidate_rows = _sample_rows_for_coverage(rows, candidate_limit)
-            groups = _chunk_rows(candidate_rows, size=int(report_cfg["group_size"]))
+        candidate_rows = rows
+        batch_size = int(full_runtime["batch_size"])
+        groups = _chunk_rows(candidate_rows, size=batch_size)
 
-        max_concurrency = int(full_runtime["max_concurrency"]) if report_mode == "full" else 3
+        max_concurrency = int(full_runtime["max_concurrency"])
         max_concurrency = max(1, min(6, max_concurrency))
         semaphore = asyncio.Semaphore(max_concurrency)
+        progress_cb = state.get("_progress_callback")
+        report_map_done = 0
+        report_total_groups = len(groups)
 
         async def _run_report_map(idx: int, group: List[Any]) -> Dict[str, Any]:
+            nonlocal report_map_done
             blocks = []
             for row in group:
                 blocks.append(
@@ -650,8 +771,14 @@ class GraphNodes:
                     f"{str(row.get('content', ''))[:int(max(report_cfg['content_clip'], detail_runtime['report_content_clip']))]}"
                 )
             prompt = (
-                "你是长文报告Map节点。仅返回JSON对象，字段: key_points, analysis, recommendations, risks。\n"
-                "每个字段为数组，内容要具体并含证据指向，不输出推理过程。\n"
+                "你是一个资深的文档分析专家。请根据以下上下文提取核心信息，以‘说明文’风格进行叙述。仅返回JSON对象，字段: key_points, analysis, recommendations, risks。\n"
+                "【关键要求】：\n"
+                "- 每个字段都必须返回**一个完整的、连贯的中文段落**，而不是列表或分点。\n"
+                "- key_points: 将所有核心事实融合成一个自然的段落，使用'首先'、'其次'、'此外'等连接词。\n"
+                "- analysis: 使用连贯的逻辑叙述，如'基于上述事实...'、'因此...'等句式分析事实关系。\n"
+                "- recommendations/risks: 使用完整句子的建议和警示，避免要点式列举。\n"
+                "- 绝对禁止返回列表格式（如['要点1', '要点2']），必须返回纯文本段落。\n"
+                "- 语气稳重专业，每个字段段落长度约100-200字。\n"
                 f"问题：{state.get('query', '')}\n"
                 f"分组#{idx}上下文：\n{chr(10).join(blocks)}"
             )
@@ -664,6 +791,12 @@ class GraphNodes:
                     prefer_free=True,
                 )
             parsed = parse_json_object(str(resp.get("content", "")))
+            report_map_done += 1
+            if callable(progress_cb):
+                try:
+                    progress_cb({"stage": "map", "current": report_map_done, "total": report_total_groups, "message": f"Map 分组 {report_map_done}/{report_total_groups}"})
+                except Exception:
+                    pass
             return {
                 "provider": str(resp.get("provider", "unknown")),
                 "key_points": _to_list(parsed.get("key_points") if isinstance(parsed, dict) else []),
@@ -673,6 +806,11 @@ class GraphNodes:
             }
 
         map_outputs = await asyncio.gather(*[_run_report_map(i, g) for i, g in enumerate(groups, start=1)])
+        if callable(progress_cb):
+            try:
+                progress_cb({"stage": "reduce", "message": "聚合 Map 结果..."})
+            except Exception:
+                pass
         stage2_groups = _chunk_rows(map_outputs, size=int(report_cfg["stage2_group_size"]))
         stage2_outputs: List[Dict[str, Any]] = []
         for idx, group in enumerate(stage2_groups, start=1):
@@ -727,7 +865,7 @@ class GraphNodes:
         return {
             "report_reduce_context": report_reduce_context,
             "coverage_stats": {
-                "mode": report_mode,
+                "mode": "full",
                 "processed_rows": processed_rows,
                 "total_rows": estimated_total,
                 "coverage_ratio": coverage_ratio,
@@ -736,12 +874,309 @@ class GraphNodes:
                 "after_doc_limit": raw_retrieved,
                 "after_candidate_limit": len(candidate_rows),
                 "retrieval_strategy": str(retrieval_stats.get("retrieval_strategy", "unknown")),
-                "full_require_complete": bool(full_runtime["require_complete"]) if report_mode == "full" else False,
+                "full_require_complete": bool(full_runtime["require_complete"]),
             },
             "provider": (stage2_outputs[-1].get("provider", "unknown") if stage2_outputs else (map_outputs[-1].get("provider", "unknown") if map_outputs else "unknown")),
         }
 
-    async def generate_report_contract(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    async def map_reduce_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = state.get("retrieved", [])
+        if not isinstance(rows, list) or not rows:
+            return {
+                "report_reduce_context": "",
+                "coverage_stats": {"mode": "full", "processed_rows": 0, "total_rows": 0, "coverage_ratio": 0.0, "map_groups": 0},
+            }
+        compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
+        report_cfg = _report_config_by_compact_level(compact_level)
+        estimated_total = _estimate_summary_scale(state, rows)
+        full_runtime = _report_full_runtime_config()
+        detail_runtime = _detail_first_runtime_config()
+        candidate_rows = rows
+        batch_size = int(full_runtime["batch_size"])
+        groups = _group_rows_for_hierarchical_report(candidate_rows, chunk_size=batch_size)
+
+        max_concurrency = int(full_runtime["max_concurrency"])
+        max_concurrency = max(1, min(6, max_concurrency))
+        semaphore = asyncio.Semaphore(max_concurrency)
+        progress_cb = state.get("_progress_callback")
+        report_map_done = 0
+        report_total_groups = len(groups)
+
+        async def _run_report_map(idx: int, group: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal report_map_done
+            blocks: List[str] = []
+            rows_in_group = group.get("rows", []) if isinstance(group.get("rows"), list) else []
+            for row in rows_in_group:
+                blocks.append(
+                    f"[{row.get('title')}::{row.get('section_path')}::{row.get('discipline')}]\n"
+                    f"{str(row.get('content', ''))[:int(max(report_cfg['content_clip'], detail_runtime['report_content_clip']))]}"
+                )
+            chapter_title = str(group.get("chapter_title", "") or "章节")
+            segment_label = str(group.get("segment_label", "") or chapter_title)
+            page_span = _format_page_span(group.get("page_start"), group.get("page_end"))
+            prompt = (
+                "你是一个精密的文档事实提取专家。你的任务是构建高质量的‘说明性事实与证据库’。请仅返回JSON对象，包含字段: key_points, analysis, recommendations, risks。\n"
+                "【关键指令】：\n"
+                "- 每个字段都必须返回**一个完整的、连贯的中文段落**，而不是列表或分点。\n"
+                "- key_points: 将所有核心事实融合成一个自然的段落，包含具体的条款编号、硬性指标、原始定义，使用专业地道的说明文风格。\n"
+                "- analysis: 使用连贯的逻辑叙述分析事实间的因果与支撑逻辑，侧重还原‘事实A如何支撑结论B’的逻辑链路。\n"
+                "- recommendations: 将文档明确要求的执行准则或具体措施组织成完整的段落建议。\n"
+                "- risks: 将文档指出的具体禁止红线、惩罚条款组织成连贯的风险警示段落。\n"
+                "- 绝对禁止返回列表格式（如['要点1', '要点2']），必须返回纯文本段落。\n"
+                "- 段落长度约150-300字，确保结果既专业又易读。\n"
+                f"用户查询：{state.get('query', '')}\n"
+                f"当前章节：{chapter_title}\n"
+                f"当前段落：{segment_label}{page_span}\n"
+                f"文档内容：\n{chr(10).join(blocks)}"
+            )
+            async with semaphore:
+                resp = await self.ai_router.chat_with_task(
+                    [{"role": "user", "content": prompt}],
+                    task_type="summarize",
+                    max_tokens=int(report_cfg["map_max_tokens"]),
+                    temperature=0.2,
+                    prefer_free=True,
+                )
+            parsed = parse_json_object(str(resp.get("content", "")))
+            report_map_done += 1
+            if callable(progress_cb):
+                try:
+                    progress_cb({"stage": "map", "current": report_map_done, "total": report_total_groups, "message": f"Map 章节分组 {report_map_done}/{report_total_groups}"})
+                except Exception:
+                    pass
+            return {
+                "chapter_key": str(group.get("chapter_key", "")),
+                "chapter_title": chapter_title,
+                "segment_label": segment_label,
+                "page_start": group.get("page_start"),
+                "page_end": group.get("page_end"),
+                "provider": str(resp.get("provider", "unknown")),
+                "key_points": _to_list(parsed.get("key_points") if isinstance(parsed, dict) else []),
+                "analysis": _to_list(parsed.get("analysis") if isinstance(parsed, dict) else []),
+                "recommendations": _to_list(parsed.get("recommendations") if isinstance(parsed, dict) else []),
+                "risks": _to_list(parsed.get("risks") if isinstance(parsed, dict) else []),
+            }
+
+        map_outputs = await asyncio.gather(*[_run_report_map(i, g) for i, g in enumerate(groups, start=1)])
+        if callable(progress_cb):
+            try:
+                progress_cb({"stage": "reduce", "message": "聚合章节结果..."})
+            except Exception:
+                pass
+
+        chapter_outputs: List[Dict[str, Any]] = []
+        chapter_groups = _group_map_outputs_by_chapter(map_outputs)
+        for idx, group in enumerate(chapter_groups, start=1):
+            chapter_items = group.get("items", []) if isinstance(group.get("items"), list) else []
+            if len(chapter_items) == 1:
+                item = dict(chapter_items[0])
+                item["segment_label"] = str(group.get("chapter_title", item.get("segment_label", "章节")))
+                chapter_outputs.append(item)
+                continue
+            parts: List[str] = []
+            for j, item in enumerate(chapter_items, start=1):
+                parts.append(
+                    f"Part{j}\n"
+                    f"- key_points: {'; '.join(item.get('key_points', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- analysis: {'; '.join(item.get('analysis', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- recommendations: {'; '.join(item.get('recommendations', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- risks: {'; '.join(item.get('risks', [])[:int(detail_runtime['stage2_item_limit'])])}"
+                )
+            page_span = _format_page_span(group.get("page_start"), group.get("page_end"))
+            prompt = (
+                "你是一个资深的报告聚合专家。请将以下同一章节不同部分的片段信息聚合为连贯、专业的‘章节级事实综述’。仅返回JSON对象，包含字段: key_points, analysis, recommendations, risks。\n"
+                "【聚合要求】：\n"
+                "- 使用规范的说明文语言，语气稳重且逻辑严密。\n"
+                "- 归纳并去重时保留核心事实，将离散的要点串联成有深度的陈述句，严禁关键词堆砌。\n"
+                "- key_points: 归并核心事实证据；analysis: 整合因果逻辑；recommendations/risks: 总结执行准则与红线。\n"
+                "每个字段应返回2-5个高质量且逻辑连贯的段落式短句。\n"
+                f"用户查询：{state.get('query', '')}\n"
+                f"章节：#{idx} {group.get('chapter_title', '章节')}{page_span}\n"
+                f"各部分摘要：\n{chr(10).join(parts)}"
+            )
+            resp = await self.ai_router.chat_with_task(
+                [{"role": "user", "content": prompt}],
+                task_type="summarize",
+                max_tokens=int(report_cfg["stage2_max_tokens"]),
+                temperature=0.2,
+                prefer_free=True,
+            )
+            parsed = parse_json_object(str(resp.get("content", "")))
+            chapter_outputs.append(
+                {
+                    "chapter_key": str(group.get("chapter_key", "")),
+                    "chapter_title": str(group.get("chapter_title", "章节")),
+                    "segment_label": str(group.get("chapter_title", "章节")),
+                    "page_start": group.get("page_start"),
+                    "page_end": group.get("page_end"),
+                    "provider": str(resp.get("provider", "unknown")),
+                    "key_points": _to_list(parsed.get("key_points") if isinstance(parsed, dict) else []),
+                    "analysis": _to_list(parsed.get("analysis") if isinstance(parsed, dict) else []),
+                    "recommendations": _to_list(parsed.get("recommendations") if isinstance(parsed, dict) else []),
+                    "risks": _to_list(parsed.get("risks") if isinstance(parsed, dict) else []),
+                }
+            )
+
+        if _prefer_chinese_for_long_doc(rows):
+            translated_outputs: List[Dict[str, Any]] = []
+            for item in chapter_outputs:
+                translated_outputs.append(await self._ensure_chapter_output_language(item, prefer_chinese=True))
+            chapter_outputs = translated_outputs
+
+        stage2_groups = _chunk_rows(chapter_outputs, size=int(report_cfg["stage2_group_size"]))
+        stage2_outputs: List[Dict[str, Any]] = []
+        for idx, group in enumerate(stage2_groups, start=1):
+            parts: List[str] = []
+            for j, item in enumerate(group, start=1):
+                page_span = _format_page_span(item.get("page_start"), item.get("page_end"))
+                parts.append(
+                    f"Chapter{j}: {item.get('chapter_title', '章节')}{page_span}\n"
+                    f"- key_points: {'; '.join(item.get('key_points', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- analysis: {'; '.join(item.get('analysis', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- recommendations: {'; '.join(item.get('recommendations', [])[:int(detail_runtime['stage2_item_limit'])])}\n"
+                    f"- risks: {'; '.join(item.get('risks', [])[:int(detail_runtime['stage2_item_limit'])])}"
+                )
+            prompt = (
+                "你是一个全局事实提炼专家。请根据以下各章节的事实摘要，生成更高层级的‘全局事实综述’。仅返回JSON对象，包含字段: key_points, analysis, recommendations, risks。\n"
+                "注意：这是为后续‘战略分析报告’提供的基础事实库。请确保提炼的内容具有全局性，覆盖多章节的核心价值。\n"
+                "【要求】：\n"
+                "- 使用规范的说明文语言，语气宏大且逻辑连贯。\n"
+                "- key_points应提炼最关键的全局要点；analysis应提供跨章节的逻辑关联总结。\n"
+                "- 避免机械堆砌，每个字段返回2到5个精炼且具有深度分析价值的陈述句。\n"
+                f"用户查询：{state.get('query', '')}\n"
+                f"章节摘要：\n{chr(10).join(parts)}"
+            )
+            resp = await self.ai_router.chat_with_task(
+                [{"role": "user", "content": prompt}],
+                task_type="summarize",
+                max_tokens=int(report_cfg["stage2_max_tokens"]),
+                temperature=0.2,
+                prefer_free=True,
+            )
+            parsed = parse_json_object(str(resp.get("content", "")))
+            stage2_outputs.append(
+                {
+                    "provider": str(resp.get("provider", "unknown")),
+                    "key_points": _to_list(parsed.get("key_points") if isinstance(parsed, dict) else []),
+                    "analysis": _to_list(parsed.get("analysis") if isinstance(parsed, dict) else []),
+                    "recommendations": _to_list(parsed.get("recommendations") if isinstance(parsed, dict) else []),
+                    "risks": _to_list(parsed.get("risks") if isinstance(parsed, dict) else []),
+                }
+            )
+
+        # 添加全局综述的最终合并步骤
+        unified_global_summary: Optional[Dict[str, Any]] = None
+        if stage2_outputs and len(stage2_outputs) > 1:
+            # 如果有多个Part，进行最终合并
+            try:
+                unified_global_summary = await self._merge_global_summaries(stage2_outputs, state, report_cfg, detail_runtime)
+            except Exception as e:
+                logger.warning(f"Failed to merge global summaries: {e}")
+                unified_global_summary = None
+        
+        blocks: List[str] = []
+        total_chars = sum(len(str(r.get("content", ""))) for r in candidate_rows)
+        # 如果总字符数不多（例如 < 6000 字），直接将原始文本分块作为上下文传给最终报告生成阶段
+        # 这样可以避免“摘要的摘要”导致的内容趋同
+        if total_chars < 6000:
+            for i, row in enumerate(candidate_rows[:30]):  # 限制分块数量防止超限
+                page_num = _row_page_num(row)
+                blocks.append(
+                    f"### 原文片段#{i+1} (第{page_num}页, {row.get('section_path', '章节')}):\n"
+                    f"{str(row.get('content', ''))[:800]}"
+                )
+        elif unified_global_summary:
+            # 使用统一的全局综述
+            blocks.append(
+                f"### 全局综述（统一整合）\n"
+                f"- 核心点: {' '.join(unified_global_summary.get('key_points', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                f"- 深度分析: {' '.join(unified_global_summary.get('analysis', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                f"- 建议与风险: {' '.join(unified_global_summary.get('recommendations', [])[:int(detail_runtime['final_item_limit'])])} {' '.join(unified_global_summary.get('risks', [])[:int(detail_runtime['final_item_limit'])])}"
+            )
+        elif stage2_outputs:
+            # 对于长文档，使用 Stage2 聚合结果
+            for idx, item in enumerate(stage2_outputs, start=1):
+                blocks.append(
+                    f"### 全局综述 Part#{idx}\n"
+                    f"- 核心点: {' '.join(item.get('key_points', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                    f"- 深度分析: {' '.join(item.get('analysis', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                    f"- 建议与风险: {' '.join(item.get('recommendations', [])[:int(detail_runtime['final_item_limit'])])} {' '.join(item.get('risks', [])[:int(detail_runtime['final_item_limit'])])}"
+                )
+        else:
+            # 回退到章节摘要
+            for item in chapter_outputs[: max(8, int(detail_runtime["stage2_item_limit"]))]:
+                page_span = _format_page_span(item.get("page_start"), item.get("page_end"))
+                blocks.append(
+                    f"### 章节摘要: {item.get('chapter_title', '章节')}{page_span}\n"
+                    f"- 核心事实: {' '.join(item.get('key_points', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                    f"- 事实逻辑: {' '.join(item.get('analysis', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                    f"- 明确要求/合规建议: {' '.join(item.get('recommendations', [])[:int(detail_runtime['final_item_limit'])])}\n"
+                    f"- 禁止项/客观风险: {' '.join(item.get('risks', [])[:int(detail_runtime['final_item_limit'])])}"
+                )
+        report_reduce_context = "\n\n".join(blocks)
+        retrieval_stats = state.get("retrieval_stats", {}) if isinstance(state.get("retrieval_stats"), dict) else {}
+        raw_retrieved = int(retrieval_stats.get("retrieved_rows", len(rows)) or len(rows))
+        raw_total = int(retrieval_stats.get("raw_total_chunks", 0) or 0)
+        if raw_total <= 0:
+            raw_total = raw_retrieved if raw_retrieved > 0 else len(rows)
+        processed_rows = len(candidate_rows)
+        coverage_ratio = round((processed_rows / max(raw_total, 1)), 4)
+        return {
+            "report_reduce_context": report_reduce_context,
+            "chapter_summaries": [await self._normalize_chapter_summary_item(item) for item in chapter_outputs],
+            "coverage_stats": {
+                "mode": "full",
+                "processed_rows": processed_rows,
+                "total_rows": estimated_total,
+                "coverage_ratio": coverage_ratio,
+                "map_groups": len(groups),
+                "chapter_groups": len(chapter_groups),
+                "raw_total_chunks": raw_total,
+                "after_doc_limit": raw_retrieved,
+                "after_candidate_limit": len(candidate_rows),
+                "retrieval_strategy": str(retrieval_stats.get("retrieval_strategy", "unknown")),
+                "full_require_complete": bool(full_runtime["require_complete"]),
+            },
+            "provider": (stage2_outputs[-1].get("provider", "unknown") if stage2_outputs else (map_outputs[-1].get("provider", "unknown") if map_outputs else "unknown")),
+        }
+
+    async def _ensure_chapter_output_language(self, item: Dict[str, Any], *, prefer_chinese: bool) -> Dict[str, Any]:
+        if not prefer_chinese:
+            return item
+        combined = " ".join(
+            _to_list(item.get("key_points"))
+            + _to_list(item.get("analysis"))
+            + _to_list(item.get("recommendations"))
+            + _to_list(item.get("risks"))
+        ).strip()
+        if not combined or not _looks_mostly_english(combined):
+            return item
+        prompt = (
+            "你是一个多语言翻译与摘要专家。请将以下摘要内容翻译或改写为高质量中文。仅返回JSON对象，包含字段: key_points, analysis, recommendations, risks。\n"
+            "确保术语专业、表达地道、逻辑清晰。\n"
+            f"章节标题：{item.get('chapter_title', '章节')}\n"
+            f"原始内容：{combined}"
+        )
+        try:
+            resp = await self.ai_router.chat_with_task(
+                [{"role": "user", "content": prompt}],
+                task_type="summarize",
+                max_tokens=900,
+                temperature=0.1,
+                prefer_free=True,
+            )
+            parsed = parse_json_object(str(resp.get("content", "")))
+            normalized = dict(item)
+            if isinstance(parsed, dict):
+                normalized["key_points"] = _to_list(parsed.get("key_points")) or _to_list(item.get("key_points"))
+                normalized["analysis"] = _to_list(parsed.get("analysis")) or _to_list(item.get("analysis"))
+                normalized["recommendations"] = _to_list(parsed.get("recommendations")) or _to_list(item.get("recommendations"))
+                normalized["risks"] = _to_list(parsed.get("risks")) or _to_list(item.get("risks"))
+            return normalized
+        except Exception:
+            return item
+
+    async def _legacy_generate_report_contract(self, state: Dict[str, Any]) -> Dict[str, Any]:
         rows = state.get("retrieved", [])
         context_blocks = [str(state.get("report_reduce_context", "")).strip()]
         detail_runtime = _detail_first_runtime_config()
@@ -754,12 +1189,17 @@ class GraphNodes:
         targets = _adaptive_report_targets(int(state.get("estimated_doc_chunks", 0) or 0), compact_level)
         max_chars = int(max(targets["max_chars"], detail_runtime["report_max_chars_floor"]))
         prompt = (
-            "你是超长文报告生成Agent。仅返回JSON对象，字段: report, sections, citations, purpose, subjects, subject_object_links, how_to, why。\n"
-            "report为完整中文报告文本；sections为数组，每项包含title和content；citations每项包含title, discipline, section_path。\n"
-            "另外返回五维字段：purpose（一句话）、subjects、subject_object_links、how_to、why（后四项均为数组）。\n"
-            f"目标报告字数区间：{int(targets['min_chars'])}-{max_chars}。\n"
-            f"问题：{state.get('query', '')}\n"
-            f"上下文：\n{chr(10).join([x for x in context_blocks if x])}"
+            "你是一个资深的战略分析师与超长文报告专家。请基于以下上下文生成一份高质量、极具穿透力的‘说明型研究报告’。仅返回JSON对象，字段: report, sections, citations, purpose, subjects, subject_object_links, how_to, why。\n"
+            "【输出内容】：\n"
+            "- report: 完整的、具有逻辑深度的中文说明文正文。\n"
+            "- sections: 报告的分节数组，每项包含title和content。务必确保content是连贯的段落，严禁机械堆砌关键词。\n"
+            "- citations: 引用数组，包含title, discipline, section_path。\n"
+            "- purpose (一句话摘要)、subjects/subject_object_links/how_to/why (各为数组)。\n"
+            "【语言要求】：\n"
+            "- 语气专业、逻辑严丝合缝、风格沉稳、地道。避免使用‘首先、其次、最后’等过于简单的连接词，多采用因果、递进等逻辑关联词。\n"
+            f"目标报告总字数区间：{int(targets['min_chars'])}-{max_chars}。\n"
+            f"用户查询：{state.get('query', '')}\n"
+            f"上下文信息：\n{chr(10).join([x for x in context_blocks if x])}"
         )
         resp = await self.ai_router.chat_with_task(
             [{"role": "user", "content": prompt}],
@@ -829,6 +1269,116 @@ class GraphNodes:
             "fallback_reason": fallback_reason,
         }
 
+    async def generate_report_contract(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        rows = state.get("retrieved", [])
+        report_profile = _infer_academic_report_profile(rows if isinstance(rows, list) else [])
+        document_tree = _build_document_tree(rows if isinstance(rows, list) else [])
+        outline_text = _render_document_tree(document_tree)
+        context_blocks = [str(state.get("report_reduce_context", "")).strip()]
+        question_context = ""
+        detail_runtime = _detail_first_runtime_config()
+        for row in rows[: int(detail_runtime["report_context_rows"])]:
+            page_num = _row_page_num(row)
+            page_span = _format_page_span(page_num, page_num)
+            context_blocks.append(
+                f"[{row.get('title')}::{row.get('section_path')}::{row.get('discipline')}{page_span}]\n"
+                f"{str(row.get('content', ''))[:int(detail_runtime['report_context_clip'])]}"
+            )
+        compact_level = _normalize_compact_level(state.get("summary_compact_level", 1), default=1)
+        targets = _adaptive_report_targets(int(state.get("estimated_doc_chunks", 0) or 0), compact_level)
+        max_chars = int(max(targets["max_chars"], detail_runtime["report_max_chars_floor"]))
+        blueprint_text = " / ".join([str(x) for x in report_profile.get("section_blueprint", []) if str(x).strip()])
+        prompt = (
+            "你是一个资深战略分析与报告主笔。请仅返回JSON对象，包含字段: report, sections, citations, purpose, subjects, subject_object_links, how_to, why。\n"
+            "【特别提示】：参考资料已为你提供了各章节的‘事实证据摘要’。你的任务是基于这些事实，进行跨维度的‘升维分析’，严禁直接复制摘要内容。\n"
+            "【生成策略】：\n"
+            "1. **report (执行摘要)**：全篇灵魂。侧重回答‘文档的全局核心意义是什么？’、‘这对用户有何战略级影响？’。以全局决策者的语调撰写。\n"
+            "2. **sections (深度专题分析)**：严禁简单拆分。每一节必须是一个独立的‘洞察专题’。例如：\n"
+            "   - 专题 A：基于各章事实的‘潜在风险矩阵’；\n"
+            "   - 专题 B：全文反映出的‘逻辑漏洞或未尽事宜’；\n"
+            "   - 专题 C：对标行业标准的‘执行指南’。\n"
+            "   - **核心要求**：如果摘要里写了‘A条款规定了B’，你应当分析‘这意味着用户在执行中会遇到C障碍’。提供摘要中没有的深度见解。\n"
+            "3. **内容互补**：摘要负责事实，报告负责‘事实背后的意义’。sections 必须包含严密的因果推演。\n"
+            f"分节蓝图指导：{blueprint_text or '核心观点 / 研究现状 / 实验分析 / 结论建议 / 风险提示'}。\n"
+            f"目标总字数：{int(targets['min_chars'])}-{max_chars}。\n"
+            f"报告风格：{report_profile.get('label', '学术研究型')}。\n"
+            f"用户查询：{state.get('query', '')}\n"
+            f"参考资料（事实库）：\n{chr(10).join([x for x in context_blocks if x])}"
+        )
+        if question_context:
+            prompt = f"题目上下文：\n{question_context}\n\n{prompt}"
+        if question_context:
+            prompt = f"问题提示：\n{question_context}\n\n{prompt}"
+        resp = await self.ai_router.chat_with_task(
+            [{"role": "user", "content": prompt}],
+            task_type="summarize",
+            max_tokens=int(targets["max_tokens"]),
+            temperature=0.2,
+            prefer_free=True,
+        )
+        parsed = parse_json_object(str(resp.get("content", "")))
+        report = str(parsed.get("report", "") if isinstance(parsed, dict) else "").strip()
+        sections = _normalize_report_sections(parsed.get("sections") if isinstance(parsed, dict) else [])
+        fallback_reason = "none"
+        citations = parsed.get("citations") if isinstance(parsed, dict) and isinstance(parsed.get("citations"), list) else []
+        if not citations:
+            citations = state.get("evidence", [])[:8]
+        if not citations:
+            citations = [{"title": "未命中具体引用", "discipline": "all", "section_path": "N/A"}]
+        if not report and sections:
+            report = "\n\n".join([f"## {item.get('title', '章节')}\n{item.get('content', '')}" for item in sections]).strip()
+        if not report or not sections:
+            fallback = _build_minimum_report_fallback(
+                query=str(state.get("query", "")).strip(),
+                report_reduce_context=str(state.get("report_reduce_context", "")).strip(),
+                rows=rows if isinstance(rows, list) else [],
+                evidence=state.get("evidence", []) if isinstance(state.get("evidence"), list) else [],
+                profile=report_profile,
+            )
+            sections = fallback["sections"]
+            report = fallback["report"]
+            fallback_reason = "report_parse_fallback"
+        five_dimensions, five_dimensions_meta = _resolve_five_dimensions(
+            parsed if isinstance(parsed, dict) else {},
+            query=str(state.get("query", "")).strip(),
+            fallback={
+                "purpose": (sections[0].get("content", "") if sections else report)[:220],
+                "subjects": [str(x.get("discipline", "all")) for x in citations[:6] if isinstance(x, dict)],
+                "subject_object_links": [x.get("content", "") for x in sections[:2] if isinstance(x, dict)],
+                "how_to": [x.get("content", "") for x in sections if isinstance(x, dict) and any(kw in str(x.get("title", "")) for kw in ["怎么", "如何", "方法", "步骤", "how", "step"])][:8],
+                "why": [x.get("content", "") for x in sections if isinstance(x, dict) and any(kw in str(x.get("title", "")) for kw in ["为什么", "原因", "背景", "意义", "why", "reason"])][:8],
+            },
+        )
+        report = report[:max_chars]
+        provider = str(resp.get("provider", state.get("provider", "unknown")))
+        non_empty_report = bool(report.strip())
+        structure_complete = bool(sections)
+        citation_coverage = bool(citations)
+        failed_checks: List[str] = []
+        if not non_empty_report:
+            failed_checks.append("empty_report")
+        if not structure_complete:
+            failed_checks.append("empty_sections")
+        if not citation_coverage:
+            failed_checks.append("empty_citations")
+        return {
+            "report": report,
+            "report_sections": sections,
+            "report_profile": report_profile,
+            "document_tree": document_tree,
+            "citations": citations[:8],
+            "five_dimensions": five_dimensions,
+            "five_dimensions_meta": five_dimensions_meta,
+            "provider": provider,
+            "quality_gates": {
+                "non_empty_report": non_empty_report,
+                "structure_complete": structure_complete,
+                "citation_coverage": citation_coverage,
+                "passed": len(failed_checks) == 0,
+                "failed_checks": failed_checks,
+            },
+            "fallback_reason": fallback_reason,
+        }
     async def check_report_quality(self, state: Dict[str, Any]) -> Dict[str, Any]:
         report = str(state.get("report", "")).strip()
         sections = state.get("report_sections", []) if isinstance(state.get("report_sections"), list) else []
@@ -863,8 +1413,7 @@ class GraphNodes:
             coverage_stats = dict(coverage_stats)
             coverage_stats["validation_graph_skipped"] = True
         full_runtime = _report_full_runtime_config()
-        report_mode = str(state.get("report_mode", "full")).strip().lower() or "full"
-        if report_mode == "full" and bool(full_runtime["require_complete"]) and not validation_graph_skipped:
+        if bool(full_runtime["require_complete"]) and not validation_graph_skipped:
             processed = int(coverage_stats.get("processed_rows", 0) or 0)
             raw_total = int(coverage_stats.get("raw_total_chunks", 0) or 0)
             if raw_total > 0 and processed < raw_total:
@@ -919,6 +1468,7 @@ class GraphNodes:
 
     async def generate_exam_contract(self, state: Dict[str, Any]) -> Dict[str, Any]:
         reasoning = state.get("internal_reasoning", {}) if isinstance(state.get("internal_reasoning"), dict) else {}
+        question_context = str(state.get("question_context", "")).strip()
         reasoning_hint = (
             f"主张: {reasoning.get('claim', '')}\n"
             f"证据摘要: {reasoning.get('evidence_summary', '')}\n"
@@ -1008,6 +1558,138 @@ class GraphNodes:
         five_dimensions_meta = (
             state.get("five_dimensions_meta", {}) if isinstance(state.get("five_dimensions_meta"), dict) else {}
         )
+        gates["five_dimensions_hit_rate"] = five_dimensions_meta.get("hit_rate", 0.0)
+        gates["five_dimensions_source"] = five_dimensions_meta.get("source", "unknown")
+        gates["strategy_complete"] = has_strategy
+        gates["passed"] = len(failed) == 0
+        gates["failed_checks"] = failed
+        return {"qa_regression_gates": gates, "quality_gates": gates}
+
+    async def internal_reasoning_step(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        question_context = str(state.get("question_context", "")).strip()
+        prompt_parts = [
+            "你是内部推理节点。只返回JSON对象，字段: prediction, claim, evidence_summary, counterexample_check, consistency_check。",
+            "prediction: 在看到证据前，基于你的内部知识库预测答案方向（一句话）。",
+            "要求：每个字段一句话，不输出多余解释。",
+        ]
+        if question_context:
+            prompt_parts.append(f"题目结构上下文：\n{question_context}")
+        prompt_parts.append(f"问题：{state.get('query', '')}")
+        prompt_parts.append(f"证据上下文：\n{state.get('compressed_context', '')}")
+        prompt = "\n".join(prompt_parts)
+        resp = await self.ai_router.chat_with_task(
+            [{"role": "user", "content": prompt}],
+            task_type="reason",
+            max_tokens=520,
+            temperature=0.2,
+            prefer_free=True,
+        )
+        parsed = parse_json_object(str(resp.get("content", "")))
+        reasoning = {
+            "claim": str(parsed.get("claim", "")).strip()[:220],
+            "evidence_summary": str(parsed.get("evidence_summary", "")).strip()[:260],
+            "counterexample_check": str(parsed.get("counterexample_check", "")).strip()[:220],
+            "consistency_check": str(parsed.get("consistency_check", "")).strip()[:220],
+        }
+        prediction = str(parsed.get("prediction", "")).strip()[:180]
+        return {"internal_reasoning": reasoning, "prediction": prediction, "predicted_answer": prediction}
+
+    async def generate_exam_contract(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        reasoning = state.get("internal_reasoning", {}) if isinstance(state.get("internal_reasoning"), dict) else {}
+        question_context = str(state.get("question_context", "")).strip()
+        reasoning_hint = (
+            f"主张: {reasoning.get('claim', '')}\n"
+            f"证据摘要: {reasoning.get('evidence_summary', '')}\n"
+            f"反例检查: {reasoning.get('counterexample_check', '')}\n"
+            f"一致性检查: {reasoning.get('consistency_check', '')}\n"
+        ).strip()
+        exam_type_hints: Dict[str, str] = {
+            "choice": "选择题：逐选项分析，answer 首字符为所选字母。",
+            "fill_blank": "填空题：直接给出答案，多空用分号分隔。",
+            "true_false": "判断题：明确正确或错误，并给出理由。",
+            "short_answer": "简答题：按要点输出，每要点一句。",
+            "essay": "论述题：先给中心论点，再分层论证。",
+            "calculation": "计算题：保留关键公式、代入过程与结果。",
+            "proof": "证明题：按逻辑链给出步骤，并注明所用定理。",
+            "design": "设计题：明确目标、约束、步骤与评估指标。",
+            "material_analysis": "材料分析题：先概括材料，再结合材料事实回答。",
+        }
+        qtype = str(state.get("question_type", "standard"))
+        prompt_parts = [
+            "你是考试作答 Agent，仅返回 JSON 对象，字段: answer, brief_reasoning, answer_strategy, purpose, subjects, subject_object_links, how_to, why。",
+            "answer_strategy 必须包含: concept_induction, information_compression, reverse_check, distractor_design。",
+            "brief_reasoning 最多 3 条，不得泄露完整思维链。",
+        ]
+        type_hint = exam_type_hints.get(qtype, "")
+        if type_hint:
+            prompt_parts.append(f"题型提示：{type_hint}")
+        if question_context:
+            prompt_parts.append(f"题目树上下文：\n{question_context}")
+        prompt_parts.extend(
+            [
+                f"题目：{state.get('query', '')}",
+                f"证据上下文：\n{state.get('compressed_context', '')}",
+                f"内部推理参考（不要逐字复述）：\n{reasoning_hint}",
+            ]
+        )
+        prompt = "\n".join(prompt_parts)
+        resp = await self.ai_router.chat_with_task(
+            [{"role": "user", "content": prompt}],
+            task_type="exam",
+            max_tokens=680,
+            temperature=0.2,
+            prefer_free=True,
+        )
+        parsed = parse_json_object(str(resp.get("content", "")))
+        strategy_default = {
+            "concept_induction": "待补充题目意图与考点。",
+            "information_compression": "待补充证据压缩结果。",
+            "reverse_check": "待执行反向检验。",
+            "distractor_design": "待补充易错点说明。",
+        }
+        strategy = parsed.get("answer_strategy") if isinstance(parsed.get("answer_strategy"), dict) else {}
+        for key in strategy_default:
+            value = str(strategy.get(key, "")).strip()
+            if value:
+                strategy_default[key] = value[:220]
+        answer = sanitize_answer(parsed.get("answer") if parsed else resp.get("content", ""), max_len=500)
+        brief_reasoning = sanitize_brief_reasoning(parsed.get("brief_reasoning") if parsed else [])
+        five_dimensions, five_dimensions_meta = _resolve_five_dimensions(
+            parsed if isinstance(parsed, dict) else {},
+            query=str(state.get("query", "")).strip(),
+            fallback={
+                "purpose": answer[:200],
+                "subjects": [str(state.get("discipline", "all"))],
+                "subject_object_links": brief_reasoning[:2],
+                "how_to": brief_reasoning[:3],
+                "why": [str(reasoning.get("evidence_summary", "")).strip()],
+            },
+        )
+        evidence = state.get("evidence", [])
+        provider = str(resp.get("provider", "unknown"))
+        free_tier_hit = provider in {"transformers-local", "github-models", "huggingface", "hash-fallback"}
+        return {
+            "answer": answer,
+            "brief_reasoning": brief_reasoning,
+            "answer_strategy": strategy_default,
+            "five_dimensions": five_dimensions,
+            "five_dimensions_meta": five_dimensions_meta,
+            "provider": provider,
+            "qa_regression_gates": build_reasoning_gates(answer, brief_reasoning, evidence),
+            "cost_profile": {"prefer_free": True, "provider": provider, "free_tier_hit": free_tier_hit},
+        }
+
+    async def check_exam_quality(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        answer = str(state.get("answer", "")).strip()
+        brief = state.get("brief_reasoning", [])
+        evidence = state.get("evidence", [])
+        strategy = state.get("answer_strategy", {}) if isinstance(state.get("answer_strategy"), dict) else {}
+        has_strategy = all(bool(str(strategy.get(key, "")).strip()) for key in ("concept_induction", "information_compression", "reverse_check", "distractor_design"))
+        gates = build_reasoning_gates(answer, brief if isinstance(brief, list) else [], evidence if isinstance(evidence, list) else [])
+        failed = list(gates.get("failed_checks", []))
+        if not has_strategy:
+            failed.append("strategy_incomplete")
+        five_dimensions_meta = state.get("five_dimensions_meta", {}) if isinstance(state.get("five_dimensions_meta"), dict) else {}
         gates["five_dimensions_hit_rate"] = five_dimensions_meta.get("hit_rate", 0.0)
         gates["five_dimensions_source"] = five_dimensions_meta.get("source", "unknown")
         gates["strategy_complete"] = has_strategy
@@ -1188,6 +1870,471 @@ def _resolve_five_dimensions(
 def _chunk_rows(rows: List[Any], size: int) -> List[List[Any]]:
     bucket_size = max(1, size)
     return [rows[i : i + bucket_size] for i in range(0, len(rows), bucket_size)]
+
+
+def _group_rows_for_hierarchical_report(rows: List[Dict[str, Any]], chunk_size: int) -> List[Dict[str, Any]]:
+    ordered_rows = sorted(rows, key=_report_row_order_key)
+    toc_items = _extract_report_toc_items(ordered_rows)
+    chapter_groups: Dict[str, Dict[str, Any]] = {}
+    active_chapter_key = ""
+    active_chapter_title = ""
+    for row in ordered_rows:
+        chapter_key, chapter_title = _resolve_report_chapter(
+            row,
+            toc_items,
+            active_chapter_key=active_chapter_key,
+            active_chapter_title=active_chapter_title,
+        )
+        bucket = chapter_groups.get(chapter_key)
+        if bucket is None:
+            bucket = {
+                "chapter_key": chapter_key,
+                "chapter_title": chapter_title,
+                "rows": [],
+                "page_start": None,
+                "page_end": None,
+            }
+            chapter_groups[chapter_key] = bucket
+        bucket["rows"].append(row)
+        if chapter_key and chapter_title and not chapter_key.startswith("pages:"):
+            active_chapter_key = chapter_key
+            active_chapter_title = chapter_title
+        page_num = _row_page_num(row)
+        if page_num > 0:
+            if bucket["page_start"] is None or page_num < bucket["page_start"]:
+                bucket["page_start"] = page_num
+            if bucket["page_end"] is None or page_num > bucket["page_end"]:
+                bucket["page_end"] = page_num
+    output: List[Dict[str, Any]] = []
+    for bucket in chapter_groups.values():
+        row_groups = _split_rows_for_report_chapter(
+            rows=bucket["rows"],
+            chunk_size=max(1, chunk_size),
+            page_start=bucket.get("page_start"),
+            page_end=bucket.get("page_end"),
+        )
+        for index, group_rows in enumerate(row_groups, start=1):
+            page_start, page_end = _page_span_from_rows(group_rows)
+            segment_label = str(bucket["chapter_title"])
+            if len(row_groups) > 1:
+                segment_label = f"{segment_label} 第{index}/{len(row_groups)}段"
+            output.append(
+                {
+                    "chapter_key": bucket["chapter_key"],
+                    "chapter_title": bucket["chapter_title"],
+                    "segment_label": segment_label,
+                    "page_start": page_start or bucket["page_start"],
+                    "page_end": page_end or bucket["page_end"],
+                    "rows": group_rows,
+                }
+            )
+    return output
+
+
+def _split_rows_for_report_chapter(
+    rows: List[Dict[str, Any]],
+    chunk_size: int,
+    page_start: Optional[int],
+    page_end: Optional[int],
+) -> List[List[Dict[str, Any]]]:
+    row_count = len(rows)
+    if row_count <= 0:
+        return []
+    if row_count <= chunk_size:
+        return [rows]
+
+    page_span = 0
+    if isinstance(page_start, int) and isinstance(page_end, int) and page_start > 0 and page_end >= page_start:
+        page_span = page_end - page_start + 1
+
+    # 章节优先：小章整章处理，只有超长章节才继续拆段。
+    if page_span and page_span <= 24 and row_count <= chunk_size * 2:
+        return [rows]
+    if not page_span and row_count <= chunk_size * 2:
+        return [rows]
+
+    desired_segments = 1
+    if page_span > 0:
+        if page_span <= 48:
+            desired_segments = 2
+        elif page_span <= 90:
+            desired_segments = 3
+        else:
+            desired_segments = 4
+    else:
+        if row_count <= chunk_size * 3:
+            desired_segments = 2
+        elif row_count <= chunk_size * 5:
+            desired_segments = 3
+        else:
+            desired_segments = 4
+
+    desired_segments = max(1, min(4, desired_segments))
+    adaptive_chunk_size = max(chunk_size, (row_count + desired_segments - 1) // desired_segments)
+    return _chunk_rows(rows, adaptive_chunk_size)
+
+
+def _group_map_outputs_by_chapter(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        # 获取chapter_key和segment_label
+        raw_chapter_key = str(item.get("chapter_key", "") or "")
+        raw_segment_label = str(item.get("segment_label", "") or "")
+        
+        # 确定最终的chapter_key
+        if raw_chapter_key:
+            chapter_key = raw_chapter_key
+        elif raw_segment_label:
+            chapter_key = raw_segment_label
+        else:
+            # 当chapter_key和segment_label都为空时，生成基于页面范围的唯一key
+            page_start = item.get("page_start")
+            page_end = item.get("page_end")
+            if isinstance(page_start, int) and page_start > 0:
+                if isinstance(page_end, int) and page_end >= page_start:
+                    chapter_key = f"pages:{page_start}-{page_end}"
+                else:
+                    chapter_key = f"page:{page_start}"
+            else:
+                # 如果连页面信息都没有，使用内容哈希生成唯一key
+                content_key = ""
+                for field in ["key_points", "analysis", "recommendations", "risks"]:
+                    field_val = item.get(field)
+                    if field_val:
+                        content_key += str(field_val)[:50]
+                if content_key:
+                    import hashlib
+                    hash_key = hashlib.md5(content_key.encode()).hexdigest()[:8]
+                    chapter_key = f"auto:{hash_key}"
+                else:
+                    # 最后的手段：使用索引
+                    chapter_key = f"item:{len(grouped)}"
+        
+        bucket = grouped.get(chapter_key)
+        if bucket is None:
+            # 确定chapter_title
+            chapter_title = str(item.get("chapter_title", "") or "")
+            if not chapter_title:
+                if raw_segment_label:
+                    chapter_title = raw_segment_label
+                elif raw_chapter_key and not raw_chapter_key.startswith("pages:") and not raw_chapter_key.startswith("page:"):
+                    chapter_title = raw_chapter_key
+                else:
+                    chapter_title = "章节"
+            
+            bucket = {
+                "chapter_key": chapter_key,
+                "chapter_title": chapter_title,
+                "page_start": item.get("page_start"),
+                "page_end": item.get("page_end"),
+                "items": [],
+            }
+            grouped[chapter_key] = bucket
+        
+        bucket["items"].append(item)
+        page_start = item.get("page_start")
+        page_end = item.get("page_end")
+        if isinstance(page_start, int) and page_start > 0:
+            if not isinstance(bucket.get("page_start"), int) or page_start < int(bucket["page_start"]):
+                bucket["page_start"] = page_start
+        if isinstance(page_end, int) and page_end > 0:
+            if not isinstance(bucket.get("page_end"), int) or page_end > int(bucket["page_end"]):
+                bucket["page_end"] = page_end
+    return list(grouped.values())
+
+
+def _extract_report_toc_items(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    metadata = parse_json_object(str(rows[0].get("metadata", "")))
+    toc = metadata.get("toc") if isinstance(metadata, dict) else []
+    if not isinstance(toc, list):
+        return []
+    items: List[Dict[str, Any]] = []
+    for entry in toc:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title", "")).strip()
+        page_num = _safe_int(entry.get("page", entry.get("page_num", 0)), 0, 0)
+        level = _safe_int(entry.get("level", 1), 1, 1)
+        if not title or page_num <= 0:
+            continue
+        items.append({"title": title, "page_num": page_num, "level": level})
+    items.sort(key=lambda x: (int(x["page_num"]), int(x["level"])))
+    return items
+
+
+def _is_generic_report_section_title(title: str) -> bool:
+    normalized = str(title or "").strip()
+    if not normalized:
+        return True
+    lowered = normalized.lower().rstrip(":：")
+    generic_exact = {
+        "解题思路",
+        "典型试题",
+        "答案",
+        "工作目标",
+        "职权和职责",
+        "示例",
+        "案例",
+        "例题",
+        "练习题",
+        "相关知识",
+    }
+    if lowered in generic_exact:
+        return True
+    generic_prefixes = (
+        "答案",
+        "解题思路",
+        "典型试题",
+        "示例",
+        "案例",
+        "附录",
+    )
+    return any(lowered.startswith(prefix) for prefix in generic_prefixes)
+
+
+def _looks_like_anchor_report_title(title: str) -> bool:
+    normalized = str(title or "").strip()
+    if not normalized:
+        return False
+    if normalized in {"目录", "前言", "编者的话", "考试大纲内容"}:
+        return True
+    if normalized.startswith("第") and ("章" in normalized or "节" in normalized):
+        return True
+    if re.match(r"^[IVXLC]+\.\s*$", normalized):
+        return True
+    if re.match(r"^[A-Z]\.\s*", normalized):
+        return True
+    if re.match(r"^\d+(?:\.\d+){0,3}\s*", normalized):
+        return True
+    return not _is_generic_report_section_title(normalized)
+
+
+def _clean_heading_candidate(line: str) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^[#>\-\*\s]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[.·•]{3,}\s*\d+\s*$", "", text).strip()
+    return text[:100]
+
+
+def _extract_heading_from_content(content: str) -> str:
+    if not content:
+        return ""
+    normalized = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+    inline_patterns = [
+        r"##\s*(摘\s*要|Abstract)\b",
+        r"##\s*([0-9]+(?:\.[0-9]+){0,4}\s*[^\n#]{1,80})",
+        r"##\s*(第[一二三四五六七八九十百0-9]+[章节篇部]\s*[^\n#]{0,60})",
+        r"(?:^|[\n。！？；;]\s*)(摘\s*要|Abstract)\b",
+        r"(?:^|[\n。！？；;]\s*)([0-9]+(?:\.[0-9]+){0,4}\s*[^\n。！？；;#]{1,80})",
+        r"(?:^|[\n。！？；;]\s*)(第[一二三四五六七八九十百0-9]+[章节篇部]\s*[^\n。！？；;#]{0,60})",
+    ]
+    for pattern in inline_patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            line = _clean_heading_candidate(match.group(1))
+            if line and len(line) <= 90:
+                return line
+    fallback_candidates: List[str] = []
+    for raw_line in normalized.splitlines()[:16]:
+        line = _clean_heading_candidate(raw_line)
+        if not line:
+            continue
+        if len(line) > 90:
+            continue
+        if re.match(r"^(摘\s*要|abstract|目录|前言|引言|参考文献|总结)\b", line, flags=re.IGNORECASE):
+            return line
+        if re.match(r"^[A-Z]\.\s+\S+", line):
+            return line
+        if re.match(r"^[IVXLC]+\.\s+\S+", line):
+            return line
+        if re.match(r"^\d+(?:\.\d+){0,4}\s+\S+", line):
+            return line
+        if re.match(r"^第[一二三四五六七八九十百0-9]+[章节篇部]\s*\S*", line):
+            return line
+        if re.match(r"^[\u4e00-\u9fffA-Za-z][^\n]{1,40}$", line):
+            fallback_candidates.append(line)
+    return fallback_candidates[0] if fallback_candidates else ""
+
+
+def _resolve_report_chapter(
+    row: Dict[str, Any],
+    toc_items: List[Dict[str, Any]],
+    *,
+    active_chapter_key: str = "",
+    active_chapter_title: str = "",
+) -> Tuple[str, str]:
+    page_num = _row_page_num(row)
+    toc_hit = _match_toc_title(page_num, toc_items)
+    if toc_hit:
+        return (f"toc:{toc_hit['page_num']}:{_slug_key(toc_hit['title'])}", str(toc_hit["title"]))
+    section_title = _derive_section_title_from_row(row)
+    toc_text_hit = _match_toc_title_by_text(section_title, toc_items) if section_title else None
+    if toc_text_hit:
+        return (f"toc:{toc_text_hit['page_num']}:{_slug_key(toc_text_hit['title'])}", str(toc_text_hit["title"]))
+    if section_title and _is_generic_report_section_title(section_title) and active_chapter_key and active_chapter_title:
+        return (active_chapter_key, active_chapter_title)
+    if section_title:
+        if not _looks_like_anchor_report_title(section_title) and active_chapter_key and active_chapter_title:
+            return (active_chapter_key, active_chapter_title)
+        return (f"section:{_slug_key(section_title)}", section_title)
+    if page_num > 0:
+        bucket_size = 12
+        start = ((page_num - 1) // bucket_size) * bucket_size + 1
+        end = start + bucket_size - 1
+        return (f"pages:{start}-{end}", f"页 {start}-{end}")
+    fallback_title = str(row.get("title", "")).strip() or "文档内容"
+    return (f"document:{_slug_key(fallback_title)}", fallback_title)
+
+
+def _match_toc_title(page_num: int, toc_items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if page_num <= 0 or not toc_items:
+        return None
+    matched: Optional[Dict[str, Any]] = None
+    for item in toc_items:
+        item_page = int(item.get("page_num", 0) or 0)
+        if item_page <= 0:
+            continue
+        if item_page > page_num:
+            break
+        matched = item
+    return matched
+
+
+def _normalize_title_lookup(value: str) -> str:
+    return re.sub(r"[\s\-_.:/\\|()\[\]【】（）·*★#]+", "", str(value or "").strip().lower())
+
+
+def _match_toc_title_by_text(title: str, toc_items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    normalized = _normalize_title_lookup(title)
+    if not normalized or not toc_items:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_score = -1
+    for item in toc_items:
+        toc_title = str(item.get("title", "")).strip()
+        toc_normalized = _normalize_title_lookup(toc_title)
+        if not toc_normalized:
+            continue
+        if toc_normalized in normalized or normalized in toc_normalized:
+            score = len(toc_normalized)
+            if score > best_score:
+                best = item
+                best_score = score
+    return best
+
+
+def _derive_section_title(section_path: str) -> str:
+    path = str(section_path or "").strip().strip("/")
+    if not path:
+        return ""
+    parts = [part for part in path.split("/") if part]
+    filtered: List[str] = []
+    for part in parts:
+        lowered = part.lower()
+        if lowered.startswith("page") and re.fullmatch(r"page\d+", lowered):
+            continue
+        if lowered in {"section", "chunk", "academic", "technical", "project", "exam", "intro", "overall"}:
+            continue
+        if re.fullmatch(r"\d+", lowered):
+            continue
+        filtered.append(part)
+    if not filtered:
+        return ""
+    title = re.sub(r"[-_]+", " ", filtered[0]).strip()
+    if len(title) <= 1:
+        return ""
+    return title[:80]
+
+
+def _derive_section_title_from_row(row: Dict[str, Any]) -> str:
+    section_title = _derive_section_title(str(row.get("section_path", "")))
+    if section_title:
+        return section_title
+    content_title = _extract_heading_from_content(str(row.get("content", "")))
+    if content_title:
+        return content_title
+    title = _clean_heading_candidate(str(row.get("title", "")))
+    if title:
+        return title
+    return ""
+
+
+def _slug_key(value: str) -> str:
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", str(value or "").strip().lower())
+    return normalized.strip("-") or "section"
+
+
+def _page_span_from_rows(rows: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    pages = [page for page in (_row_page_num(row) for row in rows) if page > 0]
+    if not pages:
+        return (None, None)
+    return (min(pages), max(pages))
+
+
+def _format_page_span(page_start: Any, page_end: Any) -> str:
+    try:
+        start = int(page_start or 0)
+        end = int(page_end or 0)
+    except Exception:
+        return ""
+    if start <= 0 and end <= 0:
+        return ""
+    if start > 0 and end > 0:
+        if start == end:
+            return f"（第{start}页）"
+        return f"（第{start}-{end}页）"
+    if start > 0:
+        return f"（第{start}页起）"
+    return f"（至第{end}页）"
+
+
+def _row_page_num(row: Dict[str, Any]) -> int:
+    try:
+        page_num = int(row.get("page_num", 0) or 0)
+    except Exception:
+        page_num = 0
+    if page_num > 0:
+        return page_num
+    section_path = str(row.get("section_path", "") or "")
+    match = re.search(r"page(\d+)", section_path, flags=re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+    return 0
+
+
+def _report_row_order_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    page_num = _row_page_num(row)
+    section_path = str(row.get("section_path", "") or "")
+    chunk_id = str(row.get("chunk_id", "") or "")
+    row_id = int(row.get("id", 0) or 0)
+    if page_num > 0:
+        return (0, page_num, _natural_sort_key(section_path), _natural_sort_key(chunk_id), row_id)
+    return (1, _natural_sort_key(section_path), _natural_sort_key(chunk_id), row_id)
+
+
+def _natural_sort_key(value: str) -> Tuple[Any, ...]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ((1, ""),)
+    parts = re.split(r"(\d+)", text)
+    output: List[Any] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            output.append((0, int(part)))
+        else:
+            output.append((1, part))
+    return tuple(output)
 
 
 def _sample_rows_for_coverage(rows: List[Any], limit: int) -> List[Any]:
@@ -1417,16 +2564,16 @@ def _report_config_by_compact_level(level: int) -> Dict[str, Any]:
 
 def _adaptive_report_targets(estimated_doc_chunks: int, compact_level: int) -> Dict[str, int]:
     if estimated_doc_chunks >= 1200:
-        base = {"min_chars": 4200, "max_chars": 6200, "max_tokens": 3600}
+        base = {"min_chars": 12000, "max_chars": 18000, "max_tokens": 8000}
     elif estimated_doc_chunks >= 600:
-        base = {"min_chars": 3000, "max_chars": 4600, "max_tokens": 2800}
+        base = {"min_chars": 8000, "max_chars": 14000, "max_tokens": 6000}
     elif estimated_doc_chunks >= 240:
-        base = {"min_chars": 2200, "max_chars": 3400, "max_tokens": 2200}
+        base = {"min_chars": 5000, "max_chars": 10000, "max_tokens": 4500}
     elif estimated_doc_chunks >= 80:
-        base = {"min_chars": 1500, "max_chars": 2600, "max_tokens": 1800}
+        base = {"min_chars": 3000, "max_chars": 6000, "max_tokens": 3200}
     else:
-        base = {"min_chars": 900, "max_chars": 1800, "max_tokens": 1400}
-    scale = {0: 1.15, 1: 1.0, 2: 0.85}.get(compact_level, 1.0)
+        base = {"min_chars": 1500, "max_chars": 3500, "max_tokens": 2200}
+    scale = {0: 1.2, 1: 1.0, 2: 0.75}.get(compact_level, 1.0)
     return {
         "min_chars": int(base["min_chars"] * scale),
         "max_chars": int(base["max_chars"] * scale),
@@ -1469,12 +2616,12 @@ def _report_validation_runtime_config() -> Dict[str, Any]:
 
 def _detail_first_runtime_config() -> Dict[str, Any]:
     return {
-        "stage2_item_limit": _safe_int(os.getenv("REPORT_STAGE2_ITEM_LIMIT", "8"), 8, 2),
-        "final_item_limit": _safe_int(os.getenv("REPORT_FINAL_ITEM_LIMIT", "12"), 12, 3),
-        "report_context_rows": _safe_int(os.getenv("REPORT_CONTEXT_ROWS", "12"), 12, 4),
-        "report_context_clip": _safe_int(os.getenv("REPORT_CONTEXT_CLIP", "1200"), 1200, 400),
-        "report_max_chars_floor": _safe_int(os.getenv("REPORT_MAX_CHARS_FLOOR", "8800"), 8800, 1200),
-        "report_content_clip": _safe_int(os.getenv("REPORT_CONTENT_CLIP", "1200"), 1200, 400),
+        "stage2_item_limit": _safe_int(os.getenv("REPORT_STAGE2_ITEM_LIMIT", "16"), 16, 2),
+        "final_item_limit": _safe_int(os.getenv("REPORT_FINAL_ITEM_LIMIT", "24"), 24, 3),
+        "report_context_rows": _safe_int(os.getenv("REPORT_CONTEXT_ROWS", "24"), 24, 4),
+        "report_context_clip": _safe_int(os.getenv("REPORT_CONTEXT_CLIP", "1600"), 1600, 400),
+        "report_max_chars_floor": _safe_int(os.getenv("REPORT_MAX_CHARS_FLOOR", "12000"), 12000, 1200),
+        "report_content_clip": _safe_int(os.getenv("REPORT_CONTENT_CLIP", "1600"), 1600, 400),
     }
 
 
@@ -1498,11 +2645,12 @@ def _normalize_report_sections(value: Any) -> List[Dict[str, str]]:
     return out[:16]
 
 
-def _build_minimum_report_fallback(
+def _legacy_build_minimum_report_fallback(
     query: str,
     report_reduce_context: str,
     rows: List[Any],
     evidence: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     detail_runtime = _detail_first_runtime_config()
     fallback_key_limit = max(6, int(detail_runtime["stage2_item_limit"]))
@@ -1544,3 +2692,252 @@ def _build_minimum_report_fallback(
     ]
     report = "\n\n".join([f"## {item['title']}\n- " + "\n- ".join(item["content"].split("；")) for item in sections]).strip()
     return {"report": report, "sections": sections}
+
+
+def _build_minimum_report_fallback(
+    query: str,
+    report_reduce_context: str,
+    rows: List[Any],
+    evidence: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    detail_runtime = _detail_first_runtime_config()
+    fallback_key_limit = max(6, int(detail_runtime["stage2_item_limit"]))
+    fallback_section_limit = max(8, int(detail_runtime["final_item_limit"]))
+    key_points: List[str] = []
+    reduced_lines = [line.strip("- ").strip() for line in report_reduce_context.splitlines() if line.strip()]
+    for line in reduced_lines:
+        if len(line) < 6:
+            continue
+        key_points.append(line[:260])
+        if len(key_points) >= fallback_key_limit:
+            break
+    if not key_points:
+        for row in rows[:fallback_key_limit]:
+            title = str(row.get("title", "未命名来源")).strip() or "未命名来源"
+            snippet = str(row.get("content", "")).replace("\n", " ").strip()
+            if snippet:
+                key_points.append(f"{title}: {snippet[:240]}")
+            if len(key_points) >= fallback_key_limit:
+                break
+    if not key_points:
+        key_points = ["当前检索结果有限，已基于现有上下文整理出可读摘要。"]
+
+    conclusions: List[str] = [f"围绕“{query or '当前问题'}”已完成基础归纳，可作为后续研究和写作的起点。"]
+    if evidence:
+        conclusions.append("已有可追溯引用来源，建议结合原文页码与章节位置继续复核关键判断。")
+    else:
+        conclusions.append("当前引用覆盖较弱，建议补充资料以提高结论稳健性。")
+
+    actions: List[str] = [
+        "优先核验引用条目所在章节与当前结论是否一致。",
+        "补充更明确的研究边界、对象和时间范围后再生成完整版分析。",
+        "若用于研究写作，请把关键判断转写为可追溯的观点-证据对。",
+    ]
+    profile_info = profile or _infer_academic_report_profile(rows)
+    profile_kind = str(profile_info.get("kind", "generic"))
+    structure_lines = _extract_tree_lines_from_profile(profile_info, limit=max(4, fallback_section_limit // 2))
+    if profile_kind == "paper":
+        sections = [
+            {"title": "研究问题与核心论点", "content": "；".join(key_points[:fallback_section_limit])},
+            {"title": "方法与证据", "content": "；".join(conclusions[: max(4, fallback_section_limit // 2)])},
+            {"title": "结构与章节线索", "content": "；".join(structure_lines or ["已按论文结构组织信息，但章节树仍可继续细化。"])},
+            {"title": "局限性与后续建议", "content": "；".join(actions[: max(4, fallback_section_limit // 2)])},
+        ]
+    elif profile_kind == "book":
+        sections = [
+            {"title": "全书核心主题", "content": "；".join(key_points[:fallback_section_limit])},
+            {"title": "章节递进与论证线索", "content": "；".join(structure_lines or conclusions[: max(4, fallback_section_limit // 2)])},
+            {"title": "关键结论与证据", "content": "；".join(conclusions[: max(4, fallback_section_limit // 2)])},
+            {"title": "研究价值与延展建议", "content": "；".join(actions[: max(4, fallback_section_limit // 2)])},
+        ]
+    else:
+        sections = [
+            {"title": "要点", "content": "；".join(key_points[:fallback_section_limit])},
+            {"title": "结论", "content": "；".join(conclusions[: max(4, fallback_section_limit // 2)])},
+            {"title": "行动建议", "content": "；".join(actions[: max(4, fallback_section_limit // 2)])},
+        ]
+    report = "\n\n".join([f"## {item['title']}\n- " + "\n- ".join(item["content"].split("；")) for item in sections]).strip()
+    return {"report": report, "sections": sections}
+
+
+def _infer_academic_report_profile(rows: List[Any]) -> Dict[str, Any]:
+    metadata = parse_json_object(str(rows[0].get("metadata", ""))) if rows else {}
+    document_type = str((rows[0].get("document_type", "") if rows else "") or metadata.get("document_type", "")).strip().lower()
+    tree = _build_document_tree(rows)
+    derived_titles = [str(item.get("title", "")).strip().lower() for item in tree]
+    paper_markers = ("abstract", "introduction", "method", "results", "discussion", "conclusion", "references")
+    paper_hits = sum(1 for title in derived_titles if any(marker in title for marker in paper_markers))
+    toc_count = len(metadata.get("toc", [])) if isinstance(metadata.get("toc"), list) else 0
+    if document_type == "academic" and (paper_hits >= 2 or any("abstract" in title for title in derived_titles)):
+        kind = "paper"
+    elif toc_count >= 3 or len(tree) >= 5:
+        kind = "book"
+    else:
+        kind = "generic"
+    if kind == "paper":
+        blueprint = ["研究问题与核心论点", "方法与数据", "主要发现", "局限性与可信度", "研究价值与延展"]
+        label = "论文/学术文章"
+    elif kind == "book":
+        blueprint = ["全书结构图", "核心主题", "章节递进关系", "关键证据与案例", "研究价值与局限"]
+        label = "书籍/长篇著作"
+    else:
+        blueprint = ["研究问题", "结构脉络", "方法与证据", "主要发现", "局限性", "研究价值"]
+        label = "学术长文档"
+    return {"kind": kind, "label": label, "section_blueprint": blueprint, "tree": tree}
+
+
+def _build_document_tree(rows: List[Any]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    metadata = parse_json_object(str(rows[0].get("metadata", "")))
+    toc = metadata.get("toc") if isinstance(metadata, dict) else []
+    if isinstance(toc, list) and toc:
+        out: List[Dict[str, Any]] = []
+        for item in toc[:24]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            page_num = _safe_int(item.get("page", item.get("page_num", 0)), 0, 0)
+            level = _safe_int(item.get("level", 1), 1, 1)
+            if not title:
+                continue
+            out.append({"title": title, "page_start": page_num, "page_end": page_num, "level": level, "source": "toc"})
+        if out:
+            return out
+    grouped = _group_rows_for_hierarchical_report(rows, chunk_size=max(len(rows), 1))
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in grouped:
+        key = str(item.get("chapter_key", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": str(item.get("chapter_title", "章节")), "page_start": item.get("page_start"), "page_end": item.get("page_end"), "level": 1, "source": "derived"})
+    return out[:24]
+
+
+def _render_document_tree(tree: List[Dict[str, Any]], limit: int = 18) -> str:
+    lines: List[str] = []
+    for item in tree[:limit]:
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        level = max(1, _safe_int(item.get("level", 1), 1, 1))
+        indent = "  " * max(0, min(level - 1, 3))
+        page_span = _format_page_span(item.get("page_start"), item.get("page_end"))
+        lines.append(f"{indent}- {title}{page_span}")
+    return "\n".join(lines)
+
+
+def _extract_tree_lines_from_profile(profile: Dict[str, Any], limit: int = 6) -> List[str]:
+    tree = profile.get("tree", []) if isinstance(profile, dict) else []
+    if not isinstance(tree, list):
+        return []
+    lines: List[str] = []
+    for item in tree[:limit]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        lines.append(f"{title}{_format_page_span(item.get('page_start'), item.get('page_end'))}")
+    return lines
+
+
+def _prefer_chinese_for_long_doc(rows: List[Any]) -> bool:
+    if not rows:
+        return False
+    sample_parts: List[str] = []
+    metadata = parse_json_object(str(rows[0].get("metadata", ""))) if rows else {}
+    if isinstance(metadata, dict):
+        sample_parts.append(str(metadata.get("title", "")))
+        toc = metadata.get("toc", [])
+        if isinstance(toc, list):
+            for item in toc[:6]:
+                if isinstance(item, dict):
+                    sample_parts.append(str(item.get("title", "")))
+    for row in rows[:6]:
+        sample_parts.append(str(row.get("title", "")))
+        sample_parts.append(str(row.get("content", ""))[:300])
+    return _contains_cjk(" ".join(sample_parts))
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[一-鿿]", text or ""))
+
+
+def _looks_mostly_english(text: str) -> bool:
+    if not text:
+        return False
+    latin = len(re.findall(r"[A-Za-z]", text))
+    cjk = len(re.findall(r"[一-鿿]", text))
+    return latin >= 40 and latin > cjk * 3
+
+
+
+
+
+async def _merge_global_summaries(
+    self,
+    stage2_outputs: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    report_cfg: Dict[str, Any],
+    detail_runtime: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    合并多个全局综述Part，生成统一的全局综述
+    """
+    if not stage2_outputs or len(stage2_outputs) <= 1:
+        return None
+    
+    # 构建合并的上下文
+    parts_text: List[str] = []
+    for idx, item in enumerate(stage2_outputs, start=1):
+        key_points = " ".join(item.get("key_points", [])[:int(detail_runtime["final_item_limit"])])
+        analysis = " ".join(item.get("analysis", [])[:int(detail_runtime["final_item_limit"])])
+        recommendations = " ".join(item.get("recommendations", [])[:int(detail_runtime["final_item_limit"])])
+        risks = " ".join(item.get("risks", [])[:int(detail_runtime["final_item_limit"])])
+        
+        parts_text.append(
+            f"### 全局综述 Part#{idx}\n"
+            f"核心要点: {key_points}\n"
+            f"分析深度: {analysis}\n"
+            f"建议措施: {recommendations}\n"
+            f"风险提示: {risks}"
+        )
+    
+    prompt = (
+        "你是一个高级文档分析专家。请将以下多个全局综述部分合并成一个统一、连贯的全局综述。\n"
+        "【关键要求】：\n"
+        "- 将多个部分的核心信息有机融合，避免简单拼接\n"
+        "- 保持逻辑连贯性，使用'首先'、'其次'、'此外'、'综上所述'等连接词\n"
+        "- 提取最关键的全局洞察，避免冗余信息\n"
+        "- 返回JSON对象，包含字段: key_points, analysis, recommendations, risks\n"
+        "- 每个字段都必须返回一个完整的、连贯的中文段落，而不是列表\n"
+        "- 段落长度约300-500字，确保覆盖所有重要方面\n"
+        f"用户查询：{state.get('query', '')}\n\n"
+        f"需要合并的全局综述部分：\n{chr(10).join(parts_text)}"
+    )
+    
+    try:
+        resp = await self.ai_router.chat_with_task(
+            [{"role": "user", "content": prompt}],
+            task_type="summarize",
+            max_tokens=int(report_cfg.get("stage2_max_tokens", 1200)),
+            temperature=0.2,
+            prefer_free=True,
+        )
+        parsed = parse_json_object(str(resp.get("content", "")))
+        if isinstance(parsed, dict):
+            return {
+                "provider": str(resp.get("provider", "unknown")),
+                "key_points": _to_list(parsed.get("key_points")),
+                "analysis": _to_list(parsed.get("analysis")),
+                "recommendations": _to_list(parsed.get("recommendations")),
+                "risks": _to_list(parsed.get("risks")),
+            }
+    except Exception as e:
+        logger.warning(f"Failed to merge global summaries: {e}")
+    
+    return None

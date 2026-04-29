@@ -14,19 +14,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from backend.runtime_config import RuntimeConfig
-from backend.services import knowledge_store
-from backend.services.knowledge_store import insert_returning_id
-from backend.services.document_parser import DocumentParser, ParsedDocument
-from backend.services.free_ai_router import FreeAIRouter
-from backend.services.pipeline import postgres_store
-from backend.services.supabase_storage import SupabaseStorageConfig, download_to_file, parse_supabase_uri
-from backend.services.r2_storage import R2StorageConfig, download_to_file as r2_download_to_file, parse_r2_uri
-from backend.services.upload_load_control import log_ingestion_event
-from backend.services import gpu_ocr_billing
-from backend.services import ocr_token_billing
-from backend.services import embedding_token_billing
-from backend.services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
+from runtime_config import RuntimeConfig
+from . import knowledge_store
+from .knowledge_store import insert_returning_id
+from .document_parser import DocumentParser, ParsedDocument
+from .free_ai_router import FreeAIRouter
+from .pipeline import postgres_store
+from .supabase_storage import SupabaseStorageConfig, delete_object as supabase_delete_object, download_to_file, parse_supabase_uri
+from .r2_storage import R2StorageConfig, delete_object as r2_delete_object, download_to_file as r2_download_to_file, parse_r2_uri
+from .upload_load_control import log_ingestion_event
+from . import gpu_ocr_billing
+from . import ocr_token_billing
+from . import embedding_token_billing
+from .billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -163,9 +163,11 @@ class UploadIngestionService:
             columns = [str(row["name"]) for row in conn.execute("PRAGMA table_info(upload_tasks)").fetchall()]
             for col, ddl in (
                 ("file_size_bytes", "ALTER TABLE upload_tasks ADD COLUMN file_size_bytes INTEGER NOT NULL DEFAULT 0"),
+                ("client_managed_original", "ALTER TABLE upload_tasks ADD COLUMN client_managed_original INTEGER NOT NULL DEFAULT 0"),
                 ("page_count", "ALTER TABLE upload_tasks ADD COLUMN page_count INTEGER NOT NULL DEFAULT 0"),
                 ("use_gpu_ocr", "ALTER TABLE upload_tasks ADD COLUMN use_gpu_ocr INTEGER NOT NULL DEFAULT 0"),
                 ("ocr_mode", "ALTER TABLE upload_tasks ADD COLUMN ocr_mode TEXT NOT NULL DEFAULT 'standard'"),
+                ("ocr_engine_override", "ALTER TABLE upload_tasks ADD COLUMN ocr_engine_override TEXT"),
                 ("embedding_mode", "ALTER TABLE upload_tasks ADD COLUMN embedding_mode TEXT NOT NULL DEFAULT 'auto'"),
                 ("embedding_model", "ALTER TABLE upload_tasks ADD COLUMN embedding_model TEXT"),
                 ("ocr_billing_client_id", "ALTER TABLE upload_tasks ADD COLUMN ocr_billing_client_id TEXT"),
@@ -275,9 +277,11 @@ class UploadIngestionService:
         *,
         storage_basename: Optional[str] = None,
         ocr_mode: str = "standard",
+        ocr_engine_override: Optional[str] = None,
         embedding_mode: str = "auto",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
+        client_managed_original: bool = False,
     ) -> Dict[str, Any]:
         """filename: 展示用原始文件名；storage_basename: 磁盘上的唯一文件名（默认同 filename，易同名覆盖）。"""
         disk_name = storage_basename if storage_basename is not None else filename
@@ -295,8 +299,8 @@ class UploadIngestionService:
                 conn,
                 """
                 INSERT INTO upload_tasks (tenant_id, filename, file_path, discipline, document_type, status, phase, file_size_bytes,
-                    ocr_mode, embedding_mode, embedding_model, ocr_billing_client_id, ocr_billing_exempt)
-                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?)
+                    client_managed_original, ocr_mode, ocr_engine_override, embedding_mode, embedding_model, ocr_billing_client_id, ocr_billing_exempt)
+                VALUES (?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tenant_id,
@@ -305,7 +309,9 @@ class UploadIngestionService:
                     discipline,
                     document_type,
                     file_size_bytes,
+                    1 if client_managed_original else 0,
                     str(ocr_mode or "standard"),
+                    str(ocr_engine_override or "").strip() or None,
                     str(embedding_mode or "auto"),
                     self.ai_router.get_active_embedding_model_id(embedding_mode),
                     ocr_billing_client_id,
@@ -326,9 +332,11 @@ class UploadIngestionService:
         *,
         storage_basename: str,
         ocr_mode: str = "standard",
+        ocr_engine_override: Optional[str] = None,
         embedding_mode: str = "auto",
         ocr_billing_client_id: Optional[str] = None,
         ocr_billing_exempt: bool = False,
+        client_managed_original: bool = False,
     ) -> Dict[str, Any]:
         """预签名直传：先占位 0 字节本地文件再建任务，客户端 PUT 完成后更新为 r2://。"""
         disk_name = storage_basename
@@ -342,9 +350,11 @@ class UploadIngestionService:
             tenant_id=tenant_id,
             storage_basename=storage_basename,
             ocr_mode=ocr_mode,
+            ocr_engine_override=ocr_engine_override,
             embedding_mode=embedding_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
+            client_managed_original=client_managed_original,
         )
 
     def get_task(self, task_id: int, tenant_id: str) -> Dict[str, Any]:
@@ -354,7 +364,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       file_size_bytes, client_managed_original, page_count, use_gpu_ocr, ocr_mode, ocr_engine_override, embedding_mode, embedding_model,
                        ocr_billing_client_id, ocr_billing_exempt, ocr_provider, ocr_call_units, ocr_billable_tokens,
                        embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
@@ -377,7 +387,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       file_size_bytes, client_managed_original, page_count, use_gpu_ocr, ocr_mode, ocr_engine_override, embedding_mode, embedding_model,
                        ocr_billing_client_id, ocr_billing_exempt, ocr_provider, ocr_call_units, ocr_billable_tokens,
                        embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
@@ -401,7 +411,7 @@ class UploadIngestionService:
                 """
                 SELECT id, tenant_id, filename, file_path, discipline, document_type, status, phase, document_id,
                        total_chunks, processed_chunks, retries, error_message, created_at, updated_at,
-                       file_size_bytes, page_count, use_gpu_ocr, ocr_mode, embedding_mode, embedding_model,
+                       file_size_bytes, client_managed_original, page_count, use_gpu_ocr, ocr_mode, ocr_engine_override, embedding_mode, embedding_model,
                        ocr_provider, ocr_call_units, ocr_billable_tokens, embedding_provider, embedding_billable_tokens,
                        extract_started_at, extract_finished_at, index_started_at, index_finished_at,
                        extract_duration_sec, index_duration_sec
@@ -522,6 +532,17 @@ class UploadIngestionService:
         finally:
             conn.close()
 
+    def update_task_client_managed_original(self, task_id: int, enabled: bool) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE upload_tasks SET client_managed_original = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (1 if enabled else 0, int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def update_task_use_gpu_ocr(self, task_id: int, use_gpu_ocr: bool) -> None:
         conn = self._conn()
         try:
@@ -539,6 +560,17 @@ class UploadIngestionService:
             conn.execute(
                 "UPDATE upload_tasks SET ocr_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (str(ocr_mode or "standard"), int(task_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_task_ocr_engine_override(self, task_id: int, ocr_engine_override: Optional[str]) -> None:
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE upload_tasks SET ocr_engine_override = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (str(ocr_engine_override or "").strip() or None, int(task_id)),
             )
             conn.commit()
         finally:
@@ -599,6 +631,7 @@ class UploadIngestionService:
         embedding_mode: Optional[str] = None,
         embedding_model: Optional[str] = None,
         embedding_provider: Optional[str] = None,
+        metadata_updates: Optional[Dict[str, Any]] = None,
     ) -> None:
         conn = self._conn()
         try:
@@ -615,6 +648,9 @@ class UploadIngestionService:
                 meta["embedding_model"] = str(embedding_model or "")
             if embedding_provider is not None:
                 meta["embedding_provider"] = str(embedding_provider or "")
+            if metadata_updates:
+                for key, value in metadata_updates.items():
+                    meta[str(key)] = value
             conn.execute(
                 "UPDATE documents SET metadata = ? WHERE id = ? AND tenant_id = ?",
                 (json.dumps(meta, ensure_ascii=False), int(document_id), str(tenant_id)),
@@ -628,7 +664,7 @@ class UploadIngestionService:
         if not fp:
             raise FileNotFoundError("任务缺少 file_path")
 
-        if not (fp.startswith("supabase://") or fp.startswith("http://") or fp.startswith("https://")):
+        if not (fp.startswith("r2://") or fp.startswith("supabase://") or fp.startswith("http://") or fp.startswith("https://")):
             if not Path(fp).exists():
                 raise FileNotFoundError(f"文件不存在: {fp}")
             return fp
@@ -672,6 +708,52 @@ class UploadIngestionService:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(r.content)
         return str(dest)
+
+    def cleanup_task_local_cache_files(self, task_id: int) -> None:
+        cache_dir = Path(self.upload_dir) / "_cache"
+        if not cache_dir.exists():
+            return
+        for path in cache_dir.glob(f"task_{int(task_id)}_*"):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                elif path.is_file():
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    async def cleanup_client_managed_original(self, task_id: int, task: Optional[Dict[str, Any]] = None) -> None:
+        task_row = task or self._get_task_any(task_id)
+        if not bool(int(task_row.get("client_managed_original") or 0)):
+            return
+        fp = str(task_row.get("file_path") or "").strip()
+        if fp.startswith("r2://"):
+            parsed = parse_r2_uri(fp)
+            cfg = R2StorageConfig.from_env()
+            if parsed and cfg:
+                bucket, key = parsed
+                try:
+                    r2_delete_object(cfg, bucket=bucket, key=key)
+                except Exception:
+                    pass
+        elif fp.startswith("supabase://"):
+            parsed = parse_supabase_uri(fp)
+            cfg = SupabaseStorageConfig.from_env()
+            if parsed and cfg:
+                bucket, key = parsed
+                try:
+                    await supabase_delete_object(cfg, bucket=bucket, key=key)
+                except Exception:
+                    pass
+        elif fp and not fp.startswith("client://"):
+            try:
+                path = Path(fp)
+                if path.exists():
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.update_task_file_size_bytes(task_id, 0)
+        self.update_task_file_path(task_id, f"client://device-local/{task_id}")
 
     def _update_task_page_count_from_parsed(self, task_id: int, parsed: ParsedDocument) -> None:
         raw = parsed.metadata.get("pdf_page_count")
@@ -865,6 +947,7 @@ class UploadIngestionService:
 
         self._ensure_task_file_size(task_id)
         self._reset_ingestion_timestamps(task_id)
+        local_fp: Optional[str] = None
         try:
             log_ingestion_event(
                 "task_run_start",
@@ -883,11 +966,18 @@ class UploadIngestionService:
             fs = int(task.get("file_size_bytes") or 0)
             _ = fs  # file_size_bytes kept for stats/debug; 外部 OCR 额度由上游扫描判定与扣减
             ocr_mode = str(task.get("ocr_mode") or "standard").strip().lower() or "standard"
-            if ocr_mode == "complex_layout":
+            ocr_engine_override = str(task.get("ocr_engine_override") or "").strip().lower()
+            if ocr_engine_override in {"glm_ocr", "complex_layout"}:
                 ocr_override = "glm-ocr"
-            elif ocr_mode == "standard":
+            elif ocr_engine_override in {"glm-ocr", "baidu", "docling"}:
+                ocr_override = ocr_engine_override
+            elif ocr_engine_override in {"local", "local-standard", "paddle-local"}:
                 ocr_override = "local"
+            elif ocr_mode == "complex_layout":
+                ocr_override = "glm-ocr"
             else:
+                # "standard" should honor the deployment's default OCR chain
+                # (for example auto/baidu/docling), instead of forcing local OCR.
                 ocr_override = None
             parse_fn = functools.partial(
                 self.parser.parse, local_fp, task["document_type"], ocr_engine_override=ocr_override
@@ -959,6 +1049,17 @@ class UploadIngestionService:
                 parsed=parsed,
                 chunks=chunks,
             )
+            if bool(int(task.get("client_managed_original") or 0)):
+                self.update_document_embedding_metadata(
+                    document_id=int(document_id),
+                    tenant_id=tenant_id,
+                    metadata_updates={
+                        "client_managed_original": True,
+                        "original_storage_mode": "client_device",
+                        "source_file_size_cloud": 0,
+                    },
+                )
+                await self.cleanup_client_managed_original(task_id, task=task)
 
             self._set_task_timestamp(task_id, "index_finished_at", self._now_iso())
             self._store_phase_durations(task_id)
@@ -976,6 +1077,8 @@ class UploadIngestionService:
             self._close_timestamps_on_failure(task_id)
             self._update_task_status(task_id, "failed", phase="failed", error_message=str(exc), retries=retries)
             raise
+        finally:
+            self.cleanup_task_local_cache_files(task_id)
         return self.get_task(task_id, tenant_id=tenant_id)
 
     async def resume_task(self, task_id: int, tenant_id: str) -> Dict[str, Any]:
@@ -1116,6 +1219,10 @@ class UploadIngestionService:
         embedding_mode = self.ai_router.normalize_embedding_mode(task.get("embedding_mode"))
         merged_meta["embedding_mode"] = embedding_mode
         merged_meta["embedding_model"] = self.ai_router.get_active_embedding_model_id(embedding_mode)
+        if bool(int(task.get("client_managed_original") or 0)):
+            merged_meta["client_managed_original"] = True
+            merged_meta["original_storage_mode"] = "client_device"
+            merged_meta["source_file_size_cloud"] = 0
         tenant_id = str(task.get("tenant_id", "public") or "public")
         conn = self._conn()
         try:
@@ -1140,13 +1247,13 @@ class UploadIngestionService:
             conn.close()
 
     async def _build_chunks_from_parsed(self, parsed: ParsedDocument, document_type: str) -> List[IngestionChunk]:
-        from backend.services.chunker import DocumentChunker
+        from .chunker import DocumentChunker
         text = parsed.text or ""
         title = str(parsed.metadata.get("title", ""))
         # 如果文本含 [[PAGE:N]] 标记，优先用 DocumentChunker（保留页码信息）
         if "[[PAGE:" in text:
             chunker = DocumentChunker(chunk_size=self.chunk_size, overlap=self.chunk_overlap)
-            raw_chunks = chunker.chunk_document(text, document_type, title)
+            raw_chunks = chunker.chunk_document(text, document_type, title, metadata=parsed.metadata)
             chunks: List[IngestionChunk] = []
             for index, payload in enumerate(raw_chunks, start=1):
                 content = (payload.get("content") or "").strip()

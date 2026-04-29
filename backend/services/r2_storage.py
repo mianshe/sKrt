@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
+def _clean_env_value(name: str) -> str:
+    raw = str(os.getenv(name) or "").strip()
+    if raw.lower() in {"none", "null", "nil", "undefined"}:
+        return ""
+    return raw
+
+
 @dataclass(frozen=True)
 class R2StorageConfig:
     endpoint: str
@@ -16,11 +23,14 @@ class R2StorageConfig:
 
     @staticmethod
     def from_env() -> Optional["R2StorageConfig"]:
-        endpoint = (os.getenv("R2_ENDPOINT") or "").strip().rstrip("/")
-        bucket = (os.getenv("R2_BUCKET") or "").strip()
-        access_key_id = (os.getenv("R2_ACCESS_KEY_ID") or "").strip()
-        secret_access_key = (os.getenv("R2_SECRET_ACCESS_KEY") or "").strip()
-        region = (os.getenv("R2_REGION") or "auto").strip() or "auto"
+        enabled = _clean_env_value("R2_ENABLED").lower() or "1"
+        if enabled in {"0", "false", "off", "no"}:
+            return None
+        endpoint = _clean_env_value("R2_ENDPOINT").rstrip("/")
+        bucket = _clean_env_value("R2_BUCKET")
+        access_key_id = _clean_env_value("R2_ACCESS_KEY_ID")
+        secret_access_key = _clean_env_value("R2_SECRET_ACCESS_KEY")
+        region = _clean_env_value("R2_REGION") or "auto"
         if not endpoint or not bucket or not access_key_id or not secret_access_key:
             return None
         return R2StorageConfig(
@@ -53,32 +63,57 @@ def _client(cfg: R2StorageConfig):
     import boto3  # lazy import
     from botocore.config import Config as BotoConfig
 
+    endpoint = str(getattr(cfg, "endpoint", "") or "").strip()
+    if not endpoint or endpoint.lower() in {"none", "null", "nil", "undefined"}:
+        raise RuntimeError("R2 endpoint is not configured. Check R2_ENDPOINT in your environment.")
+    if not endpoint.startswith(("http://", "https://")):
+        raise RuntimeError(f"R2 endpoint is invalid: {endpoint}")
+
     return boto3.client(
         "s3",
-        endpoint_url=cfg.endpoint,
+        endpoint_url=endpoint,
         aws_access_key_id=cfg.access_key_id,
         aws_secret_access_key=cfg.secret_access_key,
         region_name=cfg.region,
-        config=BotoConfig(signature_version="s3v4"),
+        config=BotoConfig(
+            signature_version="s3v4",
+            retries={"max_attempts": 4, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
 def upload_file(cfg: R2StorageConfig, *, key: str, file_path: Path, content_type: str = "application/octet-stream") -> str:
     c = _client(cfg)
     object_key = key.lstrip("/")
-    c.upload_file(
-        Filename=str(file_path),
-        Bucket=cfg.bucket,
-        Key=object_key,
-        ExtraArgs={"ContentType": content_type},
-    )
+    with open(file_path, "rb") as fp:
+        c.put_object(
+            Bucket=cfg.bucket,
+            Key=object_key,
+            Body=fp,
+            ContentType=content_type,
+            ContentLength=int(file_path.stat().st_size),
+        )
     return r2_uri(cfg.bucket, object_key)
 
 
 def download_to_file(cfg: R2StorageConfig, *, bucket: str, key: str, dest_path: Path) -> None:
     c = _client(cfg)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    c.download_file(Bucket=bucket, Key=key.lstrip("/"), Filename=str(dest_path))
+    resp = c.get_object(Bucket=bucket, Key=key.lstrip("/"))
+    body = resp["Body"]
+    try:
+        with open(dest_path, "wb") as out:
+            while True:
+                block = body.read(1024 * 1024)
+                if not block:
+                    break
+                out.write(block)
+    finally:
+        try:
+            body.close()
+        except Exception:
+            pass
 
 
 def head_object(cfg: R2StorageConfig, *, key: str) -> Dict[str, Any]:
@@ -90,6 +125,11 @@ def head_object(cfg: R2StorageConfig, *, key: str) -> Dict[str, Any]:
         "content_length": int(resp.get("ContentLength") or 0),
         "content_type": str(resp.get("ContentType") or ""),
     }
+
+
+def delete_object(cfg: R2StorageConfig, *, bucket: str, key: str) -> None:
+    c = _client(cfg)
+    c.delete_object(Bucket=bucket, Key=key.lstrip("/"))
 
 
 def generate_presigned_put_url(

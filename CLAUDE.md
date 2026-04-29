@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 工作目录说明
 
-Git 仓库根为 `d:\xm`；本文件描述的是 **`xm1` 子项目**（全栈应用）。
+Git 仓库根为 `d:\xm`；**本文件所在目录即全栈项目根** `d:\xm\xm1`（亦写作 `xm/xm1`）。
 
-- **全栈维护**：在 `d:\xm\xm1` 下运行 `claude`
-- `d:\xm\frontend` 是独立前端副本，修改前确认以哪侧为准
+- **全栈维护**：在本目录（`d:\xm\xm1`）下运行 `claude`、测试与 `./start.ps1`
+- 仓库根 `d:\xm` 下若另有 `frontend/`，可能与本目录不同步；**以本目录 `xm1` 为准**
 
 ## 构建与测试命令
 

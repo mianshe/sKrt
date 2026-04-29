@@ -1,20 +1,20 @@
 import { useEffect, useState } from "react";
 
-export type EmbeddingMode = "auto" | "local" | "api";
+export type EmbeddingMode = "local" | "api";
 
 const EMBEDDING_MODE_KEY = "xm_embedding_mode";
 
 export function normalizeEmbeddingMode(value: unknown): EmbeddingMode {
   const mode = String(value || "").trim().toLowerCase();
   if (mode === "local" || mode === "api") return mode;
-  return "auto";
+  return "local";
 }
 
 export function getEmbeddingModePreference(): EmbeddingMode {
   try {
     return normalizeEmbeddingMode(localStorage.getItem(EMBEDDING_MODE_KEY));
   } catch {
-    return "auto";
+    return "local";
   }
 }
 

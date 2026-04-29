@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background (even more faded) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2" opacity="0.7"/>
+  <rect x="14" y="14" width="460" height="620" rx="20" ry="20" fill="rgba(40,38,34,0.14)" stroke="none" opacity="0.7"/>
+  
+  <!-- Book spine -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Flipping page (rotate -45 degrees) -->
+  <g transform="rotate(-45, 0, 310)">
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2"/>
+    
+    <!-- Inner border (barely visible) -->
+    <rect x="12" y="12" width="436" height="596" rx="14" ry="14" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="1"/>
+    
+    <!-- Content box (very distorted) -->
+    <rect x="50" y="150" width="360" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2" opacity="0.6"/>
+  </g>
+  
+  <!-- Strong shadow -->
+  <ellipse cx="40" cy="310" rx="50" ry="30" fill="rgba(0,0,0,0.2)"/>
+</svg>

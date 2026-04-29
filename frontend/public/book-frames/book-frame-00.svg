@@ -1,0 +1,39 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Main book cover (matches min-h-[620px], rounded-[20px]) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Shadow effect (shadow-[14px_14px_0_rgba(40,38,34,0.2)]) -->
+  <rect x="14" y="14" width="460" height="620" rx="20" ry="20" fill="rgba(40,38,34,0.2)" stroke="none"/>
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Book spine (left edge) -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Inner white border (absolute inset-3 rounded-[14px] border border-white/40) -->
+  <rect x="12" y="12" width="436" height="596" rx="14" ry="14" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1"/>
+  
+  <!-- Title area -->
+  <g transform="translate(230, 80)">
+    <!-- DOODLE BOOK text -->
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="900" fill="white" opacity="0.7" letter-spacing="0.25em">DOODLE BOOK</text>
+    
+    <!-- Main title: 上传区-->
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="48" font-weight="900" fill="white" letter-spacing="0.12em" y="60">上传区</text>
+    
+    <!-- Subtitle -->
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="white" opacity="0.8" y="90">把文档拖进插画框，开始构建知识书</text>
+  </g>
+  
+  <!-- Content box (rounded-2xl border-2 border-[#39342d] bg-[#fffef9]) -->
+  <rect x="50" y="150" width="360" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Content box shadow (shadow-[0_10px_0_rgba(57,52,45,0.14)]) -->
+  <rect x="50" y="160" width="360" height="400" rx="16" ry="16" fill="rgba(57,52,45,0.14)" stroke="none"/>
+  <rect x="50" y="150" width="360" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Content placeholder (where children would go) -->
+  <rect x="80" y="180" width="300" height="340" rx="8" ry="8" fill="rgba(57,52,45,0.05)" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  <text x="230" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#666666">文档上传区域</text>
+</svg>
+

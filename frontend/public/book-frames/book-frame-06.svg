@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background (barely visible) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2" opacity="0.4"/>
+  
+  <!-- Book spine -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Flipping page (rotate -90 degrees, back side fully visible) -->
+  <g transform="rotate(-90, 0, 310)">
+    <!-- Back side of page -->
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+    
+    <!-- Book interior pages -->
+    <rect x="30" y="50" width="400" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.15)"/>
+    <rect x="30" y="80" width="380" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.15)"/>
+    <rect x="30" y="110" width="420" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.15)"/>
+    <rect x="30" y="140" width="350" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.15)"/>
+    <rect x="30" y="200" width="200" height="100" rx="8" ry="8" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <text x="130" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#666666">笔记区域</text>
+  </g>
+</svg>

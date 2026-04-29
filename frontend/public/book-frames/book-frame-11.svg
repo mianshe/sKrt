@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Book spine (center) -->
+  <rect x="230" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Left page (book interior) - enhanced with more details -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+  
+  <!-- Left page decorative gradient -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="url(#leftPageGradient)" stroke="#999999" stroke-width="1"/>
+  <defs>
+    <linearGradient id="leftPageGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#dbe8ff"/>
+      <stop offset="100%" stop-color="#c2d6ff"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Left page content - rich details -->
+  <rect x="30" y="50" width="170" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.3)"/>
+  <rect x="30" y="80" width="150" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.3)"/>
+  <rect x="30" y="110" width="130" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.2)"/>
+  <rect x="30" y="140" width="110" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.15)"/>
+  
+  <!-- Decorative notebook lines -->
+  <g stroke="rgba(57,52,45,0.08)" stroke-width="1">
+    <line x1="30" y1="180" x2="200" y2="180"/>
+    <line x1="30" y1="200" x2="200" y2="200"/>
+    <line x1="30" y1="220" x2="200" y2="220"/>
+    <line x1="30" y1="240" x2="180" y2="240"/>
+    <line x1="30" y1="260" x2="180" y2="260"/>
+    <line x1="30" y1="280" x2="160" y2="280"/>
+    <line x1="30" y1="300" x2="160" y2="300"/>
+  </g>
+  
+  <!-- Sticky note -->
+  <rect x="40" y="350" width="100" height="80" rx="6" ry="6" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+  <polygon points="130,380 140,360 130,360" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+  <text x="90" y="380" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="#39342d">重要笔记</text>
+  <text x="90" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#666666">需重点关注</text>
+  
+  <!-- Right page (knowledge page - enhanced) -->
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Shadow effect -->
+  <rect x="248" y="10" width="222" height="620" rx="20" ry="20" fill="rgba(57,52,45,0.15)" stroke="none"/>
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Inner border with gradient -->
+  <rect x="250" y="12" width="198" height="596" rx="14" ry="14" fill="none" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  
+  <!-- Title area -->
+  <g transform="translate(349, 80)">
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="900" fill="#666666" opacity="0.7" letter-spacing="0.25em">KNOWLEDGE BOOK</text>
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="32" font-weight="900" fill="#39342d" letter-spacing="0.12em" y="40">解析页</text>
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#666666" y="70">知识构建完成</text>
+  </g>
+  
+  <!-- Main content panel -->
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Content panel shadow -->
+  <rect x="260" y="160" width="180" height="400" rx="16" ry="16" fill="rgba(57,52,45,0.14)" stroke="none"/>
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Inner panel border -->
+  <rect x="268" y="158" width="164" height="384" rx="12" ry="12" fill="none" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  
+  <!-- Content header -->
+  <rect x="270" y="170" width="160" height="36" rx="8" ry="8" fill="#90aee5" stroke="none"/>
+  <text x="350" y="192" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">文档分析报告</text>
+  
+  <!-- Content sections with icons -->
+  <g font-family="Arial, sans-serif" font-size="12" fill="#39342d">
+    <!-- Section 1 -->
+    <rect x="275" y="220" width="150" height="36" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+    <circle cx="290" cy="238" r="4" fill="#90aee5"/>
+    <text x="310" y="242">核心概念提取</text>
+    
+    <!-- Section 2 -->
+    <rect x="275" y="265" width="150" height="36" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+    <circle cx="290" cy="283" r="4" fill="#ffb366"/>
+    <text x="310" y="287">关键词云</text>
+    
+    <!-- Section 3 -->
+    <rect x="275" y="310" width="150" height="36" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+    <circle cx="290" cy="328" r="4" fill="#66cc99"/>
+    <text x="310" y="332">知识图谱</text>
+    
+    <!-- Section 4 -->
+    <rect x="275" y="355" width="150" height="36" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+    <circle cx="290" cy="373" r="4" fill="#ff6666"/>
+    <text x="310" y="377">学习路径</text>
+    
+    <!-- Section 5 -->
+    <rect x="275" y="400" width="150" height="36" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+    <circle cx="290" cy="418" r="4" fill="#9966cc"/>
+    <text x="310" y="422">记忆卡片</text>
+  </g>
+  
+  <!-- Status indicator -->
+  <rect x="270" y="480" width="160" height="30" rx="15" ry="15" fill="#66cc99" stroke="none"/>
+  <text x="350" y="500" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">准备就绪</text>
+</svg>

@@ -7,8 +7,8 @@ type Props = {
 
 const items: { key: AppTab; label: string }[] = [
   { key: "upload", label: "上传" },
-  { key: "knowledge", label: "要点总结" },
-  { key: "chat", label: "查询" },
+  { key: "knowledge", label: "深度解析" },
+  { key: "chat", label: "问答" },
 ];
 
 function BottomNav({ activeTab, onChange }: Props) {

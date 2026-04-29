@@ -102,6 +102,11 @@ export function getClientPersistenceInfo(): ClientPersistenceInfo {
   };
 }
 
+export function isNativeDeviceStorageRuntime(): boolean {
+  const info = getClientPersistenceInfo();
+  return info.runtime !== "web-browser" && info.storageTarget === "device-native" && info.nativeBridgeReady;
+}
+
 export async function listClientGuestDocuments(): Promise<LocalGuestDoc[]> {
   const bridge = getNativeBridge();
   return bridge ? bridge.listGuestDocuments() : listLocalGuestDocuments();

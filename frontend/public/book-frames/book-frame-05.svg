@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background (very faded) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2" opacity="0.5"/>
+  <rect x="14" y="14" width="460" height="620" rx="20" ry="20" fill="rgba(40,38,34,0.1)" stroke="none" opacity="0.5"/>
+  
+  <!-- Book spine -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Flipping page (rotate -75 degrees, starting to show back side) -->
+  <g transform="rotate(-75, 0, 310)">
+    <!-- Back side of page (book interior) -->
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+    
+    <!-- Back side content (book pages) -->
+    <rect x="30" y="50" width="400" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.1)"/>
+    <rect x="30" y="80" width="380" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.1)"/>
+    <rect x="30" y="110" width="420" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.1)"/>
+  </g>
+  
+  <!-- Shadow -->
+  <ellipse cx="15" cy="310" rx="30" ry="40" fill="rgba(0,0,0,0.3)"/>
+</svg>

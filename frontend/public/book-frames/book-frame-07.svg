@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Book spine (center of open book) -->
+  <rect x="230" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Left page (back side of flipped page) -->
+  <g transform="rotate(-105, 0, 310)">
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+    
+    <!-- Left page content -->
+    <rect x="30" y="50" width="200" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.2)"/>
+    <rect x="30" y="80" width="180" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.2)"/>
+    <rect x="30" y="150" width="150" height="80" rx="8" ry="8" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <text x="105" y="190" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#666666">解析笔记</text>
+  </g>
+  
+  <!-- Right page (new knowledge page starting to appear) -->
+  <g transform="translate(238, 0)" opacity="0.3">
+    <rect x="0" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#999999" stroke-width="1"/>
+  </g>
+</svg>

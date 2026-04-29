@@ -6,14 +6,16 @@ import re
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
 import httpx
 
 from PyPDF2 import PdfReader
 from docx import Document
-from backend.services.glm_ocr import glm_ocr_enabled, run_glm_layout_parsing
+from .glm_ocr import glm_ocr_enabled, run_glm_layout_parsing
 
 try:
     import pdfplumber  # type: ignore
@@ -93,7 +95,7 @@ class DocumentParser:
         if not self._ocr_cache_task_id:
             return None
         try:
-            from backend.services import knowledge_store
+            from . import knowledge_store
 
             conn = knowledge_store.connect()
             try:
@@ -113,7 +115,7 @@ class DocumentParser:
         if not self._ocr_cache_task_id:
             return
         try:
-            from backend.services import knowledge_store
+            from . import knowledge_store
 
             conn = knowledge_store.connect()
             try:
@@ -180,10 +182,52 @@ class DocumentParser:
 
         return ParsedDocument(text=text, metadata=metadata)
 
+    def _parse_pdf_with_docling(self, file_path: str) -> str:
+        """
+        利用 IBM Docling 解析 PDF 为结构化 Markdown。
+        Docling 通过内置的版面分析模型（Layout Model）能自动识别标题、表格、列表等层级。
+        """
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError:
+            raise ValueError(
+                "未安装 docling。请运行: pip install docling 以启用高级结构化 PDF 解析。"
+            )
+
+        try:
+            converter = DocumentConverter()
+            result = converter.convert(file_path)
+            # 导出为 Markdown 以保留层级结构（# 标题）
+            md_text = result.document.export_to_markdown()
+            self._ocr_runtime_metadata.update(
+                {
+                    "ocr_used": True,
+                    "ocr_engine": "docling",
+                    "ocr_provider": "local-ai",
+                    "ocr_complex_layout": True,
+                }
+            )
+            return md_text
+        except Exception as exc:
+            raise ValueError(f"Docling 解析失败: {exc}")
+
     def _parse_pdf(self, file_path: str, *, ocr_engine_override: Optional[str] = None) -> str:
         override = (ocr_engine_override or "").strip().lower()
         if override in {"glm-ocr", "glm_ocr", "complex_layout"}:
             return self._parse_pdf_with_glm_ocr(file_path)
+        if override == "docling":
+            return self._parse_pdf_with_docling(file_path)
+
+        # 全局配置检测
+        default_engine = os.getenv("PDF_OCR_ENGINE", "auto").strip().lower()
+        if default_engine in {"glm-ocr", "glm_ocr", "complex_layout"} and not override:
+            return self._parse_pdf_with_glm_ocr(file_path)
+        if (default_engine == "docling" or default_engine == "auto") and not override:
+            try:
+                # 优先尝试 docling，因为它不需要网络且支持结构化
+                return self._parse_pdf_with_docling(file_path)
+            except Exception:
+                pass 
 
         candidates: List[str] = []
         errors: List[str] = []
@@ -275,11 +319,13 @@ class DocumentParser:
         elif ocr_engine in {"runpod", "gpu", "remote", "ocr_api", "api"}:
             engines = ["remote"]
         else:
-            # auto：已配置百度时默认「联网 OCR 优先」，失败再 Paddle/Tesseract。
-            # PDF_OCR_REMOTE_FIRST=0 则恢复本地优先、百度仅作兜底（PDF_OCR_BAIDU_FALLBACK=1）。
+            # auto：默认仅走本地 OCR 链路，不自动消耗付费 OCR API。
+            # 如需恢复远程优先或百度兜底，可显式设置：
+            #   PDF_OCR_REMOTE_FIRST=1
+            #   PDF_OCR_BAIDU_FALLBACK=1
             baidu_ok = self._baidu_ocr_configured()
-            remote_first = baidu_ok and self._as_bool(os.getenv("PDF_OCR_REMOTE_FIRST", "1"), True)
-            baidu_fallback = baidu_ok and self._as_bool(os.getenv("PDF_OCR_BAIDU_FALLBACK", "1"), True)
+            remote_first = baidu_ok and self._as_bool(os.getenv("PDF_OCR_REMOTE_FIRST", "0"), False)
+            baidu_fallback = baidu_ok and self._as_bool(os.getenv("PDF_OCR_BAIDU_FALLBACK", "0"), False)
             if remote_first:
                 engines = ["baidu", "paddle", "tesseract"]
             elif baidu_fallback:
@@ -528,13 +574,13 @@ class DocumentParser:
 
     def _ocr_pdf_pages_paddle(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
         # PDF_OCR_PADDLE_SUBPROCESS: 1/on (default) = run Paddle in child process (backend.services.ocr_worker);
-        #   0/off = in-process (debug). PDF_OCR_SUBPROCESS_TIMEOUT: seconds for child run (default 3600; 0 = unlimited).
+        #   0/off = in-process (debug). PDF_OCR_SUBPROCESS_TIMEOUT: seconds for child run (default 180; 0 = unlimited).
         if self._as_bool(os.getenv("PDF_OCR_PADDLE_SUBPROCESS", "1"), True):
             return self._ocr_pdf_pages_paddle_subprocess(file_path, dpi, max_pages)
         return self._ocr_pdf_pages_paddle_inprocess(file_path, dpi, max_pages)
 
     def _ocr_pdf_pages_paddle_subprocess(self, file_path: str, dpi: int, max_pages: int) -> Tuple[str, str]:
-        timeout_sec = self._safe_int(os.getenv("PDF_OCR_SUBPROCESS_TIMEOUT", "3600"), 3600, min_value=0, max_value=86400 * 7)
+        timeout_sec = self._safe_int(os.getenv("PDF_OCR_SUBPROCESS_TIMEOUT", "180"), 180, min_value=0, max_value=86400 * 7)
         timeout = None if timeout_sec <= 0 else float(timeout_sec)
         safe_dpi = self._safe_int(os.getenv("PDF_OCR_PADDLE_SAFE_DPI", "180"), 180, min_value=120, max_value=300)
         attempt_specs: List[Tuple[int, Dict[str, str], str]] = [
@@ -639,8 +685,10 @@ class DocumentParser:
         if runtime is None:
             return "", f"runtime-init-failed:{self._paddle_init_error or 'unknown'}"
         ocr_pages: List[str] = []
+        page_idx = 0
         try:
             for img in self._iter_pdf_page_images(file_path, dpi, max_pages):
+                page_idx += 1
                 try:
                     arr = np.array(img)
                     try:
@@ -652,6 +700,7 @@ class DocumentParser:
                             raise
                     texts = self._extract_paddle_texts(result)
                     if texts:
+                        ocr_pages.append(f"[[PAGE:{page_idx}]]")
                         ocr_pages.append("\n".join(texts))
                 finally:
                     try:
@@ -677,8 +726,10 @@ class DocumentParser:
         ocr_lang = os.getenv("PDF_OCR_TESSERACT_LANG", os.getenv("PDF_OCR_LANG", "chi_sim+eng")).strip() or "chi_sim+eng"
         ocr_config = os.getenv("PDF_OCR_TESSERACT_CONFIG", "").strip()
         ocr_pages: List[str] = []
+        page_idx = 0
         try:
             for img in self._iter_pdf_page_images(file_path, dpi, max_pages):
+                page_idx += 1
                 try:
                     page_text = (
                         pytesseract.image_to_string(img, lang=ocr_lang, config=ocr_config)
@@ -686,6 +737,7 @@ class DocumentParser:
                         else pytesseract.image_to_string(img, lang=ocr_lang)
                     )
                     if page_text and page_text.strip():
+                        ocr_pages.append(f"[[PAGE:{page_idx}]]")
                         ocr_pages.append(page_text)
                 finally:
                     try:
@@ -712,9 +764,9 @@ class DocumentParser:
         secret = os.getenv("BAIDU_OCR_SECRET_KEY", "").strip()
         try:
             with httpx.Client(timeout=30.0) as client:
-                r = client.get(
+                r = client.post(
                     "https://aip.baidubce.com/oauth/2.0/token",
-                    params={
+                    data={
                         "grant_type": "client_credentials",
                         "client_id": api_key,
                         "client_secret": secret,
@@ -723,6 +775,15 @@ class DocumentParser:
         except Exception as exc:
             return "", f"token-request:{exc}"
         if r.status_code != 200:
+            detail = ""
+            try:
+                body = r.json()
+                if isinstance(body, dict):
+                    detail = str(body.get("error_description") or body.get("error") or "").strip()
+            except Exception:
+                detail = (r.text or "").strip()[:200]
+            if detail:
+                return "", f"token-http-{r.status_code}:{detail}"
             return "", f"token-http-{r.status_code}"
         try:
             data = r.json()
@@ -822,6 +883,7 @@ class DocumentParser:
                 lines = [str(item.get("words", "")).strip() for item in words if isinstance(item, dict)]
                 block = "\n".join(lines)
                 if block:
+                    ocr_pages.append(f"[[PAGE:{page_idx}]]")
                     ocr_pages.append(block)
         except Exception as exc:
             return "", f"ocr-failed:{exc}", api_ok_count
@@ -1043,7 +1105,91 @@ class DocumentParser:
 
             return "\n".join(parts).strip()
         except Exception as exc:
+            try:
+                fallback_text = self._parse_docx_xml_fallback(file_path)
+                if fallback_text.strip():
+                    return fallback_text
+            except Exception:
+                pass
             raise ValueError(f"DOCX解析失败: {exc}") from exc
+
+    def _parse_docx_xml_fallback(self, file_path: str) -> str:
+        try:
+            with zipfile.ZipFile(file_path) as archive:
+                part_names = ["word/document.xml"]
+                for name in archive.namelist():
+                    lowered = name.lower()
+                    if lowered.startswith("word/header") and lowered.endswith(".xml"):
+                        part_names.append(name)
+                    elif lowered.startswith("word/footer") and lowered.endswith(".xml"):
+                        part_names.append(name)
+                parts: List[str] = []
+                for part_name in part_names:
+                    text = self._read_docx_xml_part(archive, part_name)
+                    if text:
+                        parts.append(text)
+                return "\n".join(parts).strip()
+        except Exception as exc:
+            raise ValueError(f"DOCX XML回退解析失败: {exc}") from exc
+
+    def _read_docx_xml_part(self, archive: zipfile.ZipFile, part_name: str) -> str:
+        try:
+            xml_bytes = archive.read(part_name)
+        except KeyError:
+            return ""
+        root = ET.fromstring(xml_bytes)
+        return self._extract_docx_xml_text(root)
+
+    def _extract_docx_xml_text(self, root: ET.Element) -> str:
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        body = root.find(".//w:body", ns)
+        container = body if body is not None else root
+        parts: List[str] = []
+        for child in list(container):
+            tag = self._xml_local_name(child.tag)
+            if tag == "p":
+                text = self._extract_docx_paragraph_text(child)
+                if text:
+                    parts.append(text)
+            elif tag == "tbl":
+                parts.extend(self._extract_docx_table_lines(child))
+        return "\n".join(parts).strip()
+
+    def _extract_docx_table_lines(self, table: ET.Element) -> List[str]:
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        lines: List[str] = []
+        for row in table.findall("./w:tr", ns):
+            cells: List[str] = []
+            for cell in row.findall("./w:tc", ns):
+                para_texts = []
+                for paragraph in cell.findall("./w:p", ns):
+                    text = self._extract_docx_paragraph_text(paragraph)
+                    if text:
+                        para_texts.append(text)
+                cell_text = "\n".join(para_texts).strip()
+                if cell_text:
+                    cells.append(cell_text)
+            if cells:
+                lines.append("\t".join(cells))
+        return lines
+
+    def _extract_docx_paragraph_text(self, paragraph: ET.Element) -> str:
+        pieces: List[str] = []
+        for node in paragraph.iter():
+            tag = self._xml_local_name(node.tag)
+            if tag == "t" and node.text:
+                pieces.append(node.text)
+            elif tag == "tab":
+                pieces.append("\t")
+            elif tag in {"br", "cr"}:
+                pieces.append("\n")
+        return "".join(pieces).strip()
+
+    def _xml_local_name(self, tag: Any) -> str:
+        value = str(tag or "")
+        if "}" in value:
+            return value.rsplit("}", 1)[-1]
+        return value
 
     def _parse_text(self, file_path: str) -> str:
         for encoding in ("utf-8", "utf-8-sig", "gb18030", "gbk", "latin-1"):
@@ -1113,9 +1259,105 @@ class DocumentParser:
             return False
         return default
 
+    def _normalize_title_candidate(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+        return cleaned.strip(" _-|:：;；,，.。/\\")
+
+    def _is_title_noise(self, value: str) -> bool:
+        candidate = self._normalize_title_candidate(value)
+        if not candidate or len(candidate) < 4:
+            return True
+        lowered = candidate.lower()
+        if re.fullmatch(r"[\d\W_]+", candidate):
+            return True
+        noise_terms = (
+            "abstract", "keywords", "keyword", "contents", "table of contents", "acknowledgements",
+            "reference", "references", "bibliography", "student id", "supervisor", "department",
+            "faculty", "school", "college", "university", "摘要", "关键词", "关键字", "目录", "致谢",
+            "参考文献", "学号", "姓名", "专业", "学院", "学校", "大学", "指导教师", "指导老师",
+        )
+        return any(term in lowered for term in noise_terms)
+
+    def _looks_like_institution_line(self, value: str) -> bool:
+        candidate = self._normalize_title_candidate(value)
+        if not candidate:
+            return False
+        lowered = candidate.lower()
+        institution_terms = (
+            "university", "college", "faculty", "department", "school", "institute", "campus",
+            "学院", "大学", "学校", "系", "研究院",
+        )
+        return any(term in lowered for term in institution_terms)
+
+    def _score_title_candidate(self, value: str, from_filename: bool = False) -> int:
+        candidate = self._normalize_title_candidate(value)
+        if self._is_title_noise(candidate):
+            return -100
+        score = 0
+        length = len(candidate)
+        lowered = candidate.lower()
+        if from_filename:
+            score += 2
+        if 6 <= length <= 40:
+            score += 4
+        elif 41 <= length <= 80:
+            score += 2
+        if re.search(r"[\u4e00-\u9fff]", candidate):
+            score += 3
+        if re.search(r"[A-Za-z]", candidate):
+            score += 1
+        if re.search(r"[\u4e00-\u9fff]", candidate) and re.search(r"[A-Za-z]", candidate):
+            score += 1
+        if re.search(r"(研究|分析|设计|系统|模型|方法|实现|应用|优化|预测|影响|治理|识别|检测|基于)", candidate):
+            score += 4
+        if re.search(r"(study|analysis|design|system|model|method|application|optimization|prediction)", lowered):
+            score += 2
+        if self._looks_like_institution_line(candidate):
+            score -= 6
+        if re.search(r"(class|student|grade|学号|班|专业)", lowered):
+            score -= 3
+        return score
+
+    def _title_from_filename(self, filename: str) -> str:
+        stem = os.path.splitext(os.path.basename(filename or ""))[0]
+        pieces = [stem]
+        pieces.extend(re.split(r"[_\-]+", stem))
+        best = ""
+        best_score = -101
+        for piece in pieces:
+            candidate = self._normalize_title_candidate(piece)
+            if not candidate:
+                continue
+            score = self._score_title_candidate(candidate, from_filename=True)
+            if score > best_score:
+                best = candidate
+                best_score = score
+        return best or stem or filename
+
+    def _select_document_title(self, text: str, document_type: str, filename: str) -> str:
+        first_lines = [line.strip() for line in text.split("\n") if line.strip()][:20]
+        filename_title = self._title_from_filename(filename)
+        candidates: List[Tuple[str, int]] = []
+        for index, raw_line in enumerate(first_lines):
+            candidate = self._normalize_title_candidate(raw_line)
+            if not candidate:
+                continue
+            score = self._score_title_candidate(candidate)
+            score -= index
+            candidates.append((candidate, score))
+        if filename_title:
+            candidates.append((filename_title, self._score_title_candidate(filename_title, from_filename=True) + 2))
+        if not candidates:
+            return filename_title or filename
+        best_title, best_score = max(candidates, key=lambda item: item[1])
+        if best_score < 0 and filename_title:
+            return filename_title
+        if document_type in {"paper", "general", "technical"} and self._looks_like_institution_line(best_title) and filename_title:
+            return filename_title
+        return best_title
+
     def _extract_metadata(self, text: str, document_type: str, filename: str) -> Dict[str, Any]:
-        first_lines = [line.strip() for line in text.split("\n") if line.strip()][:8]
-        title = first_lines[0] if first_lines else filename
+        title = self._select_document_title(text, document_type, filename)
 
         headings = self._extract_headings(text)
         knowledge_points = self._extract_knowledge_points(text, document_type)

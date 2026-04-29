@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import type { LocalProcessSnapshot } from "../lib/localUserBackup";
 import { API_BASE } from "../config/apiBase";
-import { getAccessToken, setAccessToken, useAccessToken } from "../lib/auth";
+import { getAccessToken, setAccessToken, useAccessToken, useAuthBootstrapStatus } from "../lib/auth";
 import type { EmbeddingMode } from "../lib/embeddingMode";
+import { formatApiFetchError } from "../lib/fetchErrors";
+import { isNativeDeviceStorageRuntime } from "../lib/clientPersistence";
 
 const TENANT_KEY = "xm_tenant_id";
 const CLIENT_KEY = "xm_client_id";
@@ -19,6 +21,7 @@ export { getAccessToken, setAccessToken, useAccessToken };
 
 export function withTenantHeaders(base?: Record<string, string>): Record<string, string> {
   let clientId = "";
+  const tok = getAccessToken();
   try {
     clientId = localStorage.getItem(CLIENT_KEY) || "";
     if (!clientId) {
@@ -30,11 +33,13 @@ export function withTenantHeaders(base?: Record<string, string>): Record<string,
   }
   const headers: Record<string, string> = {
     ...(base || {}),
-    "X-Tenant-Id": tenantId(),
+    "X-Tenant-Id": tok ? tenantId() : "public",
     ...(clientId ? { "X-Client-Id": clientId } : {}),
   };
-  const tok = getAccessToken();
   if (tok) headers.Authorization = `Bearer ${tok}`;
+  if (isNativeDeviceStorageRuntime()) {
+    headers["X-Client-Storage-Mode"] = "device-local";
+  }
   return headers;
 }
 
@@ -49,6 +54,7 @@ export type TenantQuotaStatus = {
 };
 
 export type OcrMode = "standard" | "complex_layout";
+export type OcrEngineOverride = "auto" | "local" | "baidu" | "glm-ocr";
 
 /** GET /tenant/quota/status；无权限或失败时返回 null */
 export async function fetchTenantQuotaStatus(): Promise<TenantQuotaStatus | null> {
@@ -87,6 +93,7 @@ export class ExternalOcrConfirmRequiredError extends Error {
       documentType: string;
       embeddingMode: EmbeddingMode;
       useGpuOcr: boolean;
+      ocrEngineOverride?: OcrEngineOverride;
       onUploadPercent?: (n: number) => void;
     },
     public readonly fileKey: string
@@ -224,7 +231,10 @@ async function fetchTaskPayloadForBackup(taskId: number): Promise<Record<string,
 
 /** 拉取当前租户文档列表（用于本机备份时附带知识库条目元数据） */
 export async function fetchDocumentsList(): Promise<DocumentItem[]> {
-  const resp = await fetch(`${API_BASE}/documents`, { headers: withTenantHeaders(), credentials: "include" });
+  const resp = await fetch(buildApiUrl("/documents"), {
+    headers: withTenantHeaders(),
+    credentials: "include",
+  });
   if (!resp.ok) return [];
   const data = (await resp.json()) as { documents?: DocumentItem[] };
   return data.documents || [];
@@ -268,8 +278,24 @@ export async function buildLocalProcessSnapshot(taskId: number): Promise<LocalPr
   };
 }
 
+function isLikelyViteDevOrigin(): boolean {
+  if (typeof window === "undefined") return false;
+  const h = window.location.hostname;
+  const p = window.location.port;
+  return (h === "localhost" || h === "127.0.0.1") && p === "5173";
+}
+
 function backendHint(): string {
-  return `请确认后端已启动并可打开 ${API_BASE}/docs；从手机/其他电脑访问时请设置环境变量 VITE_API_BASE 为可访问的后端地址。`;
+  const base =
+    "请确认后端已启动；生产构建需设置 VITE_API_BASE（推荐 /api）并反代 /api 到 uvicorn；HTTPS 站点勿请求 http://localhost。";
+  if (typeof window === "undefined") {
+    return `${base} 从手机/其他电脑访问时请设置 VITE_API_BASE 为可访问的后端地址。`;
+  }
+  const origin = window.location.origin;
+  if (API_BASE.startsWith("/") && !isLikelyViteDevOrigin()) {
+    return `${base} 当前页 origin=${origin}：相对路径 ${API_BASE} 会请求到该主机，IDE/Cursor 内置预览通常不是 127.0.0.1:5173，故不会走 Vite 代理。请用系统浏览器打开 http://127.0.0.1:5173 复测；若必须在预览内调试，可在 frontend/.env.local 设置 VITE_API_BASE=http://127.0.0.1:8000 并重启 Vite，必要时在后端设置 CORS_ALLOW_ORIGINS 或 CORS_ALLOW_ORIGIN_REGEX。`;
+  }
+  return `${base} 当前页 origin=${origin}。`;
 }
 
 function buildApiUrl(path: string): URL {
@@ -347,16 +373,24 @@ async function createSingleFileTask(
   documentType: string,
   embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
+  ocrEngineOverride: OcrEngineOverride | undefined,
   externalOcrConfirmed: boolean
 ): Promise<UploadTaskItem> {
   const form = new FormData();
   form.append("files", file);
+  const clientManagedOriginal = isNativeDeviceStorageRuntime();
   const url = buildApiUrl("/upload/tasks");
   url.searchParams.set("discipline", discipline);
   url.searchParams.set("document_type", documentType);
   url.searchParams.set("embedding_mode", embeddingMode);
   url.searchParams.set("ocr_mode", ocrMode);
+  if (ocrEngineOverride && ocrEngineOverride !== "auto") {
+    url.searchParams.set("ocr_engine_override", ocrEngineOverride);
+  }
   url.searchParams.set("external_ocr_confirmed", externalOcrConfirmed ? "1" : "0");
+  if (clientManagedOriginal) {
+    url.searchParams.set("client_managed_original", "1");
+  }
   let resp: Response;
   try {
     resp = await fetch(url, { method: "POST", body: form, headers: withTenantHeaders() });
@@ -395,8 +429,10 @@ async function postChunkComplete(
   documentType: string,
   embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
+  ocrEngineOverride: OcrEngineOverride | undefined,
   externalOcrConfirmed: boolean
 ): Promise<Response> {
+  const clientManagedOriginal = isNativeDeviceStorageRuntime();
   return fetch(`${API_BASE}/upload/chunks/${uploadId}/complete`, {
     method: "POST",
     headers: withTenantHeaders({ "Content-Type": "application/json" }),
@@ -406,7 +442,9 @@ async function postChunkComplete(
       purpose: "docs",
       embedding_mode: embeddingMode,
       ocr_mode: ocrMode,
+      ocr_engine_override: ocrEngineOverride && ocrEngineOverride !== "auto" ? ocrEngineOverride : undefined,
       external_ocr_confirmed: externalOcrConfirmed,
+      client_managed_original: clientManagedOriginal,
     }),
   });
 }
@@ -417,9 +455,18 @@ export async function resumeChunkUploadAfterExternalOcrConfirm(
   discipline: string,
   documentType: string,
   embeddingMode: EmbeddingMode,
-  ocrMode: OcrMode
+  ocrMode: OcrMode,
+  ocrEngineOverride?: OcrEngineOverride
 ): Promise<UploadTaskItem> {
-  const completeResp = await postChunkComplete(uploadId, discipline, documentType, embeddingMode, ocrMode, true);
+  const completeResp = await postChunkComplete(
+    uploadId,
+    discipline,
+    documentType,
+    embeddingMode,
+    ocrMode,
+    ocrEngineOverride,
+    true
+  );
   if (!completeResp.ok) {
     const t = await completeResp.text();
     throw new Error(t || "分片合并失败");
@@ -438,10 +485,12 @@ async function createSingleFileChunkTask(
   documentType: string,
   embeddingMode: EmbeddingMode,
   ocrMode: OcrMode,
+  ocrEngineOverride: OcrEngineOverride | undefined,
   externalOcrConfirmed: boolean,
   onUploadPercent?: (n: number) => void
 ): Promise<UploadTaskItem> {
   const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+  const clientManagedOriginal = isNativeDeviceStorageRuntime();
   const initBody = {
     filename: file.name,
     total_size: file.size,
@@ -451,6 +500,8 @@ async function createSingleFileChunkTask(
     purpose: "docs" as const,
     embedding_mode: embeddingMode,
     ocr_mode: ocrMode,
+    ocr_engine_override: ocrEngineOverride && ocrEngineOverride !== "auto" ? ocrEngineOverride : undefined,
+    client_managed_original: clientManagedOriginal,
   };
   let initResp: Response;
   try {
@@ -501,6 +552,7 @@ async function createSingleFileChunkTask(
       documentType,
       embeddingMode,
       ocrMode,
+      ocrEngineOverride,
       externalOcrConfirmed
     );
   } catch {
@@ -522,6 +574,7 @@ async function createSingleFileChunkTask(
           documentType,
           embeddingMode,
           useGpuOcr: ocrMode === "complex_layout",
+          ocrEngineOverride,
           onUploadPercent,
         },
         fileKeyForUpload(file)
@@ -630,21 +683,32 @@ export function useDocuments() {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
+  const accessToken = useAccessToken();
+  const authBootstrapStatus = useAuthBootstrapStatus();
 
   const refreshDocuments = useCallback(async () => {
+    if (authBootstrapStatus !== "ready") {
+      setDocuments([]);
+      setLoading(false);
+      setError("");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
-      const resp = await fetch(`${API_BASE}/documents`, { headers: withTenantHeaders() });
+      const resp = await fetch(buildApiUrl("/documents"), {
+        headers: withTenantHeaders(),
+        credentials: "include",
+      });
       if (!resp.ok) throw new Error("文档列表加载失败");
       const data = await resp.json();
       setDocuments(data.documents || []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "未知错误");
+      setError(formatApiFetchError(e, "文档列表加载失败"));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authBootstrapStatus]);
 
   const createUploadTasks = useCallback(
     async (
@@ -652,13 +716,29 @@ export function useDocuments() {
       discipline: string,
       documentType: string,
       onUploadProgress?: (percent: number) => void,
-      options?: { ocr_mode?: OcrMode; external_ocr_confirmed?: boolean; embedding_mode?: EmbeddingMode }
+      options?: {
+        ocr_mode?: OcrMode;
+        ocr_engine_override?: OcrEngineOverride;
+        external_ocr_confirmed?: boolean;
+        embedding_mode?: EmbeddingMode;
+      }
     ): Promise<UploadTaskItem[]> => {
       if (!files.length) return [];
       const normalizedDiscipline = discipline.trim().toLowerCase() || "all";
       const embeddingMode: EmbeddingMode =
-        options?.embedding_mode === "local" || options?.embedding_mode === "api" ? options.embedding_mode : "auto";
-      const ocrMode: OcrMode = options?.ocr_mode === "complex_layout" ? "complex_layout" : "standard";
+        options?.embedding_mode === "api" ? "api" : "local";
+      const ocrEngineOverride: OcrEngineOverride | undefined =
+        options?.ocr_engine_override === "local" ||
+        options?.ocr_engine_override === "baidu" ||
+        options?.ocr_engine_override === "glm-ocr"
+          ? options.ocr_engine_override
+          : undefined;
+      const ocrMode: OcrMode =
+        ocrEngineOverride === "glm-ocr"
+          ? "complex_layout"
+          : options?.ocr_mode === "complex_layout"
+            ? "complex_layout"
+            : "standard";
       const externalOcrConfirmed = Boolean(options?.external_ocr_confirmed);
       const all: UploadTaskItem[] = [];
       let completed = 0;
@@ -671,6 +751,7 @@ export function useDocuments() {
                 documentType,
                 embeddingMode,
                 ocrMode,
+                ocrEngineOverride,
                 externalOcrConfirmed,
                 (p) => {
                   const base = Math.round((completed / files.length) * 100);
@@ -684,6 +765,7 @@ export function useDocuments() {
                 documentType,
                 embeddingMode,
                 ocrMode,
+                ocrEngineOverride,
                 externalOcrConfirmed
               );
         completed += 1;
@@ -738,8 +820,9 @@ export function useDocuments() {
   );
 
   useEffect(() => {
+    if (authBootstrapStatus !== "ready") return;
     refreshDocuments();
-  }, [refreshDocuments]);
+  }, [authBootstrapStatus, refreshDocuments]);
 
   return {
     documents,

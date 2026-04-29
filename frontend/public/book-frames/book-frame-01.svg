@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background (faded) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2" opacity="0.9"/>
+  <rect x="14" y="14" width="460" height="620" rx="20" ry="20" fill="rgba(40,38,34,0.18)" stroke="none" opacity="0.9"/>
+  
+  <!-- Book spine (left edge) -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Flipping page (rotate -15 degrees around left edge) -->
+  <g transform="rotate(-15, 0, 310)">
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2"/>
+    
+    <!-- Inner border -->
+    <rect x="12" y="12" width="436" height="596" rx="14" ry="14" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="1"/>
+    
+    <!-- Title area (slightly distorted) -->
+    <g transform="translate(230, 80)">
+      <text text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="900" fill="white" opacity="0.7" letter-spacing="0.25em">DOODLE BOOK</text>
+      <text text-anchor="middle" font-family="Arial, sans-serif" font-size="48" font-weight="900" fill="white" letter-spacing="0.12em" y="60">上传区</text>
+    </g>
+    
+    <!-- Content box (perspective distortion) -->
+    <rect x="50" y="150" width="360" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2" opacity="0.9"/>
+  </g>
+  
+  <!-- Shadow under lifting page -->
+  <ellipse cx="100" cy="310" rx="80" ry="20" fill="rgba(0,0,0,0.1)"/>
+</svg>
