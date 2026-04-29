@@ -13,8 +13,12 @@ from . import knowledge_store
 from .billing_mode import is_self_hosted_embedding_billing
 
 from .free_ai_router import FreeAIRouter
-from services.memory.pattern_separator import PatternSeparator
 from .text_cleanup import strip_layout_noise
+
+try:
+    from services.memory.pattern_separator import PatternSeparator
+except Exception:  # pragma: no cover - optional experimental module
+    PatternSeparator = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
