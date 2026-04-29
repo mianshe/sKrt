@@ -3763,7 +3763,6 @@ upload_ingestion_service = UploadIngestionService(
     agent_chains=agent_chains,
     parser=parser,
     runtime_config=RUNTIME_CONFIG,
-        pattern_separator=pattern_separator,
 )
 deep_pipeline_service = DeepPipelineService(
     database_url=RUNTIME_CONFIG.postgres.database_url,
