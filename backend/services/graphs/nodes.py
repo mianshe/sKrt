@@ -5,7 +5,14 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .state import build_reasoning_gates, normalize_evidence, parse_json_object, sanitize_answer, sanitize_brief_reasoning
-from ..teaching_optimizer import TeachingOptimizer, create_teaching_optimizer
+
+try:
+    from ..teaching_optimizer import TeachingOptimizer, create_teaching_optimizer
+except Exception:  # pragma: no cover - optional experimental module
+    TeachingOptimizer = Any  # type: ignore[misc,assignment]
+
+    def create_teaching_optimizer(ai_router: Any) -> Any:
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +31,7 @@ class GraphNodes:
     
     async def _optimize_with_timeout(self, concept: str, text: str, context: str) -> str:
         """带超时保护的教学优化"""
-        if not ENABLE_TEACHING_OPTIMIZATION or not text.strip():
+        if not ENABLE_TEACHING_OPTIMIZATION or not text.strip() or self.teaching_optimizer is None:
             return text
             
         try:
