@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background (faded) -->
+  <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2" opacity="0.6"/>
+  <rect x="14" y="14" width="460" height="620" rx="20" ry="20" fill="rgba(40,38,34,0.12)" stroke="none" opacity="0.6"/>
+  
+  <!-- Book spine -->
+  <rect x="0" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Flipping page (rotate -60 degrees) - mostly edge view -->
+  <g transform="rotate(-60, 0, 310)">
+    <!-- Just show edge of page -->
+    <rect x="0" y="0" width="460" height="620" rx="20" ry="20" fill="#90aee5" stroke="#39342d" stroke-width="2"/>
+  </g>
+  
+  <!-- Edge highlight -->
+  <rect x="0" y="0" width="2" height="620" fill="#cccccc" stroke="#999999" stroke-width="0.5"/>
+  
+  <!-- Strong shadow -->
+  <ellipse cx="25" cy="310" rx="40" ry="35" fill="rgba(0,0,0,0.25)"/>
+</svg>

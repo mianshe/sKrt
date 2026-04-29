@@ -6,9 +6,10 @@ from .state import GraphState
 
 
 class AgentChains:
-    def __init__(self, ai_router: Any, rag_engine: Any) -> None:
-        self.runtime = GraphRuntime()
-        self.nodes = GraphNodes(ai_router=ai_router, rag_engine=rag_engine)
+    def __init__(self, ai_router: Any, rag_engine: Any, memory_hook: Any = None) -> None:
+        self.runtime = GraphRuntime(memory_hook=memory_hook)
+        self.nodes = GraphNodes(ai_router=ai_router, rag_engine=rag_engine, memory_hook=memory_hook)
+        self.memory_hook = memory_hook
 
     async def run_ingestion_graph(
         self,
@@ -42,6 +43,7 @@ class AgentChains:
         query: str,
         discipline: str,
         mode: str,
+        document_id: int | None = None,
         embedding_mode: str = "auto",
         tenant_id: str = "public",
         billing_client_id: str = "",
@@ -58,6 +60,8 @@ class AgentChains:
             "top_k": 6,
             "agent_trace": [],
         }
+        if isinstance(document_id, int) and document_id > 0:
+            initial["document_id"] = document_id
         result = await self.runtime.run(
             graph_name="chat",
             initial_state=initial,
@@ -93,6 +97,7 @@ class AgentChains:
         summary_debug_passthrough: bool = False,
         summary_compact_level: int = 1,
         summary_mode: str = "fast",
+        _progress_callback=None,
     ) -> Dict[str, Any]:
         initial: GraphState = {
             "query": query,
@@ -110,6 +115,8 @@ class AgentChains:
         }
         if isinstance(document_id, int) and document_id > 0:
             initial["document_id"] = document_id
+        if callable(_progress_callback):
+            initial["_progress_callback"] = _progress_callback
         result = await self.runtime.run(
             graph_name="summary",
             initial_state=initial,
@@ -140,8 +147,8 @@ class AgentChains:
         tenant_id: str = "public",
         billing_client_id: str = "",
         billing_exempt: bool = False,
-        report_mode: str = "full",
         summary_compact_level: int = 1,
+        _progress_callback=None,
     ) -> Dict[str, Any]:
         initial: GraphState = {
             "query": query,
@@ -153,11 +160,12 @@ class AgentChains:
             "top_k": 16,
             "summary_mode": "full",
             "summary_compact_level": int(summary_compact_level),
-            "report_mode": str(report_mode or "full"),
             "agent_trace": [],
         }
         if isinstance(document_id, int) and document_id > 0:
             initial["document_id"] = document_id
+        if callable(_progress_callback):
+            initial["_progress_callback"] = _progress_callback
         result = await self.runtime.run(
             graph_name="report",
             initial_state=initial,
@@ -183,6 +191,7 @@ class AgentChains:
         discipline: str,
         tenant_id: str = "public",
         question_type: str = "standard",
+        question_context: str = "",
         billing_client_id: str = "",
         billing_exempt: bool = False,
     ) -> Dict[str, Any]:
@@ -195,6 +204,7 @@ class AgentChains:
             "top_k": 4,
             "agent_trace": [],
             "question_type": question_type,
+            "question_context": question_context,
         }
         result = await self.runtime.run(
             graph_name="exam",

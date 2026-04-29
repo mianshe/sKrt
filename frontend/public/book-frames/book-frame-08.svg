@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Book spine (center) -->
+  <rect x="230" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Left page (fully visible) -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+  
+  <!-- Left page content -->
+  <rect x="30" y="50" width="170" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.25)"/>
+  <rect x="30" y="80" width="150" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.25)"/>
+  <rect x="30" y="150" width="120" height="60" rx="8" ry="8" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+  <text x="90" y="180" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666666">笔记</text>
+  
+  <!-- Right page (knowledge page, mostly visible) -->
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#999999" stroke-width="1" opacity="0.7"/>
+  
+  <!-- Right page content -->
+  <text x="349" y="80" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#39342d" opacity="0.7">解析页/text>
+  <text x="349" y="110" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#666666" opacity="0.7">知识已加载/text>
+</svg>

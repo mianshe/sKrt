@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from .base import PaymentProvider
 from .easypay_provider import EasyPayProvider
 from .jeepay_provider import JeepayProvider
+from .manual_qr_provider import ManualQrProvider
 from .paypal_provider import PayPalProvider
 from .xpay_provider import XPayProvider
 
@@ -19,4 +20,6 @@ def get_payment_provider(provider_name: str) -> PaymentProvider:
         return PayPalProvider()
     if provider == "xpay":
         return XPayProvider()
+    if provider == "manual_qr":
+        return ManualQrProvider()
     raise HTTPException(status_code=503, detail=f"不支持的支付通道: {provider}")

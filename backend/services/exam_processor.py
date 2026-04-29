@@ -1,3 +1,4 @@
+import asyncio
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,8 +26,13 @@ class ExamProcessor:
         billing_client_id: str = "",
         billing_exempt: bool = False,
     ) -> Dict[str, Any]:
-        questions = self._split_questions(exam_text)
+        heuristic_questions = self._split_questions(exam_text)
+        agent_questions = await self._split_questions_with_agent(exam_text, heuristic_questions)
+        questions = self._choose_best_question_split(heuristic_questions, agent_questions)
         stats = self._difficulty_stats(questions)
+        question_tree = self._build_question_tree(questions)
+        structure_summary = self._summarize_exam_structure(questions, question_tree)
+        exam_profile = self._infer_exam_profile(questions, question_tree, discipline)
         recommendations = await self._recommend(
             questions,
             discipline,
@@ -38,6 +44,9 @@ class ExamProcessor:
             "question_count": len(questions),
             "difficulty": stats,
             "questions": questions,
+            "question_tree": question_tree,
+            "structure_summary": structure_summary,
+            "exam_profile": exam_profile,
             "recommendations": recommendations,
         }
 
@@ -64,6 +73,13 @@ class ExamProcessor:
             billing_exempt=billing_exempt,
         )
         analysis["questions"] = answered_questions
+        analysis["question_tree"] = self._build_question_tree(answered_questions)
+        analysis["structure_summary"] = self._summarize_exam_structure(answered_questions, analysis["question_tree"])
+        analysis["exam_profile"] = self._infer_exam_profile(
+            answered_questions,
+            analysis["question_tree"],
+            discipline,
+        )
         analysis["qa_regression_gates"] = self._aggregate_regression_gates(answered_questions)
         return analysis
 
@@ -111,6 +127,33 @@ class ExamProcessor:
         r"(?:^|\n)\s*([A-Ha-h])\s*[.、．:：)）]\s*(.+?)(?=\n\s*[A-Ha-h]\s*[.、．:：)）]|\Z)",
         re.DOTALL,
     )
+
+    _SAFE_MARKER_PATTERNS: List[Tuple[str, Any]] = [
+        ("chapter", re.compile(r"^\s*第\s*([0-9\u4e00-\u9fff]{1,4})\s*[题章节]\s*[\.\u3001\uff0e:：\)]?\s*")),
+        ("q_num", re.compile(r"^\s*Q\s*(\d{1,3})\s*[\.\):：\uff09]?\s*", re.IGNORECASE)),
+        ("paren_num", re.compile(r"^\s*[\(\uff08]\s*(\d{1,3})\s*[\)\uff09]\s*")),
+        ("num_dot", re.compile(r"^\s*(\d{1,3})\s*[\.\u3001\uff0e:：\)\uff09]\s*")),
+        ("circled", re.compile(r"^\s*([\u2460-\u2473])\s*")),
+        ("zh_big", re.compile(r"^\s*([一二三四五六七八九十百千零]{1,4})\s*[、\.\uff0e]\s*")),
+    ]
+    _INLINE_QUESTION_BOUNDARY = re.compile(
+        r"(?<!\n)(?:(?<=[\s\u3000])|(?<=[。！？；;:：]))"
+        r"(?=(?:第\s*[0-9\u4e00-\u9fff]{1,4}\s*[题章节]|Q\s*\d{1,3}\s*[\.\):：\uff09]?|(?:\d{1,3}|[\u2460-\u2473])\s*[\.\u3001\uff0e:：\)\uff09]|[一二三四五六七八九十百千零]{1,4}\s*[、\.\uff0e]))",
+        re.IGNORECASE,
+    )
+    _CN_NUMBER_MAP: Dict[str, int] = {
+        "\u96f6": 0,
+        "\u4e00": 1,
+        "\u4e8c": 2,
+        "\u4e09": 3,
+        "\u56db": 4,
+        "\u4e94": 5,
+        "\u516d": 6,
+        "\u4e03": 7,
+        "\u516b": 8,
+        "\u4e5d": 9,
+    }
+    _ANSWER_RATE_LIMIT_RETRY_DELAY_SECONDS = 2.0
 
     _ANSWER_STRATEGY_HINTS: Dict[str, str] = {
         "choice": (
@@ -228,9 +271,12 @@ class ExamProcessor:
             # 追踪大题标题
             if level == 1:
                 current_section_title = clean.split("\n")[0][:80]
-                parent_paths[level] = number_path
-            else:
-                parent_paths[level] = number_path
+            if self._is_section_header_block(clean, marker_type=marker_type, level=level):
+                for k in list(parent_paths.keys()):
+                    if k >= level:
+                        del parent_paths[k]
+                continue
+            parent_paths[level] = number_path
 
             question_type = self._infer_question_type(clean, section_context=current_section_title)
             score = self._difficulty_score(clean, question_type=question_type)
@@ -285,8 +331,58 @@ class ExamProcessor:
         out = self._detect_material_groups(out)
         return out
 
+    async def _split_questions_with_agent(
+        self,
+        text: str,
+        heuristic_questions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        if self.ai_router is None:
+            return None
+        snippet = (text or "").strip()
+        if not snippet:
+            return None
+        prompt = self._build_question_split_prompt(
+            snippet[:12000],
+            heuristic_count=len(heuristic_questions or []),
+        )
+        try:
+            resp = await self.ai_router.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an exam structure parser. Return JSON only. "
+                            "Do not answer the exam. Do not include markdown fences."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1800,
+                temperature=0.1,
+            )
+        except Exception:
+            return None
+        content = str(resp.get("content", "")).strip()
+        return self._parse_question_split_contract(content)
+
+    def _choose_best_question_split(
+        self,
+        heuristic_questions: List[Dict[str, Any]],
+        agent_questions: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        if not agent_questions:
+            return heuristic_questions
+        if not heuristic_questions:
+            return agent_questions
+        if len(agent_questions) == 1 and len(heuristic_questions) >= 3:
+            return heuristic_questions
+        if len(agent_questions) < max(2, len(heuristic_questions) // 3):
+            return heuristic_questions
+        return agent_questions
+
     def _split_blocks(self, text: str) -> List[str]:
-        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        normalized = self._normalize_text_for_question_split(text)
+        lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
         if not lines:
             return []
         blocks: List[str] = []
@@ -303,6 +399,16 @@ class ExamProcessor:
         return blocks
 
     def _parse_leading_marker(self, block: str) -> Optional[Dict[str, Any]]:
+        for marker_type, pattern in self._SAFE_MARKER_PATTERNS:
+            m = pattern.match(block)
+            if not m:
+                continue
+            raw = (m.group(1) or "").strip()
+            return {
+                "type": marker_type,
+                "raw": raw,
+                "number": self._marker_to_number(raw),
+            }
         for marker_type, pattern in self._MARKER_PATTERNS:
             m = pattern.match(block)
             if not m:
@@ -328,6 +434,9 @@ class ExamProcessor:
         }
         if raw in circled_map:
             return circled_map[raw]
+        safe_cn_number = self._parse_cn_number(raw)
+        if safe_cn_number is not None:
+            return safe_cn_number
         zh_digits = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
         if all(ch in "一二三四五六七八九十百千零" for ch in raw):
             if raw == "十":
@@ -340,6 +449,164 @@ class ExamProcessor:
                 return val if val > 0 else None
             return zh_digits.get(raw)
         return None
+
+    def _normalize_text_for_question_split(self, text: str) -> str:
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(r"[ \t\u3000]+", " ", normalized)
+        normalized = self._INLINE_QUESTION_BOUNDARY.sub("\n", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized
+
+    def _parse_cn_number(self, raw: str) -> Optional[int]:
+        token = str(raw or "").strip()
+        if not token:
+            return None
+        if token == "\u5341":
+            return 10
+        if any(ch not in "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u96f6" for ch in token):
+            return None
+        if "\u5341" in token:
+            left, right = token.split("\u5341", 1)
+            tens = self._CN_NUMBER_MAP.get(left, 1 if left == "" else 0)
+            ones = self._CN_NUMBER_MAP.get(right, 0) if right else 0
+            value = tens * 10 + ones
+            return value if value > 0 else None
+        return self._CN_NUMBER_MAP.get(token)
+
+    def _build_question_split_prompt(self, text: str, heuristic_count: int = 0) -> str:
+        return (
+            "请把下面整份试卷拆分成“真正需要作答的题目”列表，并只返回 JSON。\n"
+            "要求：\n"
+            "1. 大题标题如“单项选择题、简答题、材料分析题”不算题目，不要单独输出。\n"
+            "2. 真正需要回答的题目才输出；如果某题包含小题，使用 number_path 表示层级，如 4.1、4.2。\n"
+            "3. section_title 填所属大题标题；parent_path 填上级题号，没有则为 null。\n"
+            "4. question_type 只能取 choice/fill_blank/true_false/short_answer/essay/calculation/proof/design/material_analysis/standard。\n"
+            f"5. 当前本地规则初判题数约为 {heuristic_count}，但你要以试卷真实结构为准，不要机械沿用。\n"
+            "6. 返回格式：\n"
+            "{\n"
+            '  "questions": [\n'
+            '    {"number_path":"1","parent_path":null,"section_title":"单项选择题","text":"题目全文","question_type":"choice","material_text":null},\n'
+            '    {"number_path":"4","parent_path":null,"section_title":"简答题","text":"审核选择题题目设计……","question_type":"design","material_text":null}\n'
+            "  ]\n"
+            "}\n\n"
+            "试卷原文如下：\n"
+            f"{text}"
+        )
+
+    def _parse_question_split_contract(self, text: str) -> Optional[List[Dict[str, Any]]]:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        cleaned = raw
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if len(lines) >= 2 and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                cleaned = "\n".join(lines).strip()
+        parsed = FreeAIRouter.safe_json_loads(cleaned, None)
+        if not isinstance(parsed, dict):
+            return None
+        rows = parsed.get("questions")
+        if not isinstance(rows, list):
+            return None
+
+        out: List[Dict[str, Any]] = []
+        for idx, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            text_value = str(row.get("text", "")).strip()
+            if not text_value:
+                continue
+            if bool(row.get("is_section_header")):
+                continue
+            number_path = self._normalize_number_path(row.get("number_path") or row.get("number") or str(idx))
+            parent_path = self._normalize_number_path(row.get("parent_path"))
+            if not parent_path and "." in number_path:
+                parent_path = number_path.rsplit(".", 1)[0]
+            section_title = str(row.get("section_title", "")).strip() or None
+            question_type = str(row.get("question_type", "")).strip()
+            if question_type not in {
+                "choice",
+                "fill_blank",
+                "true_false",
+                "short_answer",
+                "essay",
+                "calculation",
+                "proof",
+                "design",
+                "material_analysis",
+                "standard",
+            }:
+                question_type = self._infer_question_type(text_value, section_context=section_title or "")
+            score = self._difficulty_score(text_value, question_type=question_type)
+            options = self._extract_options(text_value) if question_type == "choice" else []
+            out.append(
+                {
+                    "id": len(out) + 1,
+                    "text": text_value[:1200],
+                    "difficulty_score": score,
+                    "difficulty_level": self._level(score),
+                    "level": number_path.count(".") + 1,
+                    "number_path": number_path,
+                    "marker_type": "agent",
+                    "question_type": question_type,
+                    "options": options,
+                    "material_id": None,
+                    "material_text": str(row.get("material_text", "")).strip() or None,
+                    "parent_path": parent_path or None,
+                    "section_title": section_title,
+                }
+            )
+        return out or None
+
+    def _normalize_number_path(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        normalized = raw.replace("．", ".").replace("。", ".").replace("、", ".")
+        normalized = normalized.replace("（", "(").replace("）", ")")
+        normalized = re.sub(r"[()]", "", normalized)
+        normalized = re.sub(r"[^0-9A-Za-z.\-]+", ".", normalized)
+        normalized = re.sub(r"\.{2,}", ".", normalized).strip(".")
+        return normalized
+
+    def _is_section_header_block(self, text: str, marker_type: str, level: int) -> bool:
+        if level != 1 and marker_type not in {"zh_big", "chapter"}:
+            return False
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not compact:
+            return False
+        first_line = compact.split("\n", 1)[0].strip()
+        if len(compact) > 90 or len(first_line) > 50:
+            return False
+        if any(token in compact for token in ["?", "？", "A.", "B.", "C.", "D.", "A、", "B、", "C、", "D、"]):
+            return False
+        question_cues = ["请", "说明", "分析", "计算", "证明", "回答", "作答", "根据", "为什么", "如何", "是否"]
+        if any(cue in compact for cue in question_cues):
+            return False
+        header_keywords = [
+            "选择题",
+            "单项选择",
+            "多项选择",
+            "判断题",
+            "填空题",
+            "简答题",
+            "论述题",
+            "计算题",
+            "证明题",
+            "材料分析",
+            "案例分析",
+            "综合题",
+            "阅读理解",
+            "作文题",
+        ]
+        if any(keyword in compact for keyword in header_keywords):
+            return True
+        if any(token in compact for token in ["本题", "每题", "共", "分"]) and len(compact) <= 60:
+            return True
+        return False
 
     def _infer_question_type(self, text: str, section_context: str = "") -> str:
         sc_lower = (section_context or "").lower()
@@ -460,14 +727,17 @@ class ExamProcessor:
         if not questions:
             return []
         query = " ".join(q["text"] for q in questions[:3])[:1200]
-        found = await self.rag_engine.hybrid_search(
-            query=query,
-            discipline_filter=discipline,
-            top_k=5,
-            tenant_id=tenant_id,
-            billing_client_id=billing_client_id,
-            billing_exempt=billing_exempt,
-        )
+        try:
+            found = await self.rag_engine.hybrid_search(
+                query=query,
+                discipline_filter=discipline,
+                top_k=5,
+                tenant_id=tenant_id,
+                billing_client_id=billing_client_id,
+                billing_exempt=billing_exempt,
+            )
+        except Exception as exc:
+            return self._build_recommendation_failure_result(exc)
         recs = []
         for i, row in enumerate(found["results"]):
             recs.append(
@@ -479,6 +749,28 @@ class ExamProcessor:
                 }
             )
         return recs
+
+    def _build_recommendation_failure_result(self, exc: Exception) -> List[Dict[str, Any]]:
+        message = str(exc).strip()
+        lowered = message.lower()
+        status_code = getattr(exc, "status_code", None)
+        is_rate_limited = status_code == 429 or "429" in lowered or "too many requests" in lowered
+        if is_rate_limited:
+            reason = "推荐资料检索暂时触发限流，已跳过推荐步骤，不影响试卷主体解析。"
+            fallback_reason = "rate_limited"
+        else:
+            reason = "推荐资料检索暂时失败，已跳过推荐步骤，不影响试卷主体解析。"
+            fallback_reason = "recommendation_unavailable"
+        return [
+            {
+                "rank": 1,
+                "title": "推荐资料暂不可用",
+                "section_path": "system/fallback",
+                "reason": reason,
+                "fallback_reason": fallback_reason,
+                "error_detail": message[:240],
+            }
+        ]
 
     async def _answer_questions(
         self,
@@ -579,6 +871,14 @@ class ExamProcessor:
                 max_tokens=520,
                 temperature=0.2,
             )
+            if self._should_retry_chat_response(resp):
+                resp = await self._retry_question_chat_after_backoff(
+                    chat_messages,
+                    max_tokens=520,
+                    temperature=0.2,
+                )
+                if self._should_retry_chat_response(resp):
+                    return self._build_answer_failure_result(item, RuntimeError("answer provider unavailable after retry"))
             structured = self._parse_answer_contract(str(resp.get("content", "")))
             answer_text = structured["answer"] or "未生成有效答案。"
             brief_reasoning = self._sanitize_brief_reasoning(structured["brief_reasoning"])
@@ -602,13 +902,38 @@ class ExamProcessor:
         return answered
 
     def _build_agent_query(self, question: str, question_type: str, material_text: str = "") -> str:
-        hint = self._ANSWER_STRATEGY_HINTS.get(question_type, "")
+        hint = self._resolve_question_type_hint(question_type, question, material_text=material_text)
         parts = [question]
         if material_text:
             parts.append(f"\n\n【相关材料】\n{material_text[:1200]}")
         if hint:
             parts.append(f"\n\n{hint}\n输出仍需遵循简版思路与证据可追溯。")
         return "".join(parts)
+
+    def _resolve_question_type_hint(self, question_type: str, question: str, material_text: str = "") -> str:
+        hint = self._ANSWER_STRATEGY_HINTS.get(question_type, "")
+        combined = f"{question}\n{material_text}".lower()
+        review_keywords = [
+            "审核",
+            "评价",
+            "评估",
+            "改进",
+            "优化",
+            "题目设计",
+            "试题设计",
+            "命题",
+            "干扰项",
+            "选项设计",
+        ]
+        if question_type in {"design", "short_answer", "standard"} and any(keyword in combined for keyword in review_keywords):
+            return (
+                "【题型：题目设计/审核题】\n"
+                "1) 先判断原题设计目标、考查点与适配对象；\n"
+                "2) 明确指出题干、选项、干扰项、表述边界中的问题；\n"
+                "3) 给出可执行的修改建议或重写版本；\n"
+                "4) 如果涉及选择题，需单独评价正确项唯一性、干扰项质量和歧义风险。"
+            )
+        return hint
 
     def _build_answer_prompt(
         self,
@@ -640,7 +965,7 @@ class ExamProcessor:
             "  }\n"
             "}"
         )
-        type_hint = self._ANSWER_STRATEGY_HINTS.get(question_type, "")
+        type_hint = self._resolve_question_type_hint(question_type, question, material_text=material_text)
         if type_hint:
             type_hint = f"{type_hint}\n"
         material_section = ""
@@ -682,6 +1007,928 @@ class ExamProcessor:
             f"题目：{question}\n\n证据来源：{evidence_text}\n\n参考资料：\n{context_text}\n\n"
             f"返回结构：\n{output_contract}"
         )
+
+    async def _answer_questions(
+        self,
+        questions: List[Dict[str, Any]],
+        discipline: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+    ) -> List[Dict[str, Any]]:
+        if not questions:
+            return []
+
+        normalized = [dict(item) for item in questions]
+        path_map: Dict[str, Dict[str, Any]] = {}
+        children_map: Dict[str, List[Dict[str, Any]]] = {}
+        ordered_paths: List[str] = []
+
+        for item in normalized:
+            path = str(item.get("number_path") or item.get("id") or "").strip()
+            if not path:
+                path = str(len(ordered_paths) + 1)
+                item["number_path"] = path
+            path_map[path] = item
+            children_map.setdefault(path, [])
+            ordered_paths.append(path)
+
+        roots: List[Dict[str, Any]] = []
+        for item in normalized:
+            parent_path = str(item.get("parent_path") or "").strip()
+            if parent_path and parent_path in path_map:
+                children_map.setdefault(parent_path, []).append(item)
+            else:
+                roots.append(item)
+
+        for child_items in children_map.values():
+            child_items.sort(key=self._question_sort_key)
+        roots.sort(key=self._question_sort_key)
+
+        answered_cache: Dict[str, Dict[str, Any]] = {}
+
+        async def solve(item: Dict[str, Any]) -> Dict[str, Any]:
+            path = str(item.get("number_path") or item.get("id") or "").strip()
+            if path in answered_cache:
+                return answered_cache[path]
+
+            answered_children: List[Dict[str, Any]] = []
+            for child in children_map.get(path, []):
+                answered_children.append(await solve(child))
+
+            if answered_children:
+                solved = self._build_group_question_summary(item, answered_children, path_map)
+            else:
+                solved = await self._answer_single_question_resilient(
+                    item,
+                    discipline,
+                    tenant_id=tenant_id,
+                    billing_client_id=billing_client_id,
+                    billing_exempt=billing_exempt,
+                    path_map=path_map,
+                    children_map=children_map,
+                )
+
+            solved["child_count"] = len(answered_children)
+            solved["node_kind"] = "group" if answered_children else "leaf"
+            solved["child_question_paths"] = [str(child.get("number_path", "")).strip() for child in answered_children]
+            solved["question_context"] = self._build_question_context(item, path_map, children_map)
+            solved["subtree_summary"] = self._build_subtree_summary(solved, answered_children)
+            answered_cache[path] = solved
+            return solved
+
+        for root in roots:
+            await solve(root)
+
+        return [answered_cache[path] for path in ordered_paths if path in answered_cache]
+
+    async def _answer_single_question(
+        self,
+        item: Dict[str, Any],
+        discipline: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+        path_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        children_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
+        query = str(item.get("text", "")).strip()
+        question_type = str(item.get("question_type", "standard"))
+        material_text = str(item.get("material_text") or "")
+        hierarchy_context = self._build_question_context(item, path_map or {}, children_map or {})
+        retrieval_query = self._build_retrieval_query(item, path_map or {})
+        enriched_query = self._build_agent_query(
+            query,
+            question_type,
+            material_text=material_text,
+            hierarchy_context=hierarchy_context,
+        )
+
+        if self.agent_chains is not None:
+            try:
+                graph_result = await self.agent_chains.run_exam_graph(
+                    query=enriched_query,
+                    discipline=discipline,
+                    tenant_id=tenant_id,
+                    question_type=question_type,
+                    question_context=hierarchy_context,
+                    billing_client_id=billing_client_id,
+                    billing_exempt=billing_exempt,
+                )
+            except Exception as exc:
+                if self._is_rate_limited_error(exc):
+                    try:
+                        await asyncio.sleep(self._ANSWER_RATE_LIMIT_RETRY_DELAY_SECONDS)
+                        graph_result = await self.agent_chains.run_exam_graph(
+                            query=enriched_query,
+                            discipline=discipline,
+                            tenant_id=tenant_id,
+                            question_type=question_type,
+                            question_context=hierarchy_context,
+                            billing_client_id=billing_client_id,
+                            billing_exempt=billing_exempt,
+                        )
+                    except Exception as retry_exc:
+                        return self._build_answer_failure_result(item, retry_exc)
+                else:
+                    return self._build_answer_failure_result(item, exc)
+            answer_text = str(graph_result.get("answer", "")).strip() or "未生成有效作答。"
+            brief_reasoning = self._sanitize_brief_reasoning(graph_result.get("brief_reasoning", []))
+            evidence = graph_result.get("evidence", [])
+            strategy = self._normalize_strategy(graph_result.get("answer_strategy", {}))
+            qa_gates = graph_result.get("qa_regression_gates", {})
+            quality_gates = graph_result.get("quality_gates", {})
+            merged_gates = qa_gates if isinstance(qa_gates, dict) else {}
+            if isinstance(quality_gates, dict):
+                merged_gates = {**merged_gates, **quality_gates}
+            if not merged_gates:
+                merged_gates = self._build_qa_gates(answer_text, brief_reasoning, evidence, strategy)
+            return {
+                **item,
+                "ai_answer": answer_text,
+                "brief_reasoning": brief_reasoning,
+                "evidence": evidence,
+                "answer_strategy": strategy,
+                "qa_gates": merged_gates,
+                "agent_trace": graph_result.get("agent_trace", []),
+                "cost_profile": graph_result.get("cost_profile", {}),
+            }
+
+        if self.ai_router is None:
+            answer_text = "当前未配置可用模型，暂时无法自动作答。"
+            brief_reasoning = ["模型未启用，暂时无法生成简版思路。"]
+            strategy = self._empty_strategy()
+            return {
+                **item,
+                "ai_answer": answer_text,
+                "brief_reasoning": brief_reasoning,
+                "evidence": [],
+                "answer_strategy": strategy,
+                "qa_gates": self._build_qa_gates(answer_text, brief_reasoning, [], strategy),
+            }
+
+        try:
+            retrieval = await self.rag_engine.hybrid_search(
+                query=retrieval_query,
+                discipline_filter=discipline,
+                top_k=4,
+                tenant_id=tenant_id,
+                billing_client_id=billing_client_id,
+                billing_exempt=billing_exempt,
+            )
+        except Exception as exc:
+            if self._is_rate_limited_error(exc):
+                try:
+                    retrieval = await self._retry_question_retrieval_after_backoff(
+                        query=retrieval_query,
+                        discipline=discipline,
+                        tenant_id=tenant_id,
+                        billing_client_id=billing_client_id,
+                        billing_exempt=billing_exempt,
+                    )
+                except Exception as retry_exc:
+                    return self._build_answer_failure_result(item, retry_exc)
+            else:
+                return self._build_answer_failure_result(item, exc)
+        contexts = retrieval.get("results", [])
+        evidence = [
+            {
+                "title": str(row.get("title", "未命名来源")),
+                "section_path": str(row.get("section_path", "N/A")),
+                "discipline": str(row.get("discipline", discipline or "all")),
+            }
+            for row in contexts[:3]
+        ]
+        prompt = self._build_answer_prompt(
+            query,
+            contexts,
+            evidence,
+            question_type=question_type,
+            material_text=material_text,
+            hierarchy_context=hierarchy_context,
+        )
+        chat_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "浣犳槸鑰冭瘯绛旈鍔╂墜銆傝鍏堣繘琛屽唴閮ㄦ帹鐞嗭紝浣嗘渶缁堜粎杈撳嚭绾﹀畾 JSON銆?"
+                    "绂佹娉勯湶瀹屾暣鎬濈淮閾炬垨閫愭鎺ㄥ銆?"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            resp = await self.ai_router.chat(
+                [
+                    {
+                    "role": "system",
+                    "content": (
+                        "你是考试答题助手。请先进行内部推理，但最终仅输出约定 JSON。"
+                        "禁止泄露完整思维链或逐步推导。"
+                    ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=520,
+                temperature=0.2,
+            )
+            structured = self._parse_answer_contract(str(resp.get("content", "")))
+        except Exception as exc:
+            if self._is_rate_limited_error(exc):
+                try:
+                    resp = await self._retry_question_chat_after_backoff(
+                        chat_messages,
+                        max_tokens=520,
+                        temperature=0.2,
+                    )
+                    if self._should_retry_chat_response(resp):
+                        return self._build_answer_failure_result(item, RuntimeError("answer provider unavailable after retry"))
+                    structured = self._parse_answer_contract(str(resp.get("content", "")))
+                except Exception as retry_exc:
+                    return self._build_answer_failure_result(item, retry_exc)
+            else:
+                return self._build_answer_failure_result(item, exc)
+        answer_text = structured["answer"] or "未生成有效作答。"
+        brief_reasoning = self._sanitize_brief_reasoning(structured["brief_reasoning"])
+        strategy = self._normalize_strategy(structured["answer_strategy"])
+        qa_gates = self._build_qa_gates(
+            answer=answer_text,
+            brief_reasoning=brief_reasoning,
+            evidence=evidence,
+            strategy=strategy,
+        )
+        return {
+            **item,
+            "ai_answer": answer_text,
+            "brief_reasoning": brief_reasoning,
+            "evidence": evidence,
+            "answer_strategy": strategy,
+            "qa_gates": qa_gates,
+        }
+
+    async def _answer_single_question_resilient(
+        self,
+        item: Dict[str, Any],
+        discipline: str,
+        tenant_id: str = "public",
+        billing_client_id: str = "",
+        billing_exempt: bool = False,
+        path_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        children_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
+        query = str(item.get("text", "")).strip()
+        question_type = str(item.get("question_type", "standard"))
+        material_text = str(item.get("material_text") or "")
+        hierarchy_context = self._build_question_context(item, path_map or {}, children_map or {})
+        retrieval_query = self._build_retrieval_query(item, path_map or {})
+        enriched_query = self._build_agent_query(
+            query,
+            question_type,
+            material_text=material_text,
+            hierarchy_context=hierarchy_context,
+        )
+
+        agent_chain_error: Optional[Exception] = None
+        if self.agent_chains is not None:
+            agent_retry_used = False
+            graph_result: Optional[Dict[str, Any]] = None
+            try:
+                graph_result = await self.agent_chains.run_exam_graph(
+                    query=enriched_query,
+                    discipline=discipline,
+                    tenant_id=tenant_id,
+                    question_type=question_type,
+                    question_context=hierarchy_context,
+                    billing_client_id=billing_client_id,
+                    billing_exempt=billing_exempt,
+                )
+            except Exception as exc:
+                agent_chain_error = exc
+                if self._is_rate_limited_error(exc):
+                    agent_retry_used = True
+                    try:
+                        await asyncio.sleep(self._ANSWER_RATE_LIMIT_RETRY_DELAY_SECONDS)
+                        graph_result = await self.agent_chains.run_exam_graph(
+                            query=enriched_query,
+                            discipline=discipline,
+                            tenant_id=tenant_id,
+                            question_type=question_type,
+                            question_context=hierarchy_context,
+                            billing_client_id=billing_client_id,
+                            billing_exempt=billing_exempt,
+                        )
+                        agent_chain_error = None
+                    except Exception as retry_exc:
+                        agent_chain_error = retry_exc
+            if agent_chain_error is None and graph_result is not None:
+                answer_text = str(graph_result.get("answer", "")).strip() or "未生成有效作答。"
+                brief_reasoning = self._sanitize_brief_reasoning(graph_result.get("brief_reasoning", []))
+                evidence = graph_result.get("evidence", [])
+                strategy = self._normalize_strategy(graph_result.get("answer_strategy", {}))
+                qa_gates = graph_result.get("qa_regression_gates", {})
+                quality_gates = graph_result.get("quality_gates", {})
+                merged_gates = qa_gates if isinstance(qa_gates, dict) else {}
+                if isinstance(quality_gates, dict):
+                    merged_gates = {**merged_gates, **quality_gates}
+                if not merged_gates:
+                    merged_gates = self._build_qa_gates(answer_text, brief_reasoning, evidence, strategy)
+                return {
+                    **item,
+                    "ai_answer": answer_text,
+                    "brief_reasoning": brief_reasoning,
+                    "evidence": evidence,
+                    "answer_strategy": strategy,
+                    "qa_gates": merged_gates,
+                    "agent_trace": graph_result.get("agent_trace", []),
+                    "cost_profile": graph_result.get("cost_profile", {}),
+                    "answer_provider": str(graph_result.get("provider") or "agent-graph"),
+                    "retry_used": agent_retry_used,
+                }
+
+        if self.ai_router is None:
+            if agent_chain_error is not None:
+                return self._build_answer_failure_result(item, agent_chain_error)
+            answer_text = "当前未配置可用模型，暂时无法自动作答。"
+            brief_reasoning = ["模型未启用，暂时无法生成简版思路。"]
+            strategy = self._empty_strategy()
+            return {
+                **item,
+                "ai_answer": answer_text,
+                "brief_reasoning": brief_reasoning,
+                "evidence": [],
+                "answer_strategy": strategy,
+                "qa_gates": self._build_qa_gates(answer_text, brief_reasoning, [], strategy),
+            }
+
+        try:
+            retrieval = await self.rag_engine.hybrid_search(
+                query=retrieval_query,
+                discipline_filter=discipline,
+                top_k=4,
+                tenant_id=tenant_id,
+                billing_client_id=billing_client_id,
+                billing_exempt=billing_exempt,
+            )
+        except Exception as exc:
+            if self._is_rate_limited_error(exc):
+                try:
+                    retrieval = await self._retry_question_retrieval_after_backoff(
+                        query=retrieval_query,
+                        discipline=discipline,
+                        tenant_id=tenant_id,
+                        billing_client_id=billing_client_id,
+                        billing_exempt=billing_exempt,
+                    )
+                except Exception as retry_exc:
+                    return self._build_answer_failure_result(item, retry_exc)
+            else:
+                return self._build_answer_failure_result(item, exc)
+
+        contexts = retrieval.get("results", [])
+        evidence = [
+            {
+                "title": str(row.get("title", "未命名来源")),
+                "section_path": str(row.get("section_path", "N/A")),
+                "discipline": str(row.get("discipline", discipline or "all")),
+            }
+            for row in contexts[:3]
+        ]
+        prompt = self._build_answer_prompt(
+            query,
+            contexts,
+            evidence,
+            question_type=question_type,
+            material_text=material_text,
+            hierarchy_context=hierarchy_context,
+        )
+        chat_messages = self._build_answer_chat_messages(prompt)
+        retry_used = False
+        try:
+            resp = await self.ai_router.chat_with_task(
+                messages=chat_messages,
+                task_type="exam_answer",
+                max_tokens=520,
+                temperature=0.2,
+                prefer_free=False,
+            )
+            if self._should_retry_chat_response(resp):
+                retry_used = True
+                resp = await self._retry_question_chat_after_backoff(
+                    chat_messages,
+                    max_tokens=520,
+                    temperature=0.2,
+                )
+        except Exception as exc:
+            if self._is_rate_limited_error(exc):
+                retry_used = True
+                try:
+                    resp = await self._retry_question_chat_after_backoff(
+                        chat_messages,
+                        max_tokens=520,
+                        temperature=0.2,
+                    )
+                except Exception as retry_exc:
+                    return self._build_answer_failure_result(item, retry_exc)
+            else:
+                return self._build_answer_failure_result(item, exc)
+
+        if self._should_retry_chat_response(resp):
+            return self._build_answer_failure_result(item, RuntimeError("answer provider unavailable after retry"))
+
+        structured = self._parse_answer_contract(str(resp.get("content", "")))
+        answer_text = structured["answer"] or "未生成有效作答。"
+        brief_reasoning = self._sanitize_brief_reasoning(structured["brief_reasoning"])
+        strategy = self._normalize_strategy(structured["answer_strategy"])
+        qa_gates = self._build_qa_gates(
+            answer=answer_text,
+            brief_reasoning=brief_reasoning,
+            evidence=evidence,
+            strategy=strategy,
+        )
+        return {
+            **item,
+            "ai_answer": answer_text,
+            "brief_reasoning": brief_reasoning,
+            "evidence": evidence,
+            "answer_strategy": strategy,
+            "qa_gates": qa_gates,
+            "answer_provider": str(resp.get("provider") or ""),
+            "retry_used": retry_used,
+            "agent_chain_fallback": agent_chain_error is not None,
+        }
+
+    def _is_rate_limited_error(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc).strip().lower()
+        return status_code == 429 or "429" in message or "too many requests" in message or "rate limit" in message
+
+    def _should_retry_chat_response(self, resp: Dict[str, Any]) -> bool:
+        provider = str(resp.get("provider") or "").strip().lower()
+        content = str(resp.get("content") or "").strip()
+        if not content:
+            return True
+        return provider in {"none", "hash-fallback"}
+
+    def _backup_answer_provider_order(self) -> List[str]:
+        return ["transformers-local", "huggingface", "github-models", "zhipu", "gemini"]
+
+    def _build_answer_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are an exam answer assistant. "
+                    "Return valid JSON only. "
+                    "Do not reveal chain-of-thought or step-by-step internal reasoning."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+    async def _retry_question_retrieval_after_backoff(
+        self,
+        *,
+        query: str,
+        discipline: str,
+        tenant_id: str,
+        billing_client_id: str,
+        billing_exempt: bool,
+    ) -> Dict[str, Any]:
+        await asyncio.sleep(self._ANSWER_RATE_LIMIT_RETRY_DELAY_SECONDS)
+        return await self.rag_engine.hybrid_search(
+            query=query,
+            discipline_filter=discipline,
+            top_k=4,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=billing_exempt,
+            embedding_mode="local",
+        )
+
+    async def _retry_question_chat_after_backoff(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> Dict[str, Any]:
+        if self.ai_router is None:
+            return {"provider": "none", "content": "", "task_type": "exam_retry"}
+        await asyncio.sleep(self._ANSWER_RATE_LIMIT_RETRY_DELAY_SECONDS)
+        return await self.ai_router.chat_with_provider_order_override(
+            messages=messages,
+            provider_order=self._backup_answer_provider_order(),
+            task_type="exam_retry",
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    def _build_answer_failure_result(self, item: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc).strip()
+        lowered = message.lower()
+        is_rate_limited = status_code == 429 or "429" in lowered or "too many requests" in lowered
+
+        if is_rate_limited:
+            answer_text = "Auto-answer temporarily failed because the upstream model is rate limited. Please retry later."
+            brief_reasoning = ["This question hit an upstream rate limit, so the exam upload can continue with a fallback result."]
+            fallback_reason = "rate_limited"
+        else:
+            answer_text = "Auto-answer temporarily failed for this question. Please retry later."
+            brief_reasoning = ["This question encountered a transient model or retrieval error, so a fallback result was returned."]
+            fallback_reason = "answer_generation_failed"
+
+        strategy = self._empty_strategy()
+        qa_gates = self._build_qa_gates(answer_text, brief_reasoning, [], strategy)
+        failed_checks = list(qa_gates.get("failed_checks", []))
+        if fallback_reason not in failed_checks:
+            failed_checks.append(fallback_reason)
+        qa_gates["passed"] = False
+        qa_gates["failed_checks"] = failed_checks
+
+        return {
+            **item,
+            "ai_answer": answer_text,
+            "brief_reasoning": brief_reasoning,
+            "evidence": [],
+            "answer_strategy": strategy,
+            "qa_gates": qa_gates,
+            "fallback_reason": fallback_reason,
+            "error_detail": message[:240],
+        }
+
+    def _build_group_question_summary(
+        self,
+        item: Dict[str, Any],
+        answered_children: List[Dict[str, Any]],
+        path_map: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        child_titles = [
+            f"Q{child.get('number_path', child.get('id', ''))} {self._question_preview(child.get('text', ''))}"
+            for child in answered_children[:4]
+        ]
+        focus_lines = self._collect_unique_lines(
+            [line for child in answered_children for line in child.get("brief_reasoning", [])],
+            limit=3,
+        )
+        answer_parts = [f"本题为题组，共 {len(answered_children)} 个子题，建议按顺序递归作答。"]
+        if child_titles:
+            answer_parts.append("优先处理：" + "；".join(child_titles))
+        if focus_lines:
+            answer_parts.append("共性抓手：" + "；".join(focus_lines[:2]))
+        answer_text = "\n".join(answer_parts).strip()
+        evidence = self._aggregate_child_evidence(answered_children, limit=4)
+        strategy = {
+            "concept_induction": self._join_or_default(
+                [child.get("answer_strategy", {}).get("concept_induction", "") for child in answered_children],
+                "先识别大题要求，再定位每个子题的考点。",
+            ),
+            "information_compression": self._join_or_default(
+                [child.get("answer_strategy", {}).get("information_compression", "") for child in answered_children],
+                "提炼各子题共享条件与差异条件，避免重复阅读。",
+            ),
+            "reverse_check": self._join_or_default(
+                [child.get("answer_strategy", {}).get("reverse_check", "") for child in answered_children],
+                "回看子题答案是否与总题干要求冲突。",
+            ),
+            "distractor_design": self._join_or_default(
+                [child.get("answer_strategy", {}).get("distractor_design", "") for child in answered_children],
+                "注意区分总题干公共条件与各子题局部条件。",
+            ),
+        }
+        qa_gates = self._build_qa_gates(answer_text, focus_lines or ["已结合子题结果做递归汇总。"], evidence, strategy)
+        qa_gates["child_pass_rate"] = self._aggregate_child_pass_rate(answered_children)
+        qa_gates["passed"] = bool(qa_gates.get("passed")) and qa_gates["child_pass_rate"] >= 0.5
+        if qa_gates["child_pass_rate"] < 1.0:
+            failed = list(qa_gates.get("failed_checks", []))
+            if "subquestion_consistency" not in failed:
+                failed.append("subquestion_consistency")
+            qa_gates["failed_checks"] = failed
+        return {
+            **item,
+            "ai_answer": answer_text,
+            "brief_reasoning": focus_lines or ["本题需要先理解总题干，再逐层拆解到子题。"],
+            "evidence": evidence,
+            "answer_strategy": strategy,
+            "qa_gates": qa_gates,
+            "agent_trace": self._aggregate_child_traces(answered_children),
+            "cost_profile": {"mode": "recursive-summary", "source": "child-aggregation"},
+        }
+
+    def _build_question_tree(self, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not questions:
+            return []
+        items = [dict(item) for item in questions]
+        path_map = {
+            str(item.get("number_path") or item.get("id") or "").strip(): item
+            for item in items
+            if str(item.get("number_path") or item.get("id") or "").strip()
+        }
+        children_map: Dict[str, List[Dict[str, Any]]] = {path: [] for path in path_map}
+        roots: List[Dict[str, Any]] = []
+        for item in items:
+            path = str(item.get("number_path") or item.get("id") or "").strip()
+            parent_path = str(item.get("parent_path") or "").strip()
+            if parent_path and parent_path in path_map:
+                children_map.setdefault(parent_path, []).append(item)
+            elif path:
+                roots.append(item)
+        for child_items in children_map.values():
+            child_items.sort(key=self._question_sort_key)
+        roots.sort(key=self._question_sort_key)
+
+        def build_node(item: Dict[str, Any]) -> Dict[str, Any]:
+            path = str(item.get("number_path") or item.get("id") or "").strip()
+            child_nodes = [build_node(child) for child in children_map.get(path, [])]
+            summary = str(item.get("subtree_summary") or item.get("ai_answer") or "").strip()
+            return {
+                "id": item.get("id"),
+                "number_path": path,
+                "title": self._question_preview(item.get("text", ""), limit=88),
+                "level": int(item.get("level", 1) or 1),
+                "question_type": str(item.get("question_type", "standard")),
+                "difficulty_level": str(item.get("difficulty_level", "")),
+                "node_kind": str(item.get("node_kind", "group" if child_nodes else "leaf")),
+                "child_count": len(child_nodes),
+                "summary": summary[:180],
+                "children": child_nodes,
+            }
+
+        return [build_node(root) for root in roots]
+
+    def _summarize_exam_structure(
+        self,
+        questions: List[Dict[str, Any]],
+        question_tree: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        total = len(questions)
+        leaf_count = sum(1 for item in questions if not item.get("child_count"))
+        max_depth = max((int(item.get("level", 1) or 1) for item in questions), default=1)
+        type_counter = Counter(str(item.get("question_type", "standard")) for item in questions)
+        dominant_types = [name for name, _ in type_counter.most_common(3)]
+        lines = [
+            f"共 {total} 题，叶子题 {leaf_count} 题，最大层级 {max_depth} 层。",
+            f"主导题型：{' / '.join(dominant_types) if dominant_types else 'standard'}。",
+        ]
+        root_titles = [str(node.get("title", "")).strip() for node in question_tree[:4] if str(node.get("title", "")).strip()]
+        if root_titles:
+            lines.append("顶层结构：" + "；".join(root_titles))
+        return {
+            "total_questions": total,
+            "leaf_questions": leaf_count,
+            "max_depth": max_depth,
+            "dominant_types": dominant_types,
+            "lines": lines,
+        }
+
+    def _infer_exam_profile(
+        self,
+        questions: List[Dict[str, Any]],
+        question_tree: List[Dict[str, Any]],
+        discipline: str,
+    ) -> Dict[str, Any]:
+        max_depth = max((int(item.get("level", 1) or 1) for item in questions), default=1)
+        has_material = any(bool(item.get("material_text")) for item in questions)
+        type_counter = Counter(str(item.get("question_type", "standard")) for item in questions)
+        dominant_types = [name for name, _ in type_counter.most_common(3)]
+        if has_material and max_depth >= 2:
+            label = "材料题 / 复合题结构"
+        elif max_depth >= 3:
+            label = "分层递归试卷"
+        else:
+            label = "标准试卷结构"
+        return {
+            "label": label,
+            "discipline": discipline,
+            "root_count": len(question_tree),
+            "max_depth": max_depth,
+            "dominant_types": dominant_types,
+            "has_material_group": has_material,
+        }
+
+    def _build_question_context(
+        self,
+        item: Dict[str, Any],
+        path_map: Dict[str, Dict[str, Any]],
+        children_map: Dict[str, List[Dict[str, Any]]],
+    ) -> str:
+        path = str(item.get("number_path") or item.get("id") or "").strip()
+        lines = [
+            f"当前题号: Q{path or item.get('id', '')}",
+            f"当前题型: {item.get('question_type', 'standard')}",
+            f"当前层级: {int(item.get('level', 1) or 1)}",
+        ]
+        section_title = str(item.get("section_title") or "").strip()
+        if section_title:
+            lines.append(f"所属大题: {section_title}")
+
+        ancestors = self._ancestor_chain(item, path_map)
+        if ancestors:
+            lines.append("上级题目:")
+            for ancestor in ancestors[-3:]:
+                lines.append(f"- Q{ancestor.get('number_path', '')}: {self._question_preview(ancestor.get('text', ''), limit=72)}")
+
+        children = children_map.get(path, [])
+        if children:
+            lines.append("下级子题:")
+            for child in children[:5]:
+                lines.append(f"- Q{child.get('number_path', '')}: {self._question_preview(child.get('text', ''), limit=72)}")
+
+        return "\n".join(line for line in lines if line).strip()
+
+    def _build_retrieval_query(self, item: Dict[str, Any], path_map: Dict[str, Dict[str, Any]]) -> str:
+        parts = [str(item.get("text", "")).strip()]
+        for ancestor in self._ancestor_chain(item, path_map)[-2:]:
+            ancestor_text = self._question_preview(ancestor.get("text", ""), limit=80)
+            if ancestor_text:
+                parts.append(ancestor_text)
+        material_text = str(item.get("material_text") or "").strip()
+        if material_text:
+            parts.append(self._question_preview(material_text, limit=140))
+        return "\n".join(part for part in parts if part)
+
+    def _build_agent_query(
+        self,
+        question: str,
+        question_type: str,
+        material_text: str = "",
+        hierarchy_context: str = "",
+    ) -> str:
+        hint = self._ANSWER_STRATEGY_HINTS.get(question_type, "")
+        parts = [question]
+        if hierarchy_context:
+            parts.append(f"\n\n【题目结构】\n{hierarchy_context[:900]}")
+        if material_text:
+            parts.append(f"\n\n【相关材料】\n{material_text[:1200]}")
+        if hint:
+            parts.append(f"\n\n{hint}\n输出仍需遵循简版思路与证据可追溯。")
+        return "".join(parts)
+
+    def _build_answer_prompt(
+        self,
+        question: str,
+        contexts: List[Dict[str, Any]],
+        evidence: List[Dict[str, str]],
+        question_type: str = "standard",
+        material_text: str = "",
+        hierarchy_context: str = "",
+    ) -> str:
+        snippets = []
+        for row in contexts[:4]:
+            snippets.append(
+                f"[{row.get('title', '未命名来源')}::{row.get('section_path', 'N/A')}]\n{row.get('content', '')}"
+            )
+        context_text = "\n\n".join(snippets) if snippets else "暂无检索上下文"
+        evidence_text = "；".join(
+            f"{e.get('title', '未命名来源')}({e.get('section_path', 'N/A')})"
+            for e in evidence[:3]
+        ) or "暂无明确证据"
+        output_contract = (
+            "{\n"
+            '  "answer": "最终答案，1-3句",\n'
+            '  "brief_reasoning": ["简版思路1", "简版思路2", "简版思路3(可选)"],\n'
+            '  "answer_strategy": {\n'
+            '    "concept_induction": "题目意图与考点归纳",\n'
+            '    "information_compression": "证据压缩后的关键依据",\n'
+            '    "reverse_check": "反向检验是否与答案冲突",\n'
+            '    "distractor_design": "易错点说明或排除逻辑"\n'
+            "  }\n"
+            "}"
+        )
+        type_hint = self._ANSWER_STRATEGY_HINTS.get(question_type, "")
+        sections: List[str] = [
+            "请回答以下题目，并按约定输出 JSON。",
+            "必须体现：先理解题目层级，再压缩信息，再做反向检验。",
+        ]
+        if type_hint:
+            sections.append(type_hint)
+        if hierarchy_context:
+            sections.append(f"【题目树上下文】\n{hierarchy_context[:1200]}")
+        if material_text:
+            sections.append(f"【相关材料】\n{material_text[:1200]}")
+        sections.extend(
+            [
+                f"题目：{question}",
+                f"证据来源：{evidence_text}",
+                f"参考资料：\n{context_text}",
+                f"返回结构：\n{output_contract}",
+            ]
+        )
+        if PromptTemplate is not None:
+            template = PromptTemplate.from_template("{body}")
+            return template.format(body="\n\n".join(part for part in sections if part))
+        return "\n\n".join(part for part in sections if part)
+
+    def _build_subtree_summary(self, item: Dict[str, Any], answered_children: List[Dict[str, Any]]) -> str:
+        if answered_children:
+            head = str(item.get("ai_answer", "")).strip()
+            if head:
+                return head[:180]
+            child_titles = [f"Q{child.get('number_path', '')}" for child in answered_children[:4]]
+            return f"题组概览：{' / '.join(child_titles)}"
+        answer = str(item.get("ai_answer", "")).strip()
+        return answer[:180] if answer else self._question_preview(item.get("text", ""), limit=120)
+
+    def _aggregate_child_evidence(self, answered_children: List[Dict[str, Any]], limit: int = 4) -> List[Dict[str, str]]:
+        merged: List[Dict[str, str]] = []
+        seen = set()
+        for child in answered_children:
+            for evidence in child.get("evidence", []) or []:
+                key = (
+                    str(evidence.get("title", "")).strip(),
+                    str(evidence.get("section_path", "")).strip(),
+                    str(evidence.get("discipline", "")).strip(),
+                )
+                if key in seen or not key[0]:
+                    continue
+                seen.add(key)
+                merged.append(
+                    {
+                        "title": key[0],
+                        "section_path": key[1] or "N/A",
+                        "discipline": key[2] or "all",
+                    }
+                )
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    def _aggregate_child_traces(self, answered_children: List[Dict[str, Any]], limit: int = 8) -> List[str]:
+        traces: List[str] = []
+        seen = set()
+        for child in answered_children:
+            for step in child.get("agent_trace", []) or []:
+                step_text = str(step).strip()
+                if not step_text or step_text in seen:
+                    continue
+                seen.add(step_text)
+                traces.append(step_text)
+                if len(traces) >= limit:
+                    return traces
+        return traces
+
+    def _aggregate_child_pass_rate(self, answered_children: List[Dict[str, Any]]) -> float:
+        if not answered_children:
+            return 1.0
+        passed = 0
+        for child in answered_children:
+            gates = child.get("qa_gates", {}) if isinstance(child, dict) else {}
+            if isinstance(gates, dict) and gates.get("passed"):
+                passed += 1
+        return round(passed / len(answered_children), 3)
+
+    def _ancestor_chain(
+        self,
+        item: Dict[str, Any],
+        path_map: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        chain: List[Dict[str, Any]] = []
+        parent_path = str(item.get("parent_path") or "").strip()
+        guard = 0
+        while parent_path and parent_path in path_map and guard < 12:
+            parent = path_map[parent_path]
+            chain.append(parent)
+            parent_path = str(parent.get("parent_path") or "").strip()
+            guard += 1
+        chain.reverse()
+        return chain
+
+    def _question_sort_key(self, item: Dict[str, Any]) -> Tuple[Any, ...]:
+        path = str(item.get("number_path") or item.get("id") or "").strip()
+        return self._number_path_key(path)
+
+    def _number_path_key(self, value: str) -> Tuple[Any, ...]:
+        parts = [part for part in str(value or "").split(".") if part]
+        key: List[Any] = []
+        for part in parts:
+            if part.isdigit():
+                key.append(int(part))
+            else:
+                key.append(part)
+        return tuple(key or [999999])
+
+    def _question_preview(self, text: Any, limit: int = 96) -> str:
+        preview = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(preview) <= limit:
+            return preview
+        return f"{preview[: max(8, limit - 1)].rstrip()}…"
+
+    def _collect_unique_lines(self, items: List[Any], limit: int = 3) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for raw in items:
+            text = self._question_preview(raw, limit=120)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _join_or_default(self, items: List[Any], default: str, limit: int = 2) -> str:
+        lines = self._collect_unique_lines(items, limit=limit)
+        return "；".join(lines) if lines else default
 
     def _parse_answer_contract(self, text: str) -> Dict[str, Any]:
         raw = (text or "").strip()

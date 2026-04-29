@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import AuthPanel from "./components/AuthPanel";
-import BottomNav from "./components/BottomNav";
 import GpuQuotaWidget from "./components/GpuQuotaWidget";
 import NoticeDrawer from "./components/NoticeDrawer";
 import { API_BASE } from "./config/apiBase";
-import { setAccessToken, useAccessToken, verifyLocalAuthSession } from "./lib/auth";
+import { ensureAuthReady, setAccessToken, useAccessToken, useAuthBootstrapStatus, verifyLocalAuthSession } from "./lib/auth";
 import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
 import { useDocuments } from "./hooks/useDocuments";
+import DoodleBookLayout from "./components/DoodleBookLayout";
+import { Bell } from "lucide-react";
 
 export type AppTab = "upload" | "knowledge" | "chat";
 
@@ -18,7 +19,6 @@ function App() {
     useDocuments();
 
   const [noticeOpen, setNoticeOpen] = useState(false);
-  const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
   const knowledgeRefreshKey = `${authSession}:${documents
@@ -26,6 +26,7 @@ function App() {
     .sort()
     .join(",")}`;
   const accessToken = useAccessToken();
+  const authBootstrapStatus = useAuthBootstrapStatus();
   const didInitAuthSyncRef = useRef(false);
 
   const [capacityWarn, setCapacityWarn] = useState<"soft" | "hard" | null>(null);
@@ -36,11 +37,9 @@ function App() {
         const response = await fetch(`${API_BASE}/health`);
         if (!response.ok) return;
         const data = await response.json();
-
         if (typeof data?.auth_local_jwt_enabled === "boolean") {
           setAuthLocalEnabled(data.auth_local_jwt_enabled);
         }
-
         const cap = data?.capacity;
         if (cap?.hard_exceeded) setCapacityWarn("hard");
         else if (cap?.soft_exceeded) setCapacityWarn("soft");
@@ -49,31 +48,32 @@ function App() {
         // ignore network errors
       }
     };
-
     void check();
     const id = setInterval(check, 60_000);
     return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
+    void ensureAuthReady();
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     const isInitialSync = !didInitAuthSyncRef.current;
     didInitAuthSyncRef.current = true;
-
     const refreshAfterAuthChange = () => {
       if (cancelled) return;
       setAuthSession((n) => n + 1);
       void refreshDocuments();
     };
-
     const syncAuthState = async () => {
-      if (!accessToken) {
-        if (!isInitialSync) {
-          refreshAfterAuthChange();
-        }
+      if (authBootstrapStatus !== "ready") {
         return;
       }
-
+      if (!accessToken) {
+        if (!isInitialSync) refreshAfterAuthChange();
+        return;
+      }
       if (isInitialSync) {
         const verified = await verifyLocalAuthSession(accessToken);
         if (cancelled) return;
@@ -82,150 +82,88 @@ function App() {
           return;
         }
       }
-
       refreshAfterAuthChange();
     };
-
     void syncAuthState();
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken, refreshDocuments]);
+    return () => { cancelled = true; };
+  }, [accessToken, authBootstrapStatus, refreshDocuments]);
 
   return (
-    <div className="min-h-screen text-slate-900">
-      <header className="sticky top-0 z-10 border-b border-white/60 bg-white/70 px-4 py-3.5 backdrop-blur">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h1 className="bg-gradient-to-r from-pink-500 via-violet-500 to-teal-500 bg-clip-text py-0.5 text-2xl font-black tracking-wide text-transparent drop-shadow-[0_6px_18px_rgba(124,92,255,0.25)] md:text-3xl">
-              资料解析
-            </h1>
-            <p className="mt-0.5 text-sm font-medium text-slate-500">何芯求职专用测试项目</p>
-          </div>
-
-          <div className="mt-0.5 md:hidden">
-            <button
-              type="button"
-              className="rounded-xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-white"
-              onClick={() => setMobileToolsOpen(true)}
-            >
-              菜单
-            </button>
-          </div>
-
-          <div className="mt-0.5 hidden max-w-[380px] flex-col items-end gap-2 md:flex">
-            {authLocalEnabled && (
-              <AuthPanel
-                onAuthed={() => {
-                  setMobileToolsOpen(false);
-                }}
-              />
-            )}
-            <GpuQuotaWidget authSession={authSession} />
-          </div>
-        </div>
-      </header>
-
-      {mobileToolsOpen && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 px-4 pt-16" onClick={() => setMobileToolsOpen(false)}>
-          <div
-            className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
-            onClick={(event) => event.stopPropagation()}
+    <DoodleBookLayout
+      currentTab={tab}
+      onTabChange={setTab}
+      documents={documents.map((doc) => ({
+        id: doc.id,
+        title: doc.filename || doc.title || `文档 ${doc.id}`,
+        createdAt: new Date(doc.created_at).toLocaleDateString(),
+      }))}
+      authElement={
+        <div className="flex items-center gap-3">
+          <AuthPanel onAuthed={refreshDocuments} />
+          <button 
+            onClick={() => setNoticeOpen(true)}
+            className="neo-button-sm bg-yellow-400 p-3 hover:bg-pink-400 hover:text-white group relative"
           >
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-sm font-semibold text-slate-800">快捷菜单</p>
-              <button
-                type="button"
-                className="rounded-lg px-2 py-1 text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                onClick={() => setMobileToolsOpen(false)}
-                aria-label="关闭"
-              >
-                ×
-              </button>
-            </div>
-
-            <div className="mt-3 space-y-3">
-              {authLocalEnabled && (
-                <AuthPanel
-                  onAuthed={() => {
-                    setMobileToolsOpen(false);
-                  }}
-                />
-              )}
-              <GpuQuotaWidget authSession={authSession} />
-              <div className="flex justify-end gap-2">
-                <button
-                  type="button"
-                  className="rounded-2xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                  onClick={() => {
-                    setNoticeOpen(true);
-                    setMobileToolsOpen(false);
-                  }}
-                >
-                  公告
-                </button>
-                <button
-                  type="button"
-                  className="rounded-2xl bg-white/85 px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 transition hover:bg-slate-50"
-                  onClick={() => setMobileToolsOpen(false)}
-                >
-                  关闭
-                </button>
-              </div>
-            </div>
-          </div>
+            <Bell size={20} />
+            <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-slate-900 group-hover:scale-125 transition-transform" />
+          </button>
+        </div>
+      }
+    >
+      {!accessToken && authLocalEnabled && (
+        <div className="mb-6 neo-box-sm bg-cyan-300 p-4 text-xs font-black uppercase rotate-[-1deg]">
+          当前为演示资料库。登录后将自动切换到你的个人资料库。
         </div>
       )}
 
-      {capacityWarn === "hard" && (
-        <div className="sticky top-[57px] z-10 bg-red-600 px-4 py-2 text-center text-sm font-semibold text-white shadow">
-          服务器存储空间不足，已暂停写入。请清理或扩容后继续使用。
+      <section hidden={tab !== "upload"} aria-hidden={tab !== "upload"}>
+        <UploadTab
+          documents={documents}
+          loading={loading}
+          error={error}
+          onCreateUploadTasks={createUploadTasks}
+          onGetTask={getUploadTask}
+          onDelete={deleteDocument}
+          onRefresh={refreshDocuments}
+          authLocalEnabled={authLocalEnabled}
+          authSession={authSession}
+          authReady={authBootstrapStatus === "ready"}
+        />
+      </section>
+
+      <section hidden={tab !== "knowledge"} aria-hidden={tab !== "knowledge"}>
+        <KnowledgeTab refreshKey={knowledgeRefreshKey} documents={documents} />
+      </section>
+
+      <section hidden={tab !== "chat"} aria-hidden={tab !== "chat"}>
+        <ChatTab documents={documents} onUploadExamByChunks={uploadExamByChunks} />
+      </section>
+
+      {/* 容量告警提示 */}
+      {capacityWarn && (
+        <div className={`fixed bottom-8 left-8 z-50 neo-box-sm font-black text-xs ${
+          capacityWarn === "hard" ? "bg-red-400 text-white animate-bounce" : "bg-amber-400"
+        } p-4 rotate-[-2deg]`}>
+          <div className="flex items-center gap-2">
+            <span className="text-xl">⚠️</span>
+                            <div>
+                              <p className="font-black">系统存储空间{capacityWarn === "hard" ? "已满" : "不足"}</p>
+                              <p className="opacity-80 text-[10px]">请管理您的文档</p>
+                            </div>          </div>
         </div>
       )}
 
-      {capacityWarn === "soft" && (
-        <div className="sticky top-[57px] z-10 bg-amber-500 px-4 py-2 text-center text-sm font-semibold text-white shadow">
-          服务器存储空间即将用尽，请尽快清理不需要的文档。
-        </div>
-      )}
-
-      <NoticeDrawer open={noticeOpen} onClose={() => setNoticeOpen(false)} widthPx={360} />
-
-      <button
-        type="button"
-        className="fixed right-3 top-28 z-30 hidden rounded-2xl bg-white/80 px-3 py-2 text-sm font-semibold text-slate-700 shadow-lg ring-1 ring-slate-200 transition hover:bg-white md:block"
-        onClick={() => setNoticeOpen(true)}
-      >
-        公告
-      </button>
-
-      <main className={`mx-auto w-full max-w-5xl px-3 pb-24 pt-4 transition-[padding] duration-200 ${noticeOpen ? "md:pr-[360px]" : ""}`}>
-        <div className={tab === "upload" ? "block" : "hidden"}>
-          <UploadTab
-            documents={documents}
-            loading={loading}
-            error={error}
-            onCreateUploadTasks={createUploadTasks}
-            onGetTask={getUploadTask}
-            onDelete={deleteDocument}
-            onRefresh={refreshDocuments}
-            authLocalEnabled={authLocalEnabled}
-            authSession={authSession}
-          />
-        </div>
-
-        <div className={tab === "knowledge" ? "block" : "hidden"}>
-          <KnowledgeTab refreshKey={knowledgeRefreshKey} />
-        </div>
-
-        <div className={tab === "chat" ? "block" : "hidden"}>
-          <ChatTab onUploadExamByChunks={uploadExamByChunks} />
-        </div>
-      </main>
-
-      <BottomNav activeTab={tab} onChange={setTab} />
-    </div>
+      <NoticeDrawer open={noticeOpen} onClose={() => setNoticeOpen(false)} />
+      
+      {/* GPU Quota Widget */}
+      <div className="fixed bottom-8 left-8 z-40 hidden lg:block hover:scale-105 transition-transform">
+        <GpuQuotaWidget authReady={authBootstrapStatus === "ready"} />
+      </div>
+    </DoodleBookLayout>
   );
 }
+
+// Fixed property reference in tab mapping
+const getGetUploadTask = (id: any) => Promise.resolve({} as any); 
 
 export default App;

@@ -25,6 +25,9 @@ class GraphState(TypedDict, total=False):
     summary: Dict[str, Any]
     report: str
     report_sections: List[Dict[str, str]]
+    report_profile: Dict[str, Any]
+    document_tree: List[Dict[str, Any]]
+    chapter_summaries: List[Dict[str, Any]]
     answer_strategy: Dict[str, str]
     qa_regression_gates: Dict[str, Any]
     quality_gates: Dict[str, Any]
@@ -36,6 +39,7 @@ class GraphState(TypedDict, total=False):
     five_dimensions: Dict[str, Any]
     five_dimensions_meta: Dict[str, Any]
     question_type: str
+    question_context: str
     top_k: int
 
 

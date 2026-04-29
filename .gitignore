@@ -19,6 +19,7 @@ frontend/dist/
 !frontend/.env.example
 *.pem
 *.key
+prompt.txt
 
 # Archives
 *.zip

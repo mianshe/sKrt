@@ -1,4 +1,6 @@
-"""PostgreSQL 访问层：四库流水线 schema 初始化与基础写入。"""
+"""
+PostgreSQL 访问层：四库流水线 schema 初始化与基础写入。
+"""
 from __future__ import annotations
 
 import json
@@ -429,6 +431,42 @@ def insert_reasoning_trace(conn, job_id: str, batch_id: Optional[int], trace_jso
     conn.commit()
 
 
+def insert_fact_staging(
+    conn,
+    job_id: str,
+    batch_id: Optional[int],
+    fact_text: str,
+    source_chunk_id: Optional[str] = None,
+    section_path: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO fact_staging (job_id, batch_id, fact_text, source_chunk_id, section_path, metadata)
+            VALUES (%s::uuid, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                job_id,
+                batch_id,
+                fact_text,
+                source_chunk_id,
+                section_path,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+    conn.commit()
+
+
+def fetch_facts_for_job(conn, job_id: str) -> List[Dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM fact_staging WHERE job_id = %s::uuid ORDER BY id",
+            (job_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 def insert_presentation_tree(conn, job_id: str, sqlite_document_id: int, meta: Dict[str, Any]) -> int:
     with conn.cursor() as cur:
         cur.execute(
@@ -727,3 +765,88 @@ def compact_validation_subgraph_for_prompt(conn, job_id: str, segment_id: int, m
     if len(raw) <= max_chars:
         return raw
     return raw[:max_chars] + "…"
+
+
+# 创建一个兼容层对象
+class postgres_store:
+    """兼容层对象，用于支持现有代码中的 pg.xxx() 调用模式"""
+    
+    @staticmethod
+    def connect(database_url: str):
+        return connect(database_url)
+    
+    @staticmethod
+    def set_request_context(conn, tenant_id: str, user_id: str, roles: Optional[List[str]] = None) -> None:
+        return set_request_context(conn, tenant_id, user_id, roles)
+    
+    @staticmethod
+    def init_schema(conn) -> None:
+        return init_schema(conn)
+    
+    @staticmethod
+    def insert_job(conn, job_id: str, tenant_id: str, sqlite_document_id: int, discipline: str, config: Dict[str, Any], pipeline_version: int = 1) -> None:
+        return insert_job(conn, job_id, tenant_id, sqlite_document_id, discipline, config, pipeline_version)
+    
+    @staticmethod
+    def update_job_status(conn, job_id: str, status: str, error_message: Optional[str] = None, result_summary: Optional[Dict[str, Any]] = None) -> None:
+        return update_job_status(conn, job_id, status, error_message, result_summary)
+    
+    @staticmethod
+    def fetch_job(conn, job_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return fetch_job(conn, job_id, tenant_id)
+    
+    @staticmethod
+    def insert_ingest_batch(conn, job_id: str, batch_index: int, chunk_start_idx: int, chunk_end_idx: int, source_refs: List[Dict[str, Any]]) -> int:
+        return insert_ingest_batch(conn, job_id, batch_index, chunk_start_idx, chunk_end_idx, source_refs)
+    
+    @staticmethod
+    def insert_chunk_units(conn, batch_id: int, units: List[Dict[str, Any]]) -> None:
+        return insert_chunk_units(conn, batch_id, units)
+    
+    @staticmethod
+    def insert_fact_staging(conn, job_id: str, batch_id: Optional[int], fact_text: str, source_chunk_id: Optional[str] = None, section_path: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+        return insert_fact_staging(conn, job_id, batch_id, fact_text, source_chunk_id, section_path, metadata)
+    
+    @staticmethod
+    def upsert_kg_node(conn, job_id: str, graph_role: str, external_key: str, label: Optional[str], payload: Dict[str, Any], batch_id: Optional[int], segment_id: Optional[int] = None) -> None:
+        return upsert_kg_node(conn, job_id, graph_role, external_key, label, payload, batch_id, segment_id)
+    
+    @staticmethod
+    def insert_kg_edge(conn, job_id: str, graph_role: str, source_key: str, target_key: str, relation_type: str, payload: Dict[str, Any], version: int = 1, segment_id: Optional[int] = None) -> None:
+        return insert_kg_edge(conn, job_id, graph_role, source_key, target_key, relation_type, payload, version, segment_id)
+    
+    @staticmethod
+    def fetch_facts_for_job(conn, job_id: str) -> List[Dict[str, Any]]:
+        return fetch_facts_for_job(conn, job_id)
+    
+    @staticmethod
+    def insert_presentation_tree(conn, job_id: str, sqlite_document_id: int, meta: Dict[str, Any]) -> int:
+        return insert_presentation_tree(conn, job_id, sqlite_document_id, meta)
+    
+    @staticmethod
+    def insert_tree_node(conn, tree_id: int, parent_id: Optional[int], path: str, sort_order: int, payload: Dict[str, Any], source_span_refs: List[Dict[str, Any]], projection_round: int, flush_batch_index: int) -> int:
+        return insert_tree_node(conn, tree_id, parent_id, path, sort_order, payload, source_span_refs, projection_round, flush_batch_index)
+    
+    @staticmethod
+    def update_tree_root(conn, tree_id: int, root_node_id: int) -> None:
+        return update_tree_root(conn, tree_id, root_node_id)
+    
+    @staticmethod
+    def insert_validation_segment(conn, job_id: str, segment_index: int) -> int:
+        return insert_validation_segment(conn, job_id, segment_index)
+    
+    @staticmethod
+    def insert_validation_run(conn, job_id: str, tree_id: int, trigger_after_flushes: int, result_json: Dict[str, Any], segment_id: Optional[int] = None) -> int:
+        return insert_validation_run(conn, job_id, tree_id, trigger_after_flushes, result_json, segment_id)
+    
+    @staticmethod
+    def fetch_latest_tree_for_document(conn, sqlite_document_id: int, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return fetch_latest_tree_for_document(conn, sqlite_document_id, tenant_id)
+    
+    @staticmethod
+    def fetch_tree_nodes(conn, tree_id: int) -> List[Dict[str, Any]]:
+        return fetch_tree_nodes(conn, tree_id)
+    
+    @staticmethod
+    def delete_pipeline_jobs_by_document(conn, sqlite_document_id: int, tenant_id: Optional[str] = None) -> int:
+        return delete_pipeline_jobs_by_document(conn, sqlite_document_id, tenant_id)

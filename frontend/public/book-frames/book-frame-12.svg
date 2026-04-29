@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Book spine (center) - thick and prominent -->
+  <rect x="230" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Left page (book interior) - rich notebook style -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="#e8f2ff" stroke="#999999" stroke-width="1"/>
+  
+  <!-- Gradient overlay for left page -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="url(#leftPageGradient)" stroke="#999999" stroke-width="1"/>
+  <defs>
+    <linearGradient id="leftPageGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#e8f2ff"/>
+      <stop offset="40%" stop-color="#d4e4ff"/>
+      <stop offset="100%" stop-color="#c2d6ff"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Left page header -->
+  <rect x="20" y="30" width="190" height="40" rx="8" ry="8" fill="rgba(57,52,45,0.1)"/>
+  <text x="115" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#39342d">学习笔记</text>
+  
+  <!-- Detailed notebook content -->
+  <g font-family="Arial, sans-serif" font-size="11" fill="#39342d">
+    <!-- Note 1 -->
+    <rect x="25" y="90" width="180" height="25" rx="4" ry="4" fill="rgba(255,255,255,0.7)" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+    <circle cx="35" cy="102" r="3" fill="#90aee5"/>
+    <text x="50" y="107">关键概念：机器学习</text>
+    
+    <!-- Note 2 -->
+    <rect x="25" y="125" width="180" height="25" rx="4" ry="4" fill="rgba(255,255,255,0.7)" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+    <circle cx="35" cy="137" r="3" fill="#ffb366"/>
+    <text x="50" y="142">相关技术：深度学习</text>
+    
+    <!-- Note 3 -->
+    <rect x="25" y="160" width="180" height="25" rx="4" ry="4" fill="rgba(255,255,255,0.7)" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+    <circle cx="35" cy="172" r="3" fill="#66cc99"/>
+    <text x="50" y="177">应用场景：图像识别</text>
+  </g>
+  
+  <!-- Decorative notebook lines -->
+  <g stroke="rgba(57,52,45,0.05)" stroke-width="1">
+    <line x1="25" y1="200" x2="205" y2="200"/>
+    <line x1="25" y1="220" x2="205" y2="220"/>
+    <line x1="25" y1="240" x2="205" y2="240"/>
+    <line x1="25" y1="260" x2="205" y2="260"/>
+    <line x1="25" y1="280" x2="195" y2="280"/>
+    <line x1="25" y1="300" x2="195" y2="300"/>
+  </g>
+  
+  <!-- Sticky notes -->
+  <g transform="translate(30, 320)">
+    <!-- Yellow note -->
+    <rect x="0" y="0" width="80" height="70" rx="6" ry="6" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <polygon points="70,20 80,0 70,0" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <text x="40" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#39342d">重点</text>
+    <text x="40" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="7" fill="#666666">需要记忆</text>
+  </g>
+  
+  <g transform="translate(120, 340)">
+    <!-- Blue note -->
+    <rect x="0" y="0" width="70" height="60" rx="6" ry="6" fill="#d6f3ee" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <polygon points="60,15 70,0 60,0" fill="#d6f3ee" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+    <text x="35" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="bold" fill="#39342d">提示</text>
+    <text x="35" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="7" fill="#666666">关联知识</text>
+  </g>
+  
+  <!-- Right page (knowledge page - final polished version) -->
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Shadow effect with stronger emphasis -->
+  <rect x="248" y="10" width="222" height="620" rx="20" ry="20" fill="rgba(57,52,45,0.2)" stroke="none"/>
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Inner border with gradient -->
+  <rect x="250" y="12" width="198" height="596" rx="14" ry="14" fill="none" stroke="rgba(57,52,45,0.15)" stroke-width="1"/>
+  
+  <!-- Title area with decorative elements -->
+  <g transform="translate(349, 80)">
+    <!-- Decorative line -->
+    <line x1="-40" y1="-15" x2="40" y2="-15" stroke="#90aee5" stroke-width="3" stroke-linecap="round"/>
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="900" fill="#666666" opacity="0.7" letter-spacing="0.25em">KNOWLEDGE READY</text>
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="36" font-weight="900" fill="#39342d" letter-spacing="0.12em" y="45">解析页</text>
+    <text text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#666666" y="75">知识解析完成</text>
+  </g>
+  
+  <!-- Main content panel with enhanced styling -->
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Panel shadow -->
+  <rect x="260" y="160" width="180" height="400" rx="16" ry="16" fill="rgba(57,52,45,0.14)" stroke="none"/>
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#fffef9" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Inner panel with gradient -->
+  <rect x="268" y="158" width="164" height="384" rx="12" ry="12" fill="url(#panelGradient)" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  <defs>
+    <linearGradient id="panelGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#f8f9ff"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Content header with icon -->
+  <rect x="270" y="170" width="160" height="40" rx="8" ry="8" fill="#90aee5" stroke="none"/>
+  <text x="290" y="195" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">📚</text>
+  <text x="320" y="195" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">知识解析报告</text>
+  
+  <!-- Detailed content sections -->
+  <g font-family="Arial, sans-serif" font-size="12">
+    <!-- Section 1 with progress bar -->
+    <g transform="translate(275, 225)">
+      <text y="15" font-weight="bold" fill="#39342d">概念提取</text>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#e0e0e0"/>
+      <rect x="0" y="20" width="120" height="8" rx="4" ry="4" fill="#90aee5"/>
+      <text x="155" y="26" font-size="10" fill="#666666">80%</text>
+    </g>
+    
+    <!-- Section 2 with progress bar -->
+    <g transform="translate(275, 265)">
+      <text y="15" font-weight="bold" fill="#39342d">关键词分析</text>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#e0e0e0"/>
+      <rect x="0" y="20" width="135" height="8" rx="4" ry="4" fill="#ffb366"/>
+      <text x="155" y="26" font-size="10" fill="#666666">90%</text>
+    </g>
+    
+    <!-- Section 3 with progress bar -->
+    <g transform="translate(275, 305)">
+      <text y="15" font-weight="bold" fill="#39342d">关联图谱</text>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#e0e0e0"/>
+      <rect x="0" y="20" width="105" height="8" rx="4" ry="4" fill="#66cc99"/>
+      <text x="155" y="26" font-size="10" fill="#666666">70%</text>
+    </g>
+    
+    <!-- Section 4 with progress bar -->
+    <g transform="translate(275, 345)">
+      <text y="15" font-weight="bold" fill="#39342d">学习路径</text>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#e0e0e0"/>
+      <rect x="0" y="20" width="90" height="8" rx="4" ry="4" fill="#9966cc"/>
+      <text x="155" y="26" font-size="10" fill="#666666">60%</text>
+    </g>
+    
+    <!-- Section 5 with progress bar -->
+    <g transform="translate(275, 385)">
+      <text y="15" font-weight="bold" fill="#39342d">记忆强化</text>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#e0e0e0"/>
+      <rect x="0" y="20" width="150" height="8" rx="4" ry="4" fill="#ff6666"/>
+      <text x="155" y="26" font-size="10" fill="#666666">100%</text>
+    </g>
+  </g>
+  
+  <!-- Final status indicator -->
+  <g transform="translate(270, 460)">
+    <rect width="160" height="40" rx="20" ry="20" fill="#66cc99" stroke="none"/>
+    <text x="80" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">✅ 解析完成</text>
+  </g>
+  
+  <!-- Ready for interaction text -->
+  <text x="350" y="530" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#666666">点击任意位置继续</text>
+</svg>

@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import asyncio
+import mimetypes
 import hashlib
 import hmac
 import base64
@@ -13,29 +14,37 @@ import re
 import uuid
 import shutil
 import time
+import socket
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import asynccontextmanager
 from datetime import date
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict, Tuple
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote_plus, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from backend.runtime_config import RuntimeConfig
-from backend.services.chunker import DocumentChunker
-from backend.services.document_parser import DocumentParser
-from backend.services.exam_processor import ExamProcessor
-from backend.services.free_ai_router import FreeAIRouter
-from backend.services.supabase_storage import SupabaseStorageConfig, upload_file
-from backend.services.r2_storage import (
+# 修改导入以支持当前目录结构
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 直接导入模块
+from runtime_config import RuntimeConfig
+from services.chunker import DocumentChunker
+from services.document_parser import DocumentParser
+from services.exam_processor import ExamProcessor
+from services.free_ai_router import FreeAIRouter
+from services.supabase_storage import SupabaseStorageConfig, upload_file
+from services.r2_storage import (
     R2StorageConfig,
+    delete_object as r2_delete_object,
     download_to_file as r2_download_to_file,
     generate_presigned_put_url,
     head_object as r2_head_object,
@@ -43,33 +52,36 @@ from backend.services.r2_storage import (
     r2_uri,
     upload_file as r2_upload_file,
 )
-from backend.services.graphs import AgentChains
-from backend.services.kg_builder import KGBuilder
-from backend.services.rag_engine import RAGEngine
-from backend.services.pipeline import DeepPipelineService
-from backend.services.pipeline import postgres_store as pg_store
-from backend.services.security_context import IdentityContext, JwtValidator, to_identity_context
-from backend.services.email_sender import send_plain_email
-from backend.services.client_ip import normalized_signup_ip
-from backend.services import local_auth_service
-from backend.services import knowledge_store
-from backend.services import gpu_ocr_billing
-from backend.services import ocr_token_billing
-from backend.services import embedding_token_billing
-from backend.services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
-from backend.services.knowledge_store import insert_returning_id
-from backend.services.upload_ingestion_service import UploadIngestionService
-from backend.services.payments.base import PaymentProvider
-from backend.services.payments.factory import get_payment_provider
-from backend.services.runpod_client import runpod_enabled, submit_ingestion_job
-from backend.services.gpu_autostart_cloud import (
+from services.graphs import AgentChains
+from services.kg_builder import KGBuilder
+from services.rag_engine import RAGEngine
+from services.pipeline import DeepPipelineService
+from services.pipeline import postgres_store as pg_store
+from services.security_context import IdentityContext, JwtValidator, to_identity_context
+from services.email_sender import send_plain_email
+from services.client_ip import normalized_signup_ip
+from services import local_auth_service
+from services import knowledge_store
+from services import gpu_ocr_billing
+from services.memory import MemoryHook
+from services.memory.pattern_separator import PatternSeparator
+from services import ocr_token_billing
+from services import embedding_token_billing
+from services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
+from services.knowledge_store import insert_returning_id
+from services.upload_ingestion_service import UploadIngestionService
+from services.ai_reverse_proxy import AIReverseProxyService
+from services.payments.base import PaymentProvider
+from services.payments.factory import get_payment_provider
+from services.runpod_client import runpod_enabled, submit_ingestion_job
+from services.gpu_autostart_cloud import (
     gpu_autostart_enabled,
     start_gpu_instances,
     stop_gpu_instances,
 )
-from backend.services.gpu_idle_autostop import schedule_gpu_idle_stop
+from services.gpu_idle_autostop import schedule_gpu_idle_stop
 
-from backend.services.upload_load_control import (
+from services.upload_load_control import (
     enforce_upload_create_allowed,
     get_upload_queue_metrics,
     log_ingestion_event,
@@ -94,6 +106,8 @@ def _load_project_env(root_dir: Path) -> None:
     if not env_path.exists():
         return
     try:
+        override_raw = (os.getenv("APP_ENV_OVERRIDE") or "1").strip().lower()
+        override_existing = override_raw not in {"0", "false", "off", "no"}
         for raw_line in env_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip().lstrip("\ufeff")
             if not line or line.startswith("#"):
@@ -104,13 +118,15 @@ def _load_project_env(root_dir: Path) -> None:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            if not key or key in os.environ:
+            if not key:
+                continue
+            if (not override_existing) and key in os.environ:
                 continue
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
             os.environ[key] = value
-        logger.info("loaded environment variables from %s", env_path)
+        logger.info("loaded environment variables from %s (override_existing=%s)", env_path, override_existing)
     except Exception:
         logger.exception("failed to load env file: %s", env_path)
 
@@ -139,6 +155,8 @@ class ChatRequest(BaseModel):
     mode: str = "free"
     session_id: Optional[str] = None
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    scope: str = Field(default="auto", pattern="^(auto|library|document)$")
+    document_id: Optional[int] = Field(default=None, ge=1)
 
 
 class ChatMemoryClearRequest(BaseModel):
@@ -154,23 +172,13 @@ class ExamRequest(BaseModel):
     exam_text: str = Field(min_length=1)
     discipline: str = "all"
 
-
-class SummaryRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=3000)
-    discipline: str = "all"
-    document_id: Optional[int] = Field(default=None, ge=1)
-    summary_compact_level: Optional[int] = None
-    summary_mode: Optional[str] = None
-    embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
-
-
 class ReportRequest(BaseModel):
     query: str = Field(min_length=1, max_length=3000)
     discipline: str = "all"
     document_id: Optional[int] = Field(default=None, ge=1)
     summary_compact_level: Optional[int] = None
-    report_mode: Optional[str] = None
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    force_refresh: bool = False
 
 
 class DeepReportStartRequest(BaseModel):
@@ -190,7 +198,9 @@ class ChunkInitRequest(BaseModel):
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
     ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
+    ocr_engine_override: Optional[str] = Field(default=None, pattern="^(auto|local|local-standard|paddle-local|baidu|glm-ocr|glm_ocr|docling|complex_layout)$")
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    client_managed_original: bool = False
 
 
 class ChunkCompleteRequest(BaseModel):
@@ -199,8 +209,10 @@ class ChunkCompleteRequest(BaseModel):
     purpose: str = Field(default="docs", pattern="^(docs|exam)$")
     use_gpu_ocr: Optional[bool] = None
     ocr_mode: Optional[str] = Field(default=None, pattern="^(standard|complex_layout)$")
+    ocr_engine_override: Optional[str] = Field(default=None, pattern="^(auto|local|local-standard|paddle-local|baidu|glm-ocr|glm_ocr|docling|complex_layout)$")
     external_ocr_confirmed: bool = False
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    client_managed_original: bool = False
 
 
 class UploadPresignInitRequest(BaseModel):
@@ -209,15 +221,19 @@ class UploadPresignInitRequest(BaseModel):
     document_type: Optional[str] = None
     use_gpu_ocr: bool = False
     ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
+    ocr_engine_override: Optional[str] = Field(default=None, pattern="^(auto|local|local-standard|paddle-local|baidu|glm-ocr|glm_ocr|docling|complex_layout)$")
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    client_managed_original: bool = False
 
 
 class UploadPresignCompleteRequest(BaseModel):
     object_key: str = Field(min_length=1, max_length=1024)
     use_gpu_ocr: bool = False
     ocr_mode: str = Field(default="standard", pattern="^(standard|complex_layout)$")
+    ocr_engine_override: Optional[str] = Field(default=None, pattern="^(auto|local|local-standard|paddle-local|baidu|glm-ocr|glm_ocr|docling|complex_layout)$")
     external_ocr_confirmed: bool = False
     embedding_mode: str = Field(default="auto", pattern="^(auto|local|api)$")
+    client_managed_original: bool = False
 
 
 class UserBillingModeRequest(BaseModel):
@@ -235,6 +251,7 @@ class ChunkUploadMeta(TypedDict):
     embedding_mode: str
     use_gpu_ocr: bool
     ocr_mode: str
+    ocr_engine_override: NotRequired[str]
     received_chunks: int
     temp_dir: str
     tenant_id: str
@@ -246,14 +263,18 @@ class ChunkUploadMeta(TypedDict):
 
 
 class PayOrderCreateRequest(BaseModel):
-    product_type: str = Field(default="ocr_calls", pattern="^(ocr_calls|glm_ocr_tokens|embedding_tokens|ocr_tokens|cloud_capacity)$")
+    product_type: str = Field(default="ocr_calls", pattern="^(ocr_calls|glm_ocr_tokens|embedding_tokens|ocr_tokens)$")
     product_key: Optional[str] = Field(default=None, min_length=1, max_length=32)
     pack_key: Optional[str] = Field(default=None, pattern="^(A|B|C)$")
-    provider: Optional[str] = Field(default=None, pattern="^(easypay|jeepay|paypal|xpay)$")
+    provider: Optional[str] = Field(default=None, pattern="^(easypay|jeepay|paypal|xpay|manual_qr)$")
     channel: str = Field(default="wechat_native", pattern="^(wechat_native|alipay_qr|paypal)$")
 
 
 class PayOrderRefundRequest(BaseModel):
+    key: Optional[str] = None
+
+
+class PayOrderManualConfirmRequest(BaseModel):
     key: Optional[str] = None
 
 
@@ -297,6 +318,32 @@ def _normalize_ocr_mode(value: Optional[str], *, use_gpu_ocr: Optional[bool] = N
     if bool(use_gpu_ocr):
         return "complex_layout"
     return "standard"
+
+
+def _normalize_ocr_engine_override(value: Optional[str]) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "auto", "standard"}:
+        return None
+    if raw in {"local", "local-standard", "paddle-local"}:
+        return "local"
+    if raw in {"glm_ocr", "glm-ocr", "complex_layout"}:
+        return "glm-ocr"
+    if raw in {"baidu", "docling"}:
+        return raw
+    return None
+
+
+def _resolve_upload_ocr_config(
+    *,
+    ocr_mode: Optional[str],
+    use_gpu_ocr: Optional[bool] = None,
+    ocr_engine_override: Optional[str] = None,
+) -> Tuple[str, Optional[str], bool]:
+    normalized_override = _normalize_ocr_engine_override(ocr_engine_override)
+    if normalized_override == "glm-ocr":
+        return "complex_layout", normalized_override, True
+    normalized_mode = _normalize_ocr_mode(ocr_mode, use_gpu_ocr=use_gpu_ocr)
+    return normalized_mode, normalized_override, bool(normalized_mode == "complex_layout")
 
 
 def _normalize_embedding_mode(value: Optional[str]) -> str:
@@ -430,6 +477,10 @@ def _get_request_identity(request: Request) -> RequestIdentity:
         header_key = (RUNTIME_CONFIG.tenant.header_name or "X-Tenant-Id").strip()
         raw = request.headers.get(header_key, "")
         tenant_id = _normalize_tenant_id(raw)
+        if local_auth_service.local_jwt_enabled() and not token and tenant_id in {"", "public"}:
+            demo_tenant_id = _get_local_demo_tenant_id()
+            if demo_tenant_id:
+                tenant_id = demo_tenant_id
         if not tenant_id:
             if RUNTIME_CONFIG.tenant.require_header:
                 raise HTTPException(status_code=400, detail=f"缺少有效租户头: {header_key}")
@@ -546,6 +597,11 @@ def _embedding_billing_exempt(request: Request) -> bool:
     return _is_special_user(request) or not _request_embedding_internal_billing_enabled(request)
 
 
+def _request_client_managed_original(request: Request) -> bool:
+    raw = (request.headers.get("X-Client-Storage-Mode") or "").strip().lower()
+    return raw in {"device-local", "client-device", "native-local"}
+
+
 def _has_role(identity: RequestIdentity, role: str) -> bool:
     return role in set(identity.get("roles", []))
 
@@ -561,6 +617,12 @@ def _require_permission(identity: RequestIdentity, permission: str) -> None:
     if permission.startswith("tenant.") and _has_role(identity, "tenant_admin"):
         return
     raise HTTPException(status_code=403, detail=f"权限不足: {permission}")
+
+
+def _require_proxy_identity(request: Request, permission: str = "tenant.proxy.write") -> RequestIdentity:
+    identity = _get_request_identity(request)
+    _require_permission(identity, permission)
+    return identity
 
 
 def _require_local_admin_identity(request: Request) -> RequestIdentity:
@@ -784,15 +846,33 @@ def _security_event(
 
 def _tenant_used_storage_bytes(tenant_id: str) -> int:
     """按租户汇总已用存储：upload_tasks（非 failed）+ 仅同步 POST /upload 写入的 documents.metadata.source_file_size（排除已有 upload_tasks 关联的文档，避免双计）。"""
+    try:
+        _prune_stale_orphan_upload_tasks(tenant_id)
+    except Exception:
+        logger.exception("prune stale orphan upload tasks failed tenant=%s", tenant_id)
+    cutoff_iso = datetime.fromtimestamp(
+        time.time() - (_orphan_upload_task_grace_hours() * 3600),
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M:%S")
     conn = _conn()
     try:
         row = conn.execute(
             """
             SELECT COALESCE(SUM(CAST(file_size_bytes AS INTEGER)), 0) AS s
             FROM upload_tasks
-            WHERE tenant_id = ? AND IFNULL(status, '') != 'failed'
+            WHERE tenant_id = ?
+              AND IFNULL(status, '') != 'failed'
+              AND IFNULL(client_managed_original, 0) = 0
+              AND (
+                document_id IS NOT NULL
+                OR (
+                  document_id IS NULL
+                  AND IFNULL(status, '') IN ('queued', 'running')
+                  AND updated_at >= ?
+                )
+              )
             """,
-            (tenant_id,),
+            (tenant_id, cutoff_iso),
         ).fetchone()
         total = int(row["s"] or 0)
         try:
@@ -1300,6 +1380,49 @@ def _collect_active_file_paths() -> set[str]:
         conn.close()
 
 
+def _orphan_upload_task_grace_hours() -> int:
+    return _env_int("ORPHAN_UPLOAD_TASK_GRACE_HOURS", 0, min_value=0, max_value=24 * 365)
+
+
+def _prune_stale_orphan_upload_tasks(tenant_id: str) -> int:
+    cutoff_iso = datetime.fromtimestamp(
+        time.time() - (_orphan_upload_task_grace_hours() * 3600),
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    active_task_ids = {int(task_id) for task_id, task in _ingestion_workers.items() if task and not task.done()}
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, file_path
+            FROM upload_tasks
+            WHERE tenant_id = ?
+              AND document_id IS NULL
+              AND IFNULL(status, '') IN ('queued', 'running', 'completed')
+              AND updated_at < ?
+            """,
+            (tenant_id, cutoff_iso),
+        ).fetchall()
+        deleted = 0
+        for row in rows:
+            task_id = int(row["id"] or 0)
+            if task_id <= 0 or task_id in active_task_ids:
+                continue
+            conn.execute("DELETE FROM ocr_page_cache WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM vector_ingest_checkpoints WHERE task_id = ? AND tenant_id = ?", (task_id, tenant_id))
+            conn.execute("DELETE FROM upload_tasks WHERE id = ? AND tenant_id = ?", (task_id, tenant_id))
+            file_path = str(row["file_path"] or "").strip()
+            if file_path:
+                _try_remove_upload_file(file_path)
+            upload_ingestion_service.cleanup_task_local_cache_files(task_id)
+            deleted += 1
+        if deleted:
+            conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
 def _cleanup_once() -> Dict[str, Any]:
     started = time.time()
     stats: Dict[str, Any] = {
@@ -1549,12 +1672,86 @@ def _init_runtime_tables() -> None:
         conn.close()
 
 
+def _seed_local_demo_user_if_configured() -> None:
+    if not local_auth_service.local_jwt_enabled():
+        return
+    demo_email = local_auth_service.normalize_email(os.getenv("AUTH_DEMO_EMAIL") or "")
+    demo_password = str(os.getenv("AUTH_DEMO_PASSWORD") or "")
+    demo_billing_mode = str(os.getenv("AUTH_DEMO_PROVIDER_BILLING_MODE") or "default").strip().lower() or "default"
+    if not demo_email and not demo_password:
+        return
+    if "@" not in demo_email or len(demo_email) < 5:
+        logger.warning("skip demo account seed: AUTH_DEMO_EMAIL invalid")
+        return
+    if len(demo_password) < 8:
+        logger.warning("skip demo account seed: AUTH_DEMO_PASSWORD must be at least 8 characters")
+        return
+    if demo_billing_mode not in {"default", "internal", "self_hosted"}:
+        demo_billing_mode = "default"
+
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM app_users WHERE email = ?",
+            (demo_email,),
+        ).fetchone()
+        password_hash = local_auth_service.hash_password(demo_password)
+        if row:
+            conn.execute(
+                "UPDATE app_users SET password_hash = ?, provider_billing_mode = ? WHERE id = ?",
+                (password_hash, demo_billing_mode, str(row["id"])),
+            )
+            user_id = str(row["id"])
+            action = "updated"
+        else:
+            user_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO app_users(id, email, password_hash, provider_billing_mode) VALUES(?,?,?,?)",
+                (user_id, demo_email, password_hash, demo_billing_mode),
+            )
+            action = "created"
+        conn.commit()
+        logger.info("demo local user %s: email=%s user_id=%s", action, demo_email, user_id)
+    except Exception:
+        logger.exception("seed demo local user failed")
+    finally:
+        conn.close()
+
+
+def _get_local_demo_tenant_id() -> str:
+    demo_email = local_auth_service.normalize_email(os.getenv("AUTH_DEMO_EMAIL") or "")
+    if not demo_email:
+        demo_email = "showcase@demo.local"
+    if "@" not in demo_email or len(demo_email) < 5:
+        return ""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM app_users WHERE email = ?",
+            (demo_email,),
+        ).fetchone()
+        return _normalize_tenant_id(str(row["id"] or "")) if row else ""
+    except Exception:
+        logger.exception("resolve demo tenant failed")
+        return ""
+    finally:
+        conn.close()
+
+
+def _is_demo_guest_identity(identity: RequestIdentity) -> bool:
+    if str(identity.get("auth_source") or "") == "local_jwt":
+        return False
+    demo_tenant_id = _get_local_demo_tenant_id()
+    return bool(demo_tenant_id and str(identity.get("tenant_id") or "") == demo_tenant_id)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _cleanup_task
     _enforce_production_security_baseline()
     _init_db()
     _init_runtime_tables()
+    _seed_local_demo_user_if_configured()
     upload_ingestion_service.init_schema()
     try:
         deep_pipeline_service.init_schema()
@@ -1585,6 +1782,12 @@ def _cors_allow_origins() -> List[str]:
     if not raw or raw == "*":
         return ["*"]
     return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _cors_allow_origin_regex() -> Optional[str]:
+    """可选：与 allow_origins 并用，用于 IDE/WebView 等非标准 origin（设置 CORS_ALLOW_ORIGIN_REGEX）。"""
+    raw = (os.getenv("CORS_ALLOW_ORIGIN_REGEX") or "").strip()
+    return raw or None
 
 
 def _client_id_from_request(request: Request) -> str:
@@ -1716,9 +1919,18 @@ def _pay_enabled_providers() -> List[str]:
         providers = [item.strip().lower() for item in raw.split(",") if item.strip()]
     else:
         providers = [_pay_provider_name()]
+    if (
+        os.getenv("MANUAL_PAY_WECHAT_QR_IMAGE")
+        or os.getenv("MANUAL_PAY_WECHAT_QR_URL")
+        or os.getenv("PAY_WECHAT_QR_IMAGE")
+        or os.getenv("MANUAL_PAY_ALIPAY_QR_IMAGE")
+        or os.getenv("MANUAL_PAY_ALIPAY_QR_URL")
+        or os.getenv("PAY_ALIPAY_QR_IMAGE")
+    ):
+        providers.insert(0, "manual_qr")
     seen: List[str] = []
     for provider in providers:
-        if provider in {"easypay", "jeepay", "paypal", "xpay"} and provider not in seen:
+        if provider in {"easypay", "jeepay", "paypal", "xpay", "manual_qr"} and provider not in seen:
             seen.append(provider)
     return seen or [_pay_provider_name()]
 
@@ -1727,6 +1939,8 @@ def _pay_provider_supported_channels(provider_name: Optional[str] = None) -> Lis
     provider = (provider_name or _pay_provider_name()).strip().lower()
     if provider == "paypal":
         return ["paypal"]
+    if provider == "manual_qr":
+        return ["wechat_native", "alipay_qr"]
     return ["wechat_native", "alipay_qr"]
 
 
@@ -1757,7 +1971,6 @@ PAY_PRODUCT_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     "glm_ocr_tokens": PAY_GLM_OCR_TOKEN_PACKS,
     "ocr_tokens": PAY_GLM_OCR_TOKEN_PACKS,
     "embedding_tokens": PAY_EMBEDDING_TOKEN_PACKS,
-    "cloud_capacity": PAY_EMBEDDING_TOKEN_PACKS,
 }
 
 
@@ -1765,8 +1978,6 @@ def _normalize_pay_product_type(product_type: str) -> str:
     raw = str(product_type or "ocr_calls").strip().lower()
     if raw == "ocr_tokens":
         return "glm_ocr_tokens"
-    if raw == "cloud_capacity":
-        return "embedding_tokens"
     return raw
 
 
@@ -1902,6 +2113,101 @@ def _get_payment_provider(provider_name: Optional[str] = None) -> PaymentProvide
     return get_payment_provider((provider_name or _pay_provider_name()).strip().lower())
 
 
+def _is_tcp_endpoint_reachable(url: str, *, timeout_sec: float = 1.5) -> bool:
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        parsed = urlparse(target)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
+
+
+def _provider_health(provider_name: str) -> Dict[str, Any]:
+    provider = str(provider_name or "").strip().lower()
+    channels = _pay_provider_supported_channels(provider)
+    if provider == "manual_qr":
+        ready = bool(
+            os.getenv("MANUAL_PAY_WECHAT_QR_IMAGE")
+            or os.getenv("MANUAL_PAY_WECHAT_QR_URL")
+            or os.getenv("PAY_WECHAT_QR_IMAGE")
+            or os.getenv("MANUAL_PAY_ALIPAY_QR_IMAGE")
+            or os.getenv("MANUAL_PAY_ALIPAY_QR_URL")
+            or os.getenv("PAY_ALIPAY_QR_IMAGE")
+        )
+        return {
+            "provider": provider,
+            "available": ready,
+            "auto_confirm": False,
+            "channels": channels,
+            "reason": "" if ready else "未配置手动收款码图片",
+        }
+    if provider == "xpay":
+        local_mock_enabled = (os.getenv("XPAY_LOCAL_MOCK_ENABLED") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        base = (os.getenv("XPAY_API_BASE") or "").strip()
+        ready = True if local_mock_enabled else _is_tcp_endpoint_reachable(base)
+        return {
+            "provider": provider,
+            "available": ready,
+            "auto_confirm": ready,
+            "channels": channels,
+            "reason": "本地 XPay 模拟已启用" if local_mock_enabled else ("" if ready else f"XPAY_API_BASE 不可达: {base or '(empty)'}"),
+        }
+    if provider == "paypal":
+        ready = bool((os.getenv("PAYPAL_CLIENT_ID") or "").strip() and (os.getenv("PAYPAL_CLIENT_SECRET") or "").strip())
+        return {
+            "provider": provider,
+            "available": ready,
+            "auto_confirm": True,
+            "channels": channels,
+            "reason": "" if ready else "未配置 PayPal 凭证",
+        }
+    if provider == "easypay":
+        ready = bool(
+            (os.getenv("EASYPAY_API_BASE") or "").strip()
+            and (os.getenv("EASYPAY_PID") or "").strip()
+            and (os.getenv("EASYPAY_KEY") or "").strip()
+            and ((os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip())
+        )
+        return {
+            "provider": provider,
+            "available": ready,
+            "auto_confirm": True,
+            "channels": channels,
+            "reason": "" if ready else "EasyPay 配置不完整",
+        }
+    if provider == "jeepay":
+        ready = bool(
+            (os.getenv("JEEPAY_API_BASE") or "").strip()
+            and (os.getenv("JEEPAY_MCH_NO") or "").strip()
+            and (os.getenv("JEEPAY_APP_ID") or "").strip()
+            and (os.getenv("JEEPAY_APP_SECRET") or "").strip()
+            and ((os.getenv("PAY_NOTIFY_URL") or "").strip())
+        )
+        return {
+            "provider": provider,
+            "available": ready,
+            "auto_confirm": True,
+            "channels": channels,
+            "reason": "" if ready else "JeePay 配置不完整",
+        }
+    return {
+        "provider": provider,
+        "available": False,
+        "auto_confirm": False,
+        "channels": channels,
+        "reason": "未知 provider",
+    }
+
+
 def _get_pay_product(product_type: str, product_key: str) -> Dict[str, Any]:
     normalized_type = _normalize_pay_product_type(product_type)
     catalog = PAY_PRODUCT_CATALOG.get(normalized_type)
@@ -1926,7 +2232,7 @@ def _describe_pay_product(product_type: str, product_key: str, product: Dict[str
 
 def _allocate_manual_pay_amount(base_amount_cny: float, provider_name: str, channel: str) -> Tuple[float, float]:
     base_amount = Decimal(str(base_amount_cny)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if provider_name != "xpay" or channel != "wechat_native":
+    if provider_name not in {"xpay", "manual_qr"} or channel != "wechat_native":
         return float(base_amount), 0.0
     lower_bound = float((base_amount - Decimal("0.09")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     upper_bound = float(base_amount)
@@ -2579,6 +2885,7 @@ def _consume_global_gpu_monthly_pages_or_raise(request: Request, page_count: int
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allow_origins(),
+    allow_origin_regex=_cors_allow_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2983,13 +3290,19 @@ async def send_gpu_redeem_code(request: Request) -> Dict[str, Any]:
 @app.get("/gpu/ocr/pay/config")
 async def get_gpu_pay_config() -> Dict[str, Any]:
     providers = _pay_enabled_providers()
-    provider_name = providers[0]
+    health = {provider: _provider_health(provider) for provider in providers}
+    auto_providers = [provider for provider in providers if health.get(provider, {}).get("available") and health.get(provider, {}).get("auto_confirm")]
+    manual_providers = [provider for provider in providers if health.get(provider, {}).get("available") and not health.get(provider, {}).get("auto_confirm")]
+    fallback_providers = [provider for provider in providers if provider not in auto_providers and provider not in manual_providers]
+    ordered_providers = auto_providers + manual_providers + fallback_providers
+    provider_name = ordered_providers[0] if ordered_providers else providers[0]
     return {
         "ok": True,
         "provider": provider_name,
-        "providers": providers,
+        "providers": ordered_providers,
         "supported_channels": _pay_provider_supported_channels(provider_name),
-        "provider_channels": {provider: _pay_provider_supported_channels(provider) for provider in providers},
+        "provider_channels": {provider: _pay_provider_supported_channels(provider) for provider in ordered_providers},
+        "provider_health": {provider: health.get(provider, {}) for provider in ordered_providers},
     }
 
 
@@ -3002,7 +3315,7 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
     provider = _get_payment_provider(provider_name)
     notify_url = (os.getenv("PAY_NOTIFY_URL") or os.getenv("EASYPAY_NOTIFY_URL") or "").strip()
     return_url = (os.getenv("PAY_RETURN_URL") or os.getenv("EASYPAY_RETURN_URL") or "").strip()
-    if provider_name != "paypal" and not notify_url:
+    if provider_name not in {"paypal", "manual_qr"} and not notify_url:
         raise HTTPException(status_code=503, detail="未配置 PAY_NOTIFY_URL/EASYPAY_NOTIFY_URL")
     tenant_id, client_id = _ocr_billing_tenant_client(request)
     product_type = _normalize_pay_product_type(str(body.product_type or "ocr_calls"))
@@ -3107,6 +3420,22 @@ async def create_gpu_pay_order(request: Request, body: PayOrderCreateRequest) ->
 @app.get("/gpu/ocr/pay/xpay/wechat-qr", name="xpay_wechat_qr_image")
 async def xpay_wechat_qr_image() -> Response:
     provider = _get_payment_provider("xpay")
+    if getattr(provider, "local_mock_enabled", False):
+        raw = str(os.getenv("MANUAL_PAY_WECHAT_QR_IMAGE") or (ROOT_DIR / "pay" / "wechat.png")).strip()
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail=f"本地微信收款码不存在: {path}")
+        content_type = mimetypes.guess_type(str(path))[0] or "image/png"
+        return Response(
+            content=path.read_bytes(),
+            media_type=content_type,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
     api_base = getattr(provider, "api_base", "").strip().rstrip("/")
     if not api_base:
         raise HTTPException(status_code=503, detail="xpay not configured")
@@ -3194,6 +3523,40 @@ async def get_gpu_pay_order(order_no: str, request: Request) -> Dict[str, Any]:
         "amount_cny": float(order.get("amount_cny") or 0),
         "credited_pages": int(order.get("credited_pages") or 0),
         "reverted_pages": int(order.get("reverted_pages") or 0),
+    }
+
+
+@app.post("/gpu/ocr/pay/order/{order_no}/manual-confirm")
+async def confirm_manual_pay_order(
+    order_no: str,
+    request: Request,
+    body: PayOrderManualConfirmRequest = Body(default=PayOrderManualConfirmRequest()),
+) -> Dict[str, Any]:
+    admin_key = (os.getenv("PAY_MANUAL_CONFIRM_KEY") or os.getenv("PAY_REFUND_ADMIN_KEY") or "").strip()
+    if admin_key and str(body.key or "").strip() == admin_key:
+        pass
+    else:
+        identity = _get_request_identity(request)
+        if identity.get("auth_source") != "local_jwt" or not bool(identity.get("is_admin")):
+            raise HTTPException(status_code=403, detail="需要管理员登录或 PAY_MANUAL_CONFIRM_KEY")
+    row = _get_pay_order(order_no)
+    if not row:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    order_before = dict(row)
+    if str(order_before.get("provider") or "") != "manual_qr":
+        raise HTTPException(status_code=400, detail="只有 manual_qr 订单需要手动确认")
+    order = _mark_order_paid_if_needed(
+        order_no=order_no,
+        transaction_id=f"manual:{order_no}",
+        provider_order_id=str(order_before.get("provider_order_id") or order_no),
+    )
+    return {
+        "ok": True,
+        "order_no": order_no,
+        "status": str(order.get("status") or ""),
+        "credited_pages": int(order.get("credited_pages") or 0),
+        "credited_tokens": int(order.get("credit_tokens") or 0),
+        "credited_embedding_tokens": int(order.get("credit_embedding_tokens") or 0),
     }
 
 
@@ -3374,10 +3737,13 @@ async def request_security_middleware(request: Request, call_next):
         )
 
 ai_router = FreeAIRouter(RUNTIME_CONFIG)
+ai_reverse_proxy = AIReverseProxyService(RUNTIME_CONFIG.reverse_proxy)
 parser = DocumentParser()
 chunker = DocumentChunker()
-rag_engine = RAGEngine(ai_router)
-agent_chains = AgentChains(ai_router=ai_router, rag_engine=rag_engine)
+    pattern_separator = PatternSeparator(dim=1536)
+rag_engine = RAGEngine(ai_router, pattern_separator=pattern_separator)
+memory_hook = MemoryHook(db_path=DB_PATH, rag_engine=rag_engine, pattern_separator=pattern_separator, auto_start_decay=True)
+agent_chains = AgentChains(ai_router=ai_router, rag_engine=rag_engine, memory_hook=memory_hook)
 kg_builder = KGBuilder()
 exam_processor = ExamProcessor(rag_engine, ai_router, agent_chains=agent_chains)
 upload_ingestion_service = UploadIngestionService(
@@ -3387,6 +3753,7 @@ upload_ingestion_service = UploadIngestionService(
     agent_chains=agent_chains,
     parser=parser,
     runtime_config=RUNTIME_CONFIG,
+        pattern_separator=pattern_separator,
 )
 deep_pipeline_service = DeepPipelineService(
     database_url=RUNTIME_CONFIG.postgres.database_url,
@@ -3440,8 +3807,10 @@ def _normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
         "file_size_bytes": int(task.get("file_size_bytes", 0) or 0),
+        "client_managed_original": bool(int(task.get("client_managed_original", 0) or 0) == 1),
         "use_gpu_ocr": bool(int(task.get("use_gpu_ocr", 0) or 0) == 1),
         "ocr_mode": str(task.get("ocr_mode", "standard") or "standard"),
+        "ocr_engine_override": str(task.get("ocr_engine_override", "") or ""),
         "embedding_mode": str(task.get("embedding_mode", "auto") or "auto"),
         "embedding_model": str(task.get("embedding_model", "") or ""),
         "ocr_provider": str(task.get("ocr_provider", "") or ""),
@@ -3564,8 +3933,10 @@ def _content_type_for_upload_suffix(suffix: str) -> str:
 
 
 def _unique_upload_basename(original_filename: str) -> str:
-    """磁盘存储名：UUID 前缀 + 安全原始名，避免并发/重复上传互相覆盖。"""
-    return f"{uuid.uuid4().hex}_{_safe_filename(original_filename)}"
+    """磁盘/对象存储名：使用短 UUID + 原扩展名，减少长文件名和非 ASCII 路径带来的兼容问题。"""
+    safe_name = _safe_filename(original_filename)
+    suffix = Path(safe_name).suffix[:16]
+    return f"{uuid.uuid4().hex}{suffix}"
 
 
 def _chunk_path(upload_id: str, chunk_index: int) -> Path:
@@ -3621,12 +3992,14 @@ async def _handle_completed_chunked_upload(
     tenant_id: str,
     use_gpu_ocr: bool,
     ocr_mode: str,
+    ocr_engine_override: Optional[str],
     embedding_mode: str,
     *,
     ocr_billing_client_id: Optional[str] = None,
     ocr_billing_exempt: bool = False,
     embedding_billing_client_id: Optional[str] = None,
     embedding_billing_exempt: bool = False,
+    client_managed_original: bool = False,
 ) -> Dict[str, Any]:
     if purpose == "docs":
         task = upload_ingestion_service.create_task(
@@ -3636,12 +4009,15 @@ async def _handle_completed_chunked_upload(
             storage_basename=target_path.name,
             tenant_id=tenant_id,
             ocr_mode=ocr_mode,
+            ocr_engine_override=ocr_engine_override,
             embedding_mode=embedding_mode,
             ocr_billing_client_id=ocr_billing_client_id,
             ocr_billing_exempt=ocr_billing_exempt,
+            client_managed_original=client_managed_original,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(use_gpu_ocr))
         upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
+        upload_ingestion_service.update_task_ocr_engine_override(int(task.get("id", 0)), ocr_engine_override)
         upload_ingestion_service.update_task_embedding_config(
             int(task.get("id", 0)),
             embedding_mode,
@@ -3685,13 +4061,6 @@ def _resolve_summary_compact_level(value: Any, default: int = 1) -> int:
     return parsed
 
 
-def _resolve_summary_mode(value: Any, default: str = "fast") -> str:
-    mode = str(value or "").strip().lower()
-    if mode in {"fast", "full"}:
-        return mode
-    return default
-
-
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     baidu_ocr_ok = bool(
@@ -3699,17 +4068,18 @@ async def health() -> Dict[str, Any]:
     )
     pdf_ocr_engine = (os.getenv("PDF_OCR_ENGINE", "auto") or "auto").strip().lower()
     capacity = _capacity_snapshot()
-    local_embedding_ready = bool(ai_router._load_local_embedding_runtime()) if ai_router.hybrid_cfg.enable_local_embedding else False
+    local_embedding_status = ai_router.get_local_embedding_runtime_status()
     return {
         "status": "ok",
         "database": knowledge_store.health_database_label(),
         "storage": str(UPLOAD_DIR),
         "hybrid_local_first": RUNTIME_CONFIG.hybrid.local_first,
         "active_embedding_model": ai_router.get_active_embedding_model_id(),
-        "local_embedding_enabled": bool(ai_router.hybrid_cfg.enable_local_embedding),
-        "local_embedding_model": ai_router.hybrid_cfg.local_embedding_model_id,
-        "local_embedding_ready": local_embedding_ready,
-        "local_embedding_error": "" if local_embedding_ready else ai_router.get_local_embedding_unavailable_reason(),
+        "local_embedding_enabled": bool(local_embedding_status.get("enabled")),
+        "local_embedding_model": str(local_embedding_status.get("model_id") or ""),
+        "local_embedding_ready": bool(local_embedding_status.get("ready")),
+        "local_embedding_initialized": bool(local_embedding_status.get("initialized")),
+        "local_embedding_error": str(local_embedding_status.get("error") or ""),
         "llamaindex_enabled": RUNTIME_CONFIG.llama_index.enabled,
         "langchain_enabled": RUNTIME_CONFIG.langchain.enabled,
         "agent_graph_enabled": True,
@@ -3726,6 +4096,7 @@ async def health() -> Dict[str, Any]:
         "auth_local_jwt_enabled": bool(local_auth_service.local_jwt_enabled()),
         "auth_ingest_requires_login": bool(local_auth_service.ingest_requires_login()),
         "auth_membership_check": bool(RUNTIME_CONFIG.auth.require_membership_check),
+        "reverse_proxy": ai_reverse_proxy.summary(),
         "capacity": capacity,
     }
 
@@ -3748,7 +4119,10 @@ async def capacity_status(request: Request) -> Dict[str, Any]:
 @app.get("/tenant/quota/status")
 async def tenant_quota_status(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
-    _require_permission(identity, "tenant.metrics.read")
+    if identity.get("auth_source") == "local_jwt":
+        pass
+    else:
+        _require_permission(identity, "tenant.metrics.read")
     return _tenant_quota_snapshot(identity)
 
 
@@ -3770,12 +4144,33 @@ async def security_baseline(request: Request) -> Dict[str, Any]:
     }
 
 
+@app.get("/proxy/health")
+async def proxy_health(request: Request) -> Dict[str, Any]:
+    identity = _require_proxy_identity(request, permission="tenant.proxy.read")
+    return {
+        "proxy": ai_reverse_proxy.summary(),
+        "tenant_id": str(identity.get("tenant_id", "public")),
+        "user_id": str(identity.get("user_id", "")),
+    }
+
+
+@app.api_route(
+    "/proxy/{upstream_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def reverse_proxy(upstream_path: str, request: Request):
+    identity = _require_proxy_identity(request)
+    request_id = request.headers.get("X-Request-Id", uuid.uuid4().hex)
+    return await ai_reverse_proxy.handle(request, upstream_path, identity, request_id)
+
+
 @app.post("/upload/chunks/init")
 async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str, Any]:
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    _enforce_tenant_quota(identity, additional_bytes=int(req.total_size))
+    client_managed_original = bool(req.client_managed_original) and _request_client_managed_original(request)
+    _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else int(req.total_size))
     tenant_id = str(identity.get("tenant_id", "public"))
     filename = _safe_filename(req.filename)
     suffix = Path(filename).suffix.lower()
@@ -3784,7 +4179,11 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
     if req.total_chunks > 10000:
         raise HTTPException(status_code=400, detail="分片数量过大，请增大分片大小")
 
-    ocr_mode = _normalize_ocr_mode(req.ocr_mode, use_gpu_ocr=req.use_gpu_ocr)
+    ocr_mode, ocr_engine_override, use_gpu_ocr = _resolve_upload_ocr_config(
+        ocr_mode=req.ocr_mode,
+        use_gpu_ocr=req.use_gpu_ocr,
+        ocr_engine_override=req.ocr_engine_override,
+    )
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     upload_id = uuid.uuid4().hex
     temp_dir = CHUNK_TEMP_DIR / upload_id
@@ -3798,8 +4197,10 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
         "discipline": req.discipline,
         "document_type": req.document_type,
         "embedding_mode": embedding_mode,
-        "use_gpu_ocr": bool(req.use_gpu_ocr),
+        "use_gpu_ocr": bool(use_gpu_ocr),
         "ocr_mode": ocr_mode,
+        "ocr_engine_override": ocr_engine_override or "",
+        "client_managed_original": client_managed_original,
         "received_chunks": 0,
         "temp_dir": str(temp_dir),
         "tenant_id": tenant_id,
@@ -3844,7 +4245,13 @@ async def complete_chunk_upload(
     discipline = (req.discipline if req else meta["discipline"]) if req else meta["discipline"]
     document_type = (req.document_type if req else meta["document_type"]) if req else meta["document_type"]
     embedding_mode = _ensure_embedding_mode_available((req.embedding_mode if req else meta.get("embedding_mode")) if req else meta.get("embedding_mode"))
-    ocr_mode = _normalize_ocr_mode((req.ocr_mode if req else meta.get("ocr_mode")), use_gpu_ocr=(req.use_gpu_ocr if req else None))
+    client_managed_original = bool((req.client_managed_original if req else meta.get("client_managed_original")) if req else meta.get("client_managed_original"))
+    client_managed_original = client_managed_original and _request_client_managed_original(request)
+    ocr_mode, ocr_engine_override, use_gpu_ocr = _resolve_upload_ocr_config(
+        ocr_mode=(req.ocr_mode if req else meta.get("ocr_mode")),
+        use_gpu_ocr=(req.use_gpu_ocr if req else None),
+        ocr_engine_override=(req.ocr_engine_override if req else meta.get("ocr_engine_override")),
+    )
     external_ocr_confirmed = bool(req.external_ocr_confirmed) if req else False
 
     temp_dir = Path(meta["temp_dir"])
@@ -3861,7 +4268,7 @@ async def complete_chunk_upload(
         storage_name = str(meta["pending_storage_basename"])
         target_filename = str(meta["pending_target_filename"])
         actual_size = final_path.stat().st_size
-        use_gpu_ocr = bool(ocr_mode == "complex_layout")
+        use_gpu_ocr = bool(use_gpu_ocr)
     else:
         missing = [idx for idx in range(total_chunks) if not _chunk_path(upload_id, idx).exists()]
         if missing:
@@ -3885,9 +4292,9 @@ async def complete_chunk_upload(
         if expected_size > 0 and actual_size != expected_size:
             raise HTTPException(status_code=400, detail=f"文件大小校验失败 expected={expected_size} actual={actual_size}")
 
-        use_gpu_ocr = bool(ocr_mode == "complex_layout")
+        use_gpu_ocr = bool(use_gpu_ocr)
 
-    _enforce_tenant_quota(identity, additional_bytes=int(actual_size))
+    _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else int(actual_size))
 
     merged_sha256 = _calc_sha256(final_path) if final_path.exists() else ""
 
@@ -3895,17 +4302,12 @@ async def complete_chunk_upload(
     r2_cfg = R2StorageConfig.from_env()
     r2_prefix = (os.getenv("R2_STORAGE_PREFIX") or "").strip().strip("/")
     r2_delete_local = _env_bool("R2_DELETE_LOCAL_AFTER_UPLOAD", True)
-    if r2_cfg and purpose == "docs":
+    if r2_cfg and purpose == "docs" and not client_managed_original:
         object_key = f"{r2_prefix}/{tenant_id}/{storage_name}".strip("/")
         try:
             uri = r2_upload_file(r2_cfg, key=object_key, file_path=final_path)
             # 将 file_path 更新到远端，后续 ingestion worker 会自动 r2:// 下载到缓存再解析
             # 这里还没创建 task；在 create_task 后会再写一次，但保持一致：先把本地文件删掉以省磁盘
-            if r2_delete_local:
-                try:
-                    final_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
             # 通过 meta 暂存，交给 _handle_completed_chunked_upload 创建任务后写入
             meta["file_path_override"] = uri
         except Exception:
@@ -3938,14 +4340,17 @@ async def complete_chunk_upload(
         tenant_id=tenant_id,
         use_gpu_ocr=use_gpu_ocr,
         ocr_mode=ocr_mode,
+        ocr_engine_override=ocr_engine_override,
         embedding_mode=embedding_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
         embedding_billing_client_id=client_id,
         embedding_billing_exempt=bool(vector_exempt),
+        client_managed_original=client_managed_original,
     )
 
     # 若上面已写入 R2，则把 task.file_path 更新为 r2://...（并确保本地文件可删除）
+    r2_file_path_updated = False
     try:
         uri = meta.get("file_path_override")
         if uri and isinstance(result, dict) and result.get("tasks"):
@@ -3953,8 +4358,14 @@ async def complete_chunk_upload(
             tid = int(result["tasks"][0].get("task_id") or 0)
             if tid > 0:
                 upload_ingestion_service.update_task_file_path(tid, str(uri))
+                r2_file_path_updated = True
     except Exception:
         logger.exception("update task file_path to r2 uri failed")
+    if r2_delete_local and r2_file_path_updated:
+        try:
+            final_path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("delete local merged file after r2 uri update failed")
 
     if purpose == "docs":
         conn_rec = _conn()
@@ -4082,12 +4493,14 @@ async def create_upload_tasks(
     embedding_mode: str = "auto",
     use_gpu_ocr: bool = False,
     ocr_mode: str = "standard",
+    ocr_engine_override: Optional[str] = None,
     external_ocr_confirmed: bool = False,
 ) -> Any:
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     tenant_id = str(identity.get("tenant_id", "public"))
+    client_managed_original = _request_client_managed_original(request)
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
 
@@ -4115,7 +4528,11 @@ async def create_upload_tasks(
     finally:
         conn_th.close()
 
-    normalized_ocr_mode = _normalize_ocr_mode(ocr_mode, use_gpu_ocr=use_gpu_ocr)
+    normalized_ocr_mode, normalized_ocr_engine_override, task_use_gpu = _resolve_upload_ocr_config(
+        ocr_mode=ocr_mode,
+        use_gpu_ocr=use_gpu_ocr,
+        ocr_engine_override=ocr_engine_override,
+    )
     normalized_embedding_mode = _ensure_embedding_mode_available(embedding_mode)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     if normalized_ocr_mode == "complex_layout" and ocr_cid:
@@ -4140,9 +4557,7 @@ async def create_upload_tasks(
         await _save_upload_file_stream(f, target)
 
         sz = target.stat().st_size if target.exists() else 0
-        task_use_gpu = bool(normalized_ocr_mode == "complex_layout")
-
-        _enforce_tenant_quota(identity, additional_bytes=int(sz))
+        _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else int(sz))
 
         dtype = document_type or _guess_doc_type(f.filename)
         task = upload_ingestion_service.create_task(
@@ -4152,19 +4567,22 @@ async def create_upload_tasks(
             storage_basename=storage,
             tenant_id=tenant_id,
             ocr_mode=normalized_ocr_mode,
+            ocr_engine_override=normalized_ocr_engine_override,
             embedding_mode=normalized_embedding_mode,
             ocr_billing_client_id=ocr_cid,
             ocr_billing_exempt=ocr_ex,
+            client_managed_original=client_managed_original,
         )
         upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
         upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), normalized_ocr_mode)
+        upload_ingestion_service.update_task_ocr_engine_override(int(task.get("id", 0)), normalized_ocr_engine_override)
         upload_ingestion_service.update_task_embedding_config(
             int(task.get("id", 0)),
             normalized_embedding_mode,
             ai_router.get_active_embedding_model_id(normalized_embedding_mode),
         )
         # 优先：R2（S3 兼容）持久化，并把 upload_tasks.file_path 指向 r2://bucket/key
-        if r2_cfg:
+        if r2_cfg and not client_managed_original:
             object_key = f"{r2_prefix}/{tenant_id}/{storage}".strip("/")
             try:
                 uri = r2_upload_file(r2_cfg, key=object_key, file_path=target)
@@ -4177,7 +4595,7 @@ async def create_upload_tasks(
             except Exception:
                 logger.exception("upload to r2 failed (fallback to local file_path)")
         # 兜底：Supabase Storage（若未启用 R2）
-        elif sb_cfg:
+        elif sb_cfg and not client_managed_original:
             object_key = f"{sb_prefix}/{tenant_id}/{storage}".strip("/")
             try:
                 uri = await upload_file(sb_cfg, key=object_key, file_path=target)
@@ -4217,6 +4635,7 @@ async def create_upload_task_single_file(
     discipline: str = "general",
     document_type: Optional[str] = None,
     ocr_mode: str = "standard",
+    ocr_engine_override: Optional[str] = None,
     external_ocr_confirmed: bool = False,
 ) -> Any:
     """与 POST /upload/tasks 相同，仅上传一个文件；在 /docs 里应出现标准 file 控件。若看不到：重启后端并强制刷新 /docs（Ctrl+F5）。"""
@@ -4226,6 +4645,7 @@ async def create_upload_task_single_file(
         discipline=discipline,
         document_type=document_type,
         ocr_mode=ocr_mode,
+        ocr_engine_override=ocr_engine_override,
         external_ocr_confirmed=external_ocr_confirmed,
     )
 
@@ -4236,6 +4656,7 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
+    client_managed_original = bool(body.client_managed_original) and _request_client_managed_original(request)
     _enforce_tenant_quota(identity)
     tenant_id = str(identity.get("tenant_id", "public"))
     r2_cfg = R2StorageConfig.from_env()
@@ -4263,7 +4684,11 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     storage = _unique_upload_basename(filename)
     dtype = body.document_type or _guess_doc_type(filename)
     disc = body.discipline if body.discipline != "auto" else "all"
-    ocr_mode = _normalize_ocr_mode(body.ocr_mode, use_gpu_ocr=body.use_gpu_ocr)
+    ocr_mode, ocr_engine_override, task_use_gpu = _resolve_upload_ocr_config(
+        ocr_mode=body.ocr_mode,
+        use_gpu_ocr=body.use_gpu_ocr,
+        ocr_engine_override=body.ocr_engine_override,
+    )
     embedding_mode = _ensure_embedding_mode_available(body.embedding_mode)
     ocr_cid, ocr_ex = _task_ocr_billing_from_request(request)
     if ocr_mode == "complex_layout" and ocr_cid:
@@ -4275,12 +4700,15 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
         tenant_id=tenant_id,
         storage_basename=storage,
         ocr_mode=ocr_mode,
+        ocr_engine_override=ocr_engine_override,
         embedding_mode=embedding_mode,
         ocr_billing_client_id=ocr_cid,
         ocr_billing_exempt=ocr_ex,
+        client_managed_original=client_managed_original,
     )
-    upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), False)
+    upload_ingestion_service.update_task_use_gpu_ocr(int(task.get("id", 0)), bool(task_use_gpu))
     upload_ingestion_service.update_task_ocr_mode(int(task.get("id", 0)), ocr_mode)
+    upload_ingestion_service.update_task_ocr_engine_override(int(task.get("id", 0)), ocr_engine_override)
     upload_ingestion_service.update_task_embedding_config(
         int(task.get("id", 0)),
         embedding_mode,
@@ -4328,6 +4756,7 @@ async def upload_tasks_presign_complete(
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     tenant_id = str(identity.get("tenant_id", "public"))
+    client_managed_original = bool(body.client_managed_original) and _request_client_managed_original(request)
     r2_cfg = R2StorageConfig.from_env()
     if not r2_cfg:
         raise HTTPException(status_code=503, detail="未配置 R2")
@@ -4364,11 +4793,12 @@ async def upload_tasks_presign_complete(
     if sz <= 0:
         raise HTTPException(status_code=400, detail="对象大小为 0，请重新上传")
 
-    _enforce_tenant_quota(identity, additional_bytes=sz)
+    _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else sz)
 
     uri = r2_uri(r2_cfg.bucket, object_key)
     upload_ingestion_service.update_task_file_path(task_id, uri)
-    upload_ingestion_service.update_task_file_size_bytes(task_id, sz)
+    upload_ingestion_service.update_task_file_size_bytes(task_id, 0 if client_managed_original else sz)
+    upload_ingestion_service.update_task_client_managed_original(task_id, client_managed_original)
 
     fp = str(task.get("file_path") or "")
     if fp and not str(fp).startswith("r2://"):
@@ -4377,9 +4807,14 @@ async def upload_tasks_presign_complete(
         except Exception:
             pass
 
-    ocr_mode = _normalize_ocr_mode(body.ocr_mode, use_gpu_ocr=body.use_gpu_ocr)
+    ocr_mode, ocr_engine_override, task_use_gpu = _resolve_upload_ocr_config(
+        ocr_mode=body.ocr_mode,
+        use_gpu_ocr=body.use_gpu_ocr,
+        ocr_engine_override=body.ocr_engine_override,
+    )
     upload_ingestion_service.update_task_ocr_mode(task_id, ocr_mode)
-    upload_ingestion_service.update_task_use_gpu_ocr(task_id, bool(ocr_mode == "complex_layout"))
+    upload_ingestion_service.update_task_ocr_engine_override(task_id, ocr_engine_override)
+    upload_ingestion_service.update_task_use_gpu_ocr(task_id, bool(task_use_gpu))
     spawn_worker = True
 
     if spawn_worker:
@@ -4410,6 +4845,29 @@ async def get_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
     except ValueError:
         raise HTTPException(status_code=404, detail="上传任务不存在")
     return _normalize_task(task)
+
+
+@app.delete("/upload/tasks/{task_id}")
+async def delete_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
+    identity = _ingest_identity_or_raise(request)
+    _require_permission(identity, "tenant.upload.write")
+    tenant_id = str(identity.get("tenant_id", "public"))
+    result = await _delete_upload_task_with_artifacts(
+        task_id,
+        tenant_id=tenant_id,
+        user_id=str(identity.get("user_id", "anonymous")),
+        roles=list(identity.get("roles", [])),
+    )
+    _audit_log(
+        request,
+        identity,
+        action="upload_tasks.delete",
+        resource_type="upload_task",
+        resource_id=str(task_id),
+        result="success",
+        details=result,
+    )
+    return result
 
 
 @app.get("/upload/metrics")
@@ -4454,8 +4912,6 @@ async def get_upload_queue_metrics_endpoint(request: Request) -> Dict[str, Any]:
 async def list_documents(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.documents.read")
-    if local_auth_service.is_anonymous_local_guest(identity):
-        return {"documents": []}
     tenant_id = str(identity.get("tenant_id", "public"))
     conn = _conn()
     try:
@@ -4520,6 +4976,8 @@ async def download_document_original(doc_id: int, request: Request) -> Any:
     filename = str(row["filename"] or "document").strip() or "document"
     if not fp:
         raise HTTPException(status_code=404, detail="原件路径为空")
+    if fp.startswith("client://"):
+        raise HTTPException(status_code=409, detail="该文档原件由 APK/EXE 客户端保存在本机，请在原上传设备中打开或下载。")
     if fp.startswith("r2://"):
         r2_cfg = R2StorageConfig.from_env()
         if not r2_cfg:
@@ -4578,14 +5036,18 @@ async def get_document_summary(doc_id: int, request: Request) -> Dict[str, Any]:
     summary = upload_ingestion_service.get_summary_by_document_id(doc_id, tenant_id=tenant_id)
     if not summary:
         return {"document_id": doc_id, "summary": None}
-    return {"document_id": doc_id, "summary": summary}
+    # 前端期望 summary 直接包含 title/top_keywords/conclusions 等字段，
+    # 而 get_summary_by_document_id 把它们包在 payload 里，这里展开。
+    payload = summary.get("payload") if isinstance(summary.get("payload"), dict) else {}
+    return {"document_id": doc_id, "summary": payload}
 
 
-def _try_remove_upload_file(path_str: str) -> None:
-    """仅删除位于 UPLOAD_DIR 下的文件，防止误删。"""
+def _try_remove_file_under_base(path_str: str, base_dir: Path) -> None:
+    if not path_str:
+        return
     try:
         p = Path(path_str).resolve()
-        base = UPLOAD_DIR.resolve()
+        base = base_dir.resolve()
         p.relative_to(base)
     except (ValueError, OSError):
         return
@@ -4596,11 +5058,383 @@ def _try_remove_upload_file(path_str: str) -> None:
         pass
 
 
+def _try_remove_summary_artifact(path_str: str) -> None:
+    _try_remove_file_under_base(path_str, upload_ingestion_service.summary_test_dir)
+
+
+def _ensure_deep_report_cache_schema() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deep_report_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL DEFAULT 'public',
+                document_id INTEGER NOT NULL,
+                cache_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, document_id, cache_key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deep_report_cache_tenant_doc ON deep_report_cache(tenant_id, document_id)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_deep_report_cache_key(
+    *,
+    query: str,
+    discipline: str,
+    embedding_mode: str,
+    summary_compact_level: int,
+) -> str:
+    payload = {
+        "query": str(query or "").strip(),
+        "discipline": str(discipline or "all").strip() or "all",
+        "embedding_mode": str(embedding_mode or "auto").strip() or "auto",
+        "summary_compact_level": int(summary_compact_level),
+        "schema_version": 3,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_demo_deep_report_cache_key(
+    *,
+    summary_compact_level: int,
+) -> str:
+    payload = {
+        "summary_compact_level": int(summary_compact_level),
+        "schema_version": 3,
+        "profile": "demo-stable",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_request_deep_report_cache_key(
+    *,
+    identity: RequestIdentity,
+    query: str,
+    discipline: str,
+    embedding_mode: str,
+    summary_compact_level: int,
+) -> str:
+    if _is_demo_guest_identity(identity):
+        return _build_demo_deep_report_cache_key(summary_compact_level=summary_compact_level)
+    return _build_deep_report_cache_key(
+        query=query,
+        discipline=discipline,
+        embedding_mode=embedding_mode,
+        summary_compact_level=summary_compact_level,
+    )
+
+
+def _get_cached_deep_report(
+    *,
+    tenant_id: str,
+    document_id: int,
+    cache_key: str,
+) -> Optional[Dict[str, Any]]:
+    _ensure_deep_report_cache_schema()
+    conn = _conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM deep_report_cache
+            WHERE tenant_id = ? AND document_id = ? AND cache_key = ?
+            """,
+            (tenant_id, document_id, cache_key),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    payload = FreeAIRouter.safe_json_loads(str(row["payload_json"] or ""), {})
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_cached_deep_report(
+    *,
+    tenant_id: str,
+    document_id: int,
+    cache_key: str,
+    payload: Dict[str, Any],
+) -> None:
+    _ensure_deep_report_cache_schema()
+    conn = _conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO deep_report_cache (tenant_id, document_id, cache_key, payload_json, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(tenant_id, document_id, cache_key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (tenant_id, document_id, cache_key, json.dumps(payload, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_cached_deep_reports(*, tenant_id: str, document_id: int) -> None:
+    _ensure_deep_report_cache_schema()
+    conn = _conn()
+    try:
+        conn.execute(
+            "DELETE FROM deep_report_cache WHERE tenant_id = ? AND document_id = ?",
+            (tenant_id, document_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_report_response_from_graph_result(
+    *,
+    graph_result: Dict[str, Any],
+    summary_compact_level: int,
+    document_id: int | None = None,
+) -> Dict[str, Any]:
+    report_text = str(graph_result.get("report", "")).strip()
+    sections = graph_result.get("report_sections", []) if isinstance(graph_result.get("report_sections"), list) else []
+    citations = graph_result.get("citations", []) if isinstance(graph_result.get("citations"), list) else []
+    coverage_stats = graph_result.get("coverage_stats", {}) if isinstance(graph_result.get("coverage_stats"), dict) else {}
+    validation_graph_skipped = bool(
+        graph_result.get("validation_graph_skipped", coverage_stats.get("validation_graph_skipped", False))
+    )
+    if not citations:
+        citations = _build_sources(graph_result.get("retrieved", []), limit=8)
+    if not citations:
+        citations = [{"title": "基于当前检索未命中", "discipline": "all", "section_path": "N/A"}]
+    short_report_guard_hit = _is_short_report(report_text, summary_compact_level)
+    if _is_invalid_report_text(report_text) or short_report_guard_hit:
+        fallback_payload = _fallback_summary("", graph_result.get("retrieved", []), citations)
+        report_text, sections = _build_report_markdown_from_fallback(
+            fallback_payload=fallback_payload,
+            existing_sections=sections,
+            short_report=short_report_guard_hit,
+        )
+        fallback_reason = str(graph_result.get("fallback_reason", "none")).strip() or "none"
+        if fallback_reason in {"none", "report_ok"}:
+            fallback_reason = "report_endpoint_short_guard" if short_report_guard_hit else "report_endpoint_fallback"
+        if (not validation_graph_skipped) and _is_report_under_coverage(coverage_stats):
+            fallback_reason = "parse_under_coverage"
+    else:
+        fallback_reason = str(graph_result.get("fallback_reason", "none")).strip() or "none"
+    if not sections:
+        fallback_payload = _fallback_summary("", graph_result.get("retrieved", []), citations)
+        report_text, sections = _build_report_markdown_from_fallback(
+            fallback_payload=fallback_payload,
+            existing_sections=[],
+            short_report=False,
+        )
+    return {
+        "report": report_text,
+        "sections": sections,
+        "five_dimensions": graph_result.get("five_dimensions", {}),
+        "five_dimensions_meta": graph_result.get("five_dimensions_meta", {}),
+        "citations": citations,
+        "provider": graph_result.get("provider", "unknown"),
+        "summary_compact_level": summary_compact_level,
+        "coverage_stats": coverage_stats,
+        "validation_graph_skipped": validation_graph_skipped,
+        "quality_gates": graph_result.get("quality_gates", {}),
+        "fallback_reason": fallback_reason,
+        "report_profile": graph_result.get("report_profile", {}),
+        "document_tree": graph_result.get("document_tree", []),
+        "document_id": document_id,
+        "agent_trace": graph_result.get("agent_trace", []),
+        "cost_profile": graph_result.get("cost_profile", {}),
+        "embedding_mode": graph_result.get("embedding_mode", "auto"),
+        "chapter_summaries": graph_result.get("chapter_summaries", []),
+        "fallback": bool(graph_result.get("fallback")),
+    }
+
+
+async def _cancel_ingestion_worker_if_running(task_id: int) -> None:
+    running = _ingestion_workers.pop(task_id, None)
+    if running is None:
+        return
+    if not running.done():
+        running.cancel()
+    try:
+        await running
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("cleanup wait worker failed task_id=%s", task_id)
+
+
+async def _delete_document_with_artifacts(
+    doc_id: int,
+    *,
+    tenant_id: str,
+    user_id: str,
+    roles: List[str],
+) -> Dict[str, Any]:
+    conn = _conn()
+    task_ids: List[int] = []
+    upload_paths: List[str] = []
+    summary_artifact_paths: List[str] = []
+    try:
+        row = conn.execute("SELECT id FROM documents WHERE id = ? AND tenant_id = ?", (doc_id, tenant_id)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        task_rows = conn.execute(
+            "SELECT id, file_path FROM upload_tasks WHERE document_id = ? AND tenant_id = ?",
+            (doc_id, tenant_id),
+        ).fetchall()
+        summary_rows = conn.execute(
+            "SELECT artifact_path FROM document_summaries WHERE document_id = ? AND tenant_id = ?",
+            (doc_id, tenant_id),
+        ).fetchall()
+        task_ids = [int(r["id"]) for r in task_rows if r["id"] is not None]
+        upload_paths = [str(r["file_path"]) for r in task_rows if r["file_path"]]
+        summary_artifact_paths = [str(r["artifact_path"]) for r in summary_rows if r["artifact_path"]]
+    finally:
+        conn.close()
+
+    for task_id in task_ids:
+        await _cancel_ingestion_worker_if_running(task_id)
+
+    conn = _conn()
+    try:
+        conn.execute(
+            "DELETE FROM ocr_page_cache WHERE task_id IN (SELECT id FROM upload_tasks WHERE document_id = ? AND tenant_id = ?)",
+            (doc_id, tenant_id),
+        )
+        conn.execute(
+            "DELETE FROM vector_ingest_checkpoints WHERE task_id IN (SELECT id FROM upload_tasks WHERE document_id = ? AND tenant_id = ?)",
+            (doc_id, tenant_id),
+        )
+        conn.execute("DELETE FROM document_summaries WHERE document_id = ? AND tenant_id = ?", (doc_id, tenant_id))
+        conn.execute("DELETE FROM upload_tasks WHERE document_id = ? AND tenant_id = ?", (doc_id, tenant_id))
+        conn.execute("DELETE FROM vectors WHERE document_id = ? AND tenant_id = ?", (doc_id, tenant_id))
+        conn.execute("DELETE FROM documents WHERE id = ? AND tenant_id = ?", (doc_id, tenant_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if RUNTIME_CONFIG.postgres.enabled:
+        try:
+            deep_pipeline_service.delete_document_data(
+                doc_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                roles=roles,
+            )
+        except Exception:
+            logger.exception("PostgreSQL cleanup failed document_id=%s", doc_id)
+
+    _delete_cached_deep_reports(tenant_id=tenant_id, document_id=doc_id)
+
+    for fp in upload_paths:
+        _try_remove_upload_file(fp)
+    for task_id in task_ids:
+        upload_ingestion_service.cleanup_task_local_cache_files(task_id)
+    for artifact_path in summary_artifact_paths:
+        _try_remove_summary_artifact(artifact_path)
+
+    await _rebuild_kg_relations(tenant_id=tenant_id)
+    return {"deleted": doc_id, "task_ids": task_ids}
+
+
+async def _delete_upload_task_with_artifacts(
+    task_id: int,
+    *,
+    tenant_id: str,
+    user_id: str,
+    roles: List[str],
+) -> Dict[str, Any]:
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id, document_id, file_path FROM upload_tasks WHERE id = ? AND tenant_id = ?",
+            (task_id, tenant_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload task not found")
+    finally:
+        conn.close()
+
+    document_id = int(row["document_id"] or 0)
+    if document_id > 0:
+        result = await _delete_document_with_artifacts(
+            document_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            roles=roles,
+        )
+        result["deleted_task_id"] = task_id
+        return result
+
+    await _cancel_ingestion_worker_if_running(task_id)
+
+    conn = _conn()
+    try:
+        conn.execute("DELETE FROM ocr_page_cache WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM vector_ingest_checkpoints WHERE task_id = ? AND tenant_id = ?", (task_id, tenant_id))
+        conn.execute("DELETE FROM upload_tasks WHERE id = ? AND tenant_id = ?", (task_id, tenant_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if row["file_path"]:
+        _try_remove_upload_file(str(row["file_path"]))
+    upload_ingestion_service.cleanup_task_local_cache_files(task_id)
+    return {"deleted_task_id": task_id}
+
+
+def _try_remove_upload_file(path_str: str) -> None:
+    """仅删除位于 UPLOAD_DIR 下的文件，防止误删。"""
+    if not path_str:
+        return
+    if str(path_str).startswith("client://"):
+        return
+    if str(path_str).startswith("r2://"):
+        parsed = parse_r2_uri(str(path_str))
+        cfg = R2StorageConfig.from_env()
+        if parsed and cfg:
+            bucket, key = parsed
+            try:
+                r2_delete_object(cfg, bucket=bucket, key=key)
+            except Exception:
+                logger.exception("delete r2 upload file failed path=%s", path_str)
+        return
+    _try_remove_file_under_base(path_str, UPLOAD_DIR)
+
+
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: int, request: Request) -> Dict[str, Any]:
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.documents.delete")
     tenant_id = str(identity.get("tenant_id", "public"))
+    result = await _delete_document_with_artifacts(
+        doc_id,
+        tenant_id=tenant_id,
+        user_id=str(identity.get("user_id", "anonymous")),
+        roles=list(identity.get("roles", [])),
+    )
+    _audit_log(
+        request,
+        identity,
+        action="documents.delete",
+        resource_type="document",
+        resource_id=str(doc_id),
+        result="success",
+        details=result,
+    )
+    return result
     conn = _conn()
     upload_paths: List[str] = []
     try:
@@ -4686,15 +5520,30 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
         enriched_query = f"{req.query}\n\n[历史工作记忆]\n" + "\n\n".join(memory_context_lines[-_chat_memory_recent_limit():])
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
-    graph_result = await agent_chains.run_chat_graph(
-        query=enriched_query,
-        discipline=req.discipline,
-        mode=req.mode,
-        embedding_mode=embedding_mode,
-        tenant_id=tenant_id,
-        billing_client_id=billing_client_id,
-        billing_exempt=bool(billing_exempt),
-    )
+    scope = str(req.scope or "auto").strip().lower() or "auto"
+    effective_document_id = req.document_id if scope == "document" else (req.document_id if scope == "auto" else None)
+    try:
+        graph_result = await agent_chains.run_chat_graph(
+            query=enriched_query,
+            discipline=req.discipline,
+            mode=req.mode,
+            document_id=effective_document_id,
+            embedding_mode=embedding_mode,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=bool(billing_exempt),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "chat graph failed tenant_id=%s user_id=%s document_id=%s scope=%s",
+            tenant_id,
+            user_id,
+            effective_document_id,
+            scope,
+        )
+        raise HTTPException(status_code=500, detail=f"chat_graph_failed: {exc}") from exc
     answer = str(graph_result.get("answer", "")).strip()
     brief_reasoning = graph_result.get("brief_reasoning", [])
     sources = graph_result.get("evidence", [])
@@ -4723,6 +5572,8 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
         "cost_profile": graph_result.get("cost_profile", {}),
         "session_id": session_id,
         "embedding_mode": embedding_mode,
+        "scope": ("document" if effective_document_id else "library"),
+        "document_id": effective_document_id,
     }
 
 
@@ -4773,118 +5624,11 @@ async def clear_chat_memory(req: ChatMemoryClearRequest, request: Request) -> Di
     return {"cleared": cleared, "session_id": session_id}
 
 
-@app.post("/insights/summary")
-async def insights_summary(req: SummaryRequest, request: Request) -> Dict[str, Any]:
-    identity = _get_request_identity(request)
-    _require_permission(identity, "tenant.insights.read")
-    if local_auth_service.is_anonymous_local_guest(identity):
-        raise HTTPException(status_code=401, detail="请先登录后查看要点总结")
-    tenant_id = str(identity.get("tenant_id", "public"))
-    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
-    _, billing_client_id = _billing_tenant_client(request)
-    billing_exempt = _embedding_billing_exempt(request)
-    summary_debug_passthrough = _env_bool("SUMMARY_DEBUG_PASSTHROUGH", False)
-    summary_compact_level = 0
-    summary_mode = "full"
-    try:
-        graph_result = await agent_chains.run_summary_graph(
-            query=req.query,
-            discipline=req.discipline,
-            document_id=req.document_id,
-            embedding_mode=embedding_mode,
-            tenant_id=tenant_id,
-            billing_client_id=billing_client_id,
-            billing_exempt=bool(billing_exempt),
-            summary_debug_passthrough=summary_debug_passthrough,
-            summary_compact_level=summary_compact_level,
-            summary_mode=summary_mode,
-        )
-    except Exception as exc:
-        logger.exception("insights/summary graph failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"摘要生成失败: {exc}") from exc
-    debug_payload: Dict[str, Any] = {}
-    if summary_debug_passthrough:
-        debug_payload = {
-            "raw_model_content": graph_result.get("raw_model_content"),
-            "parsed_before_clip": graph_result.get("parsed_before_clip"),
-        }
-    if not graph_result.get("retrieved"):
-        fallback_payload = _fallback_summary(req.query, [], [])
-        return {
-            **fallback_payload,
-            "five_dimensions": graph_result.get("five_dimensions", {}),
-            "five_dimensions_meta": graph_result.get("five_dimensions_meta", {}),
-            "provider": graph_result.get("provider", "unknown"),
-            "fallback": True,
-            "fallback_reason": graph_result.get("fallback_reason", "no_results"),
-            "summary_compact_level": summary_compact_level,
-            "summary_mode": summary_mode,
-            "raw_lengths": graph_result.get("raw_lengths", {}),
-            "clipped_lengths": graph_result.get("clipped_lengths", {}),
-            "effective_coverage": graph_result.get("effective_coverage", {}),
-            "coverage_stats": graph_result.get("coverage_stats", {}),
-            "document_id": req.document_id,
-            "agent_trace": graph_result.get("agent_trace", []),
-            "cost_profile": graph_result.get("cost_profile", {}),
-            "embedding_mode": embedding_mode,
-            **debug_payload,
-        }
-    summary = graph_result.get("summary", {})
-    normalized = {
-        "brief": summary.get("brief", []),
-        "highlights": summary.get("highlights", []),
-        "conclusions": summary.get("conclusions", []),
-        "actions": summary.get("actions", []),
-        "citations": summary.get("citations", []),
-    }
-    if not normalized.get("highlights"):
-        fallback_payload = _fallback_summary(req.query, graph_result.get("retrieved", []), _build_sources(graph_result.get("retrieved", []), limit=6))
-        return {
-            **fallback_payload,
-            "five_dimensions": graph_result.get("five_dimensions", {}),
-            "five_dimensions_meta": graph_result.get("five_dimensions_meta", {}),
-            "provider": graph_result.get("provider", "unknown"),
-            "fallback": True,
-            "fallback_reason": graph_result.get("fallback_reason", "no_results"),
-            "summary_compact_level": summary_compact_level,
-            "summary_mode": summary_mode,
-            "raw_lengths": graph_result.get("raw_lengths", {}),
-            "clipped_lengths": graph_result.get("clipped_lengths", {}),
-            "effective_coverage": graph_result.get("effective_coverage", {}),
-            "coverage_stats": graph_result.get("coverage_stats", {}),
-            "document_id": req.document_id,
-            "agent_trace": graph_result.get("agent_trace", []),
-            "cost_profile": graph_result.get("cost_profile", {}),
-            "embedding_mode": embedding_mode,
-            **debug_payload,
-        }
-    return {
-        **normalized,
-        "five_dimensions": graph_result.get("five_dimensions", {}),
-        "five_dimensions_meta": graph_result.get("five_dimensions_meta", {}),
-        "provider": graph_result.get("provider", "unknown"),
-        "fallback": False,
-        "quality_gates": graph_result.get("quality_gates", {}),
-        "fallback_reason": graph_result.get("fallback_reason", "none"),
-        "summary_compact_level": summary_compact_level,
-        "summary_mode": summary_mode,
-        "raw_lengths": graph_result.get("raw_lengths", {}),
-        "clipped_lengths": graph_result.get("clipped_lengths", {}),
-        "effective_coverage": graph_result.get("effective_coverage", {}),
-        "coverage_stats": graph_result.get("coverage_stats", {}),
-        "document_id": req.document_id,
-        "agent_trace": graph_result.get("agent_trace", []),
-        "cost_profile": graph_result.get("cost_profile", {}),
-        "embedding_mode": embedding_mode,
-        **debug_payload,
-    }
-
-
 @app.post("/insights/report")
 async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.insights.read")
-    if local_auth_service.is_anonymous_local_guest(identity):
+    if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
         raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
     tenant_id = str(identity.get("tenant_id", "public"))
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
@@ -4892,7 +5636,23 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     billing_exempt = _embedding_billing_exempt(request)
     default_summary_compact_level = _resolve_summary_compact_level(os.getenv("SUMMARY_COMPACT_LEVEL"), default=1)
     summary_compact_level = _resolve_summary_compact_level(req.summary_compact_level, default=default_summary_compact_level)
-    report_mode = _resolve_summary_mode(req.report_mode, default="full")
+    cache_key: Optional[str] = None
+    if isinstance(req.document_id, int) and req.document_id > 0:
+        cache_key = _build_request_deep_report_cache_key(
+            identity=identity,
+            query=req.query,
+            discipline=req.discipline,
+            embedding_mode=embedding_mode,
+            summary_compact_level=summary_compact_level,
+        )
+        if not req.force_refresh:
+            cached_payload = _get_cached_deep_report(
+                tenant_id=tenant_id,
+                document_id=int(req.document_id),
+                cache_key=cache_key,
+            )
+            if cached_payload:
+                return cached_payload
     graph_result = await agent_chains.run_report_graph(
         query=req.query,
         discipline=req.discipline,
@@ -4901,60 +5661,121 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
         tenant_id=tenant_id,
         billing_client_id=billing_client_id,
         billing_exempt=bool(billing_exempt),
-        report_mode=report_mode,
         summary_compact_level=summary_compact_level,
     )
-    report_text = str(graph_result.get("report", "")).strip()
-    sections = graph_result.get("report_sections", []) if isinstance(graph_result.get("report_sections"), list) else []
-    citations = graph_result.get("citations", []) if isinstance(graph_result.get("citations"), list) else []
-    coverage_stats = graph_result.get("coverage_stats", {}) if isinstance(graph_result.get("coverage_stats"), dict) else {}
-    validation_graph_skipped = bool(
-        graph_result.get("validation_graph_skipped", coverage_stats.get("validation_graph_skipped", False))
+    graph_result["embedding_mode"] = embedding_mode
+    response_payload = _build_report_response_from_graph_result(
+        graph_result=graph_result,
+        summary_compact_level=summary_compact_level,
+        document_id=req.document_id,
     )
-    if not citations:
-        citations = _build_sources(graph_result.get("retrieved", []), limit=8)
-    if not citations:
-        citations = [{"title": "基于当前检索未命中", "discipline": "all", "section_path": "N/A"}]
-    short_report_guard_hit = _is_short_report_for_mode(report_text, report_mode, summary_compact_level)
-    if _is_invalid_report_text(report_text) or short_report_guard_hit:
-        fallback_payload = _fallback_summary(req.query, graph_result.get("retrieved", []), citations)
-        report_text, sections = _build_report_markdown_from_fallback(
-            fallback_payload=fallback_payload,
-            existing_sections=sections,
-            short_report=short_report_guard_hit,
+    if cache_key and isinstance(req.document_id, int) and req.document_id > 0:
+        _store_cached_deep_report(
+            tenant_id=tenant_id,
+            document_id=int(req.document_id),
+            cache_key=cache_key,
+            payload=response_payload,
         )
-        fallback_reason = str(graph_result.get("fallback_reason", "none")).strip() or "none"
-        if fallback_reason in {"none", "report_ok"}:
-            fallback_reason = "report_endpoint_short_guard" if short_report_guard_hit else "report_endpoint_fallback"
-        if (not validation_graph_skipped) and _is_report_under_coverage(coverage_stats):
-            fallback_reason = "parse_under_coverage"
-    else:
-        fallback_reason = str(graph_result.get("fallback_reason", "none")).strip() or "none"
-    if not sections:
-        fallback_payload = _fallback_summary(req.query, graph_result.get("retrieved", []), citations)
-        report_text, sections = _build_report_markdown_from_fallback(
-            fallback_payload=fallback_payload,
-            existing_sections=[],
-            short_report=False,
+    return response_payload
+
+
+# ── SSE 流式进度端点 ──────────────────────────────────────────────
+
+
+async def _run_graph_with_sse(
+    graph_coro_factory,
+    queue: "asyncio.Queue[Dict[str, Any]]",
+):
+    """在后台运行 graph，通过 queue 推送进度和最终结果。"""
+    try:
+        result = await graph_coro_factory()
+        await queue.put({"stage": "done", "result": result})
+    except Exception as exc:
+        await queue.put({"stage": "error", "message": str(exc)[:500]})
+
+
+async def _sse_event_generator(queue: "asyncio.Queue[Dict[str, Any]]"):
+    """从 queue 消费事件，生成 SSE 格式的字节流。"""
+    import json as _json
+    while True:
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=120)
+        except asyncio.TimeoutError:
+            yield f"data: {_json.dumps({'stage': 'heartbeat'})}\n\n"
+            continue
+        yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
+        if event.get("stage") in ("done", "error"):
+            break
+
+
+@app.post("/insights/report/stream")
+async def insights_report_stream(req: ReportRequest, request: Request):
+    identity = _get_request_identity(request)
+    _require_permission(identity, "tenant.insights.read")
+    if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
+        raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
+    tenant_id = str(identity.get("tenant_id", "public"))
+    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
+    _, billing_client_id = _billing_tenant_client(request)
+    billing_exempt = _embedding_billing_exempt(request)
+    summary_compact_level = _resolve_summary_compact_level(req.summary_compact_level, default=1)
+    cache_key: Optional[str] = None
+    if isinstance(req.document_id, int) and req.document_id > 0:
+        cache_key = _build_request_deep_report_cache_key(
+            identity=identity,
+            query=req.query,
+            discipline=req.discipline,
+            embedding_mode=embedding_mode,
+            summary_compact_level=summary_compact_level,
         )
-    return {
-        "report": report_text,
-        "sections": sections,
-        "five_dimensions": graph_result.get("five_dimensions", {}),
-        "five_dimensions_meta": graph_result.get("five_dimensions_meta", {}),
-        "citations": citations,
-        "provider": graph_result.get("provider", "unknown"),
-        "report_mode": report_mode,
-        "summary_compact_level": summary_compact_level,
-        "coverage_stats": coverage_stats,
-        "validation_graph_skipped": validation_graph_skipped,
-        "quality_gates": graph_result.get("quality_gates", {}),
-        "fallback_reason": fallback_reason,
-        "document_id": req.document_id,
-        "agent_trace": graph_result.get("agent_trace", []),
-        "cost_profile": graph_result.get("cost_profile", {}),
-        "embedding_mode": embedding_mode,
-    }
+        if not req.force_refresh:
+            cached_payload = _get_cached_deep_report(
+                tenant_id=tenant_id,
+                document_id=int(req.document_id),
+                cache_key=cache_key,
+            )
+            if cached_payload:
+                async def _cached_stream():
+                    yield f"data: {json.dumps({'stage': 'done', 'result': cached_payload}, ensure_ascii=False)}\n\n"
+                return StreamingResponse(_cached_stream(), media_type="text/event-stream")
+
+    queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+    def progress_callback(event: Dict[str, Any]):
+        try:
+            queue.put_nowait(event)
+        except Exception:
+            pass
+
+    async def _run():
+        graph_result = await agent_chains.run_report_graph(
+            query=req.query,
+            discipline=req.discipline,
+            document_id=req.document_id,
+            embedding_mode=embedding_mode,
+            tenant_id=tenant_id,
+            billing_client_id=billing_client_id,
+            billing_exempt=bool(billing_exempt),
+            summary_compact_level=summary_compact_level,
+            _progress_callback=progress_callback,
+        )
+        graph_result["embedding_mode"] = embedding_mode
+        response_payload = _build_report_response_from_graph_result(
+            graph_result=graph_result,
+            summary_compact_level=summary_compact_level,
+            document_id=req.document_id,
+        )
+        if cache_key and isinstance(req.document_id, int) and req.document_id > 0:
+            _store_cached_deep_report(
+                tenant_id=tenant_id,
+                document_id=int(req.document_id),
+                cache_key=cache_key,
+                payload=response_payload,
+            )
+        return response_payload
+
+    asyncio.create_task(_run_graph_with_sse(_run, queue))
+    return StreamingResponse(_sse_event_generator(queue), media_type="text/event-stream")
 
 
 def _spawn_deep_pipeline(job_id: str, tenant_id: str, user_id: str, roles: List[str]) -> None:
@@ -5260,9 +6081,7 @@ def _is_invalid_report_text(value: str) -> bool:
     return False
 
 
-def _is_short_report_for_mode(text: str, report_mode: str, compact_level: int) -> bool:
-    if str(report_mode or "full").strip().lower() != "full":
-        return False
+def _is_short_report(text: str, compact_level: int) -> bool:
     effective_chars = len(re.sub(r"\s+", "", (text or "").strip()))
     if compact_level == 0:
         return effective_chars < 700

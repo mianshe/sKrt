@@ -73,3 +73,15 @@ async def download_to_file(cfg: SupabaseStorageConfig, *, bucket: str, key: str,
         resp.raise_for_status()
         dest_path.write_bytes(resp.content)
 
+
+async def delete_object(cfg: SupabaseStorageConfig, *, bucket: str, key: str) -> None:
+    endpoint = f"{cfg.url}/storage/v1/object/{bucket}/{key.lstrip('/')}"
+    headers = {
+        "authorization": f"Bearer {cfg.service_role_key}",
+        "apikey": cfg.service_role_key,
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.delete(endpoint, headers=headers)
+        if resp.status_code not in {200, 204, 404}:
+            resp.raise_for_status()
+

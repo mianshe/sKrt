@@ -1,5 +1,5 @@
-from backend.services.security_context import to_identity_context
-from backend.runtime_config import RuntimeConfig
+from .security_context import to_identity_context
+from runtime_config import RuntimeConfig
 
 
 def test_identity_context_from_claims():

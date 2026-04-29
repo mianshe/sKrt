@@ -1,407 +1,491 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import ChatMessage, { ChatItem } from "../components/ChatMessage";
-import { ExamChunkUploadResult } from "../hooks/useDocuments";
+import { FileText, MessageSquare, Send, Sparkles, Trash2, Upload } from "lucide-react";
+import { withTenantHeaders, type DocumentItem } from "../hooks/useDocuments";
 import { API_BASE } from "../config/apiBase";
 import { useEmbeddingModePreference } from "../lib/embeddingMode";
 
 const CHAT_STORAGE_KEY = "xm_chat_state_v1";
 const CHAT_SESSION_KEY = "xm_chat_session_id_v1";
-const TENANT_KEY = "xm_tenant_id";
+
+type ChatItem = {
+  role: "user" | "assistant";
+  content: string;
+  sources?: Array<{ title: string; section_path: string }>;
+  examAnalysis?: {
+    question_count: number;
+    structure_summary?: { lines?: string[] };
+    questions?: Array<{
+      number_path?: string;
+      question_type?: string;
+      text?: string;
+      section_title?: string | null;
+      ai_answer?: string;
+      brief_reasoning?: string[];
+      evidence?: Array<{ title?: string; section_path?: string }>;
+      material_text?: string | null;
+      level?: number;
+    }>;
+  };
+};
 
 type Props = {
-  onUploadExamByChunks: (file: File, discipline: string, onUploadProgress?: (percent: number) => void) => Promise<ExamChunkUploadResult>;
+  documents: DocumentItem[];
+  onUploadExamByChunks: (
+    file: File,
+    discipline: string,
+    onUploadProgress?: (percent: number) => void
+  ) => Promise<any>;
 };
 
-type ExamAnalysis = {
-  question_count: number;
-  difficulty: {
-    average_score: number;
-    distribution: { easy: number; medium: number; hard: number };
-  };
-  questions: Array<{
-    id: number;
-    text: string;
-    level?: number;
-    number_path?: string;
-    marker_type?: string;
-    question_type?: string;
-    difficulty_score: number;
-    difficulty_level: string;
-    ai_answer?: string;
-    brief_reasoning?: string[];
-    evidence?: Array<{ title: string; section_path: string; discipline: string }>;
-    answer_strategy?: {
-      concept_induction: string;
-      information_compression: string;
-      reverse_check: string;
-      distractor_design: string;
-    };
-    qa_gates?: {
-      consistency: boolean;
-      evidence_traceable: boolean;
-      reasoning_visibility: boolean;
-      passed: boolean;
-      failed_checks: string[];
-    };
-    options?: Array<{ label: string; text: string }>;
-    material_id?: string | null;
-    material_text?: string | null;
-    parent_path?: string | null;
-    section_title?: string | null;
-  }>;
-  qa_regression_gates?: {
-    consistency_pass_rate: number;
-    evidence_traceable_pass_rate: number;
-    reasoning_visibility_pass_rate: number;
-    overall_pass_rate: number;
-  };
-  recommendations: Array<{ rank: number; title: string; section_path: string; reason: string }>;
-};
-
-const QUESTION_TYPE_LABELS: Record<string, string> = {
-  choice: "选择题", fill_blank: "填空题", true_false: "判断题",
-  short_answer: "简答题", essay: "论述题", calculation: "计算题",
-  proof: "证明题", design: "设计题", material_analysis: "材料分析题",
-  standard: "标准题",
-};
-
-type PersistedChatState = {
-  messages: ChatItem[];
-  query: string;
-  latestExamAnalysis: ExamAnalysis | null;
-};
-
-function loadPersistedState(): PersistedChatState | null {
+function loadPersistedState(): { messages: ChatItem[] } | null {
   try {
     const raw = localStorage.getItem(CHAT_STORAGE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as PersistedChatState;
+    return JSON.parse(raw);
   } catch {
     return null;
   }
 }
 
-function ChatTab({ onUploadExamByChunks }: Props) {
+async function readErrorMessage(resp: Response): Promise<string> {
+  const fallback = `Request failed (${resp.status})`;
+  try {
+    const data = await resp.json();
+    if (typeof data?.detail === "string" && data.detail.trim()) return data.detail.trim();
+    if (typeof data?.message === "string" && data.message.trim()) return data.message.trim();
+  } catch {
+    // ignore
+  }
+  try {
+    const text = (await resp.text()).trim();
+    if (text) return text;
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
+function ChatTab({ documents, onUploadExamByChunks }: Props) {
   const persisted = loadPersistedState();
   const [messages, setMessages] = useState<ChatItem[]>(persisted?.messages || []);
-  const [query, setQuery] = useState(persisted?.query || "");
-  const discipline = "all";
-  const mode: "free" = "free";
-  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
+  const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [queryStatus, setQueryStatus] = useState("");
   const [examFile, setExamFile] = useState<File | null>(null);
+  const [lastExamFile, setLastExamFile] = useState<File | null>(null);
   const [examUploading, setExamUploading] = useState(false);
-  const [examUploadProgress, setExamUploadProgress] = useState(0);
-  const [examError, setExamError] = useState("");
-  const [latestExamAnalysis, setLatestExamAnalysis] = useState<ExamAnalysis | null>(persisted?.latestExamAnalysis || null);
+  const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
+  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
+
   const sessionId = useMemo(() => {
     const existed = localStorage.getItem(CHAT_SESSION_KEY);
-    if (existed && existed.trim()) return existed.trim();
-    const next = `sess-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    if (existed) return existed;
+    const next = `sess-${Math.random().toString(36).slice(2, 10)}`;
     localStorage.setItem(CHAT_SESSION_KEY, next);
     return next;
   }, []);
-  const tenantId = useMemo(() => localStorage.getItem(TENANT_KEY)?.trim() || "public", []);
 
-  const disabled = useMemo(() => !query.trim() || loading, [query, loading]);
   useEffect(() => {
-    const payload: PersistedChatState = {
-      messages,
-      query,
-      latestExamAnalysis,
-    };
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(payload));
-  }, [messages, query, latestExamAnalysis]);
+    if (!documents.length) {
+      setSelectedDocId(null);
+      return;
+    }
+    if (selectedDocId != null && !documents.some((doc) => doc.id === selectedDocId)) {
+      setSelectedDocId(null);
+    }
+  }, [documents, selectedDocId]);
+
+  useEffect(() => {
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify({ messages }));
+  }, [messages]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (disabled) return;
+    if (!query.trim() || loading) return;
 
     const userText = query.trim();
     setQuery("");
     setMessages((prev) => [...prev, { role: "user", content: userText }]);
     setLoading(true);
-    setQueryStatus("正在检索相关内容…");
+    setQueryStatus("Searching...");
 
     try {
-      const resp = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
-        body: JSON.stringify({ query: userText, discipline, mode, session_id: sessionId, embedding_mode: embeddingMode }),
-      });
-      if (!resp.ok) throw new Error("查询请求失败");
-      const data = await resp.json();
-      setQueryStatus("正在生成回答…");
+      const requestChat = async (mode: "local" | "api") =>
+        fetch(`${API_BASE}/chat`, {
+          method: "POST",
+          headers: withTenantHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            query: userText,
+            session_id: sessionId,
+            embedding_mode: mode,
+            scope: selectedDocId ? "document" : "library",
+            document_id: selectedDocId ?? undefined,
+          }),
+        });
 
-      const fullText = String(data.answer || "");
+      let response = await requestChat(embeddingMode);
+
+      if (!response.ok) {
+        const firstError = await readErrorMessage(response);
+        const tokenInsufficient =
+          response.status === 429 && /embedding-3 token.*不足|token.*不足/i.test(firstError);
+        if (tokenInsufficient && embeddingMode !== "local") {
+          setQueryStatus("API 额度不足，切到本地向量重试...");
+          response = await requestChat("local");
+        } else {
+          throw new Error(firstError);
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response));
+      }
+
+      const data = await response.json();
       const aiItem: ChatItem = {
         role: "assistant",
-        content: "",
-        brief_reasoning: Array.isArray(data.brief_reasoning) ? data.brief_reasoning : [],
-        agent_trace: Array.isArray(data.agent_trace) ? data.agent_trace : [],
+        content: data.answer || "",
         sources: data.sources || [],
-        cross_discipline: data.cross_discipline || [],
       };
       setMessages((prev) => [...prev, aiItem]);
-
-      for (let i = 1; i <= fullText.length; i += 5) {
-        await new Promise((r) => setTimeout(r, 16));
-        setMessages((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last?.role === "assistant") {
-            next[next.length - 1] = { ...last, content: fullText.slice(0, i) };
-          }
-          return next;
-        });
-      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: err instanceof Error ? err.message : "请求失败，请稍后重试。" },
+        { role: "assistant", content: "Error: " + (err instanceof Error ? err.message : "Request failed") },
       ]);
     } finally {
-      setQueryStatus("");
       setLoading(false);
+      setQueryStatus("");
     }
   };
 
-  const handleExamUpload = async () => {
-    if (!examFile) return;
+  const handleClearChat = () => {
+    if (!window.confirm("确认清空全部对话记录吗？")) return;
+    setMessages([]);
+    localStorage.removeItem(CHAT_STORAGE_KEY);
+  };
+
+  const runExamUpload = async (file: File) => {
     setExamUploading(true);
-    setExamError("");
-    setExamUploadProgress(0);
     try {
-      const payload = await onUploadExamByChunks(examFile, discipline || "all", setExamUploadProgress);
-      const analysis = (payload.analysis || null) as ExamAnalysis | null;
-      if (!analysis) throw new Error("未返回有效分析结果");
-      setLatestExamAnalysis(analysis);
+      const res = await onUploadExamByChunks(file, "all");
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `已完成题目文件解析与作答：共 ${analysis.question_count} 题，平均难度 ${analysis.difficulty?.average_score ?? 0}。`,
+          content: `Exam analyzed: ${res.analysis.question_count} questions found.`,
+          examAnalysis: {
+            question_count: res.analysis.question_count,
+            structure_summary: res.analysis.structure_summary,
+            questions: Array.isArray(res.analysis.questions) ? res.analysis.questions : [],
+          },
         },
       ]);
+      setLastExamFile(file);
       setExamFile(null);
-    } catch (e) {
-      setExamError(e instanceof Error ? e.message : "题目上传分析失败");
+    } catch {
+      alert("Exam analysis failed");
     } finally {
       setExamUploading(false);
     }
   };
 
-  const handleClearChat = async () => {
-    if (!window.confirm("确认清空当前对话与本地缓存吗？")) return;
-    try {
-      await fetch(`${API_BASE}/chat/memory`, {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json", "X-Tenant-Id": tenantId },
-        body: JSON.stringify({ session_id: sessionId }),
-      });
-    } catch {
-      // ignore network errors for local clear
-    }
-    setMessages([]);
-    setQuery("");
-    setLatestExamAnalysis(null);
-    setExamError("");
-    setExamFile(null);
-    setExamUploadProgress(0);
-    localStorage.removeItem(CHAT_STORAGE_KEY);
+  const renderExamAnalysis = (analysis?: ChatItem["examAnalysis"]) => {
+    if (!analysis) return null;
+    const summaryLines = Array.isArray(analysis.structure_summary?.lines)
+      ? analysis.structure_summary.lines.filter(Boolean).slice(0, 3)
+      : [];
+    const questions = Array.isArray(analysis.questions) ? analysis.questions : [];
+
+    return (
+      <div className="mt-4 border-t-2 border-black/10 pt-3 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="neo-box-sm bg-cyan-300 px-2 py-1 text-[10px] font-black uppercase">
+            Parsed {analysis.question_count} Questions
+          </span>
+          <span className="text-[10px] font-black uppercase opacity-50">Exam Tree</span>
+        </div>
+
+        {summaryLines.length > 0 && (
+          <div className="space-y-1">
+            {summaryLines.map((line, idx) => (
+              <div key={idx} className="text-[11px] font-bold leading-relaxed opacity-80">
+                {line}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {questions.length > 0 && (
+          <details className="neo-box-sm bg-slate-50 p-3" open>
+            <summary className="cursor-pointer text-[11px] font-black uppercase tracking-wider">
+              View Parsed Questions
+            </summary>
+            <div className="mt-3 space-y-2">
+              {questions.map((question, idx) => (
+                <details
+                  key={`${question.number_path || idx}-${idx}`}
+                  className="border-2 border-black/10 bg-white px-3 py-2"
+                >
+                  <summary className="cursor-pointer list-none">
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] font-black uppercase">
+                      <span className="bg-yellow-300 px-1.5 py-0.5">Q{question.number_path || idx + 1}</span>
+                      <span className="bg-pink-200 px-1.5 py-0.5">{question.question_type || "standard"}</span>
+                      {question.section_title ? (
+                        <span className="bg-cyan-100 px-1.5 py-0.5 normal-case">Section: {question.section_title}</span>
+                      ) : null}
+                      {typeof question.level === "number" ? (
+                        <span className="bg-slate-200 px-1.5 py-0.5">L{question.level}</span>
+                      ) : null}
+                    </div>
+                    <div className="mt-2 text-[12px] font-bold leading-relaxed whitespace-pre-wrap">
+                      {question.text || "(empty question)"}
+                    </div>
+                  </summary>
+
+                  <div className="mt-3 border-t-2 border-black/10 pt-3 space-y-3">
+                    <div>
+                      <div className="text-[10px] font-black uppercase opacity-50">AI Answer</div>
+                      <div className="mt-1 text-[12px] font-bold leading-relaxed whitespace-pre-wrap">
+                        {question.ai_answer || "暂无作答结果"}
+                      </div>
+                    </div>
+
+                    {Array.isArray(question.brief_reasoning) && question.brief_reasoning.length > 0 && (
+                      <div>
+                        <div className="text-[10px] font-black uppercase opacity-50">Brief Reasoning</div>
+                        <div className="mt-1 space-y-1">
+                          {question.brief_reasoning.slice(0, 3).map((line, reasoningIdx) => (
+                            <div
+                              key={`${question.number_path || idx}-reason-${reasoningIdx}`}
+                              className="text-[11px] font-bold leading-relaxed"
+                            >
+                              {reasoningIdx + 1}. {line}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {Array.isArray(question.evidence) && question.evidence.length > 0 && (
+                      <div>
+                        <div className="text-[10px] font-black uppercase opacity-50">Evidence</div>
+                        <div className="mt-1 flex flex-wrap gap-2">
+                          {question.evidence.slice(0, 4).map((item, evidenceIdx) => (
+                            <div
+                              key={`${question.number_path || idx}-evidence-${evidenceIdx}`}
+                              className="neo-box-sm bg-yellow-100 px-2 py-1 text-[10px] font-black"
+                            >
+                              {(item.title || "Untitled").trim()}
+                              {item.section_path ? ` (${item.section_path})` : ""}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {question.material_text ? (
+                      <details className="neo-box-sm bg-cyan-50 p-2">
+                        <summary className="cursor-pointer text-[10px] font-black uppercase tracking-wider">
+                          View Related Material
+                        </summary>
+                        <div className="mt-2 text-[11px] font-bold leading-relaxed whitespace-pre-wrap">
+                          {question.material_text}
+                        </div>
+                      </details>
+                    ) : null}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </details>
+        )}
+      </div>
+    );
   };
 
   return (
-    <section className="space-y-3">
-      <div className="card p-4">
-        <p className="text-sm font-medium text-violet-600">当前模式：查询</p>
-        <p className="mt-1 text-xs text-slate-500">学科与文档类型由系统自动理解。</p>
-      </div>
+    <div className="flex flex-col h-[650px] gap-6">
+      <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-6">
+        {messages.length === 0 && (
+          <div className="h-full flex flex-col items-center justify-center text-center opacity-30 grayscale p-10">
+            <MessageSquare size={80} strokeWidth={1} />
+            <p className="mt-4 text-xl font-black uppercase tracking-widest">暂无对话</p>
+          </div>
+        )}
 
-      <div className="mt-3 flex flex-wrap gap-2 text-xs">
-        <button
-          type="button"
-          className={`rounded-full px-3 py-1 ${embeddingMode === "auto" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-          onClick={() => setEmbeddingMode("auto")}
-        >
-          自动向量
-        </button>
-        <button
-          type="button"
-          className={`rounded-full px-3 py-1 ${embeddingMode === "local" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-          onClick={() => setEmbeddingMode("local")}
-        >
-          本地向量
-        </button>
-        <button
-          type="button"
-          className={`rounded-full px-3 py-1 ${embeddingMode === "api" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-          onClick={() => setEmbeddingMode("api")}
-        >
-          API 向量
-        </button>
-      </div>
-      <p className="px-4 text-xs text-amber-700">切换模式后，全局检索只会命中同一向量模型下的文档。</p>
+        {messages.map((msg, idx) => (
+          <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+            <div
+              className={`max-w-[85%] neo-box p-4 ${
+                msg.role === "user" ? "bg-blue-400 text-white rotate-1" : "bg-white rotate-[-0.5deg]"
+              }`}
+            >
+              <div className="text-[10px] font-black uppercase opacity-60 mb-2 border-b-2 border-current pb-1">
+                {msg.role === "user" ? "用户" : "AI助手"}
+              </div>
+              <p className="text-sm font-bold leading-relaxed whitespace-pre-wrap">{msg.content}</p>
 
-      <div className="card h-[430px] overflow-y-auto p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <p className="text-xs text-slate-500">对话记录</p>
-          <button className="btn-primary" type="button" onClick={handleClearChat} disabled={loading || examUploading}>
-            清空对话
-          </button>
-        </div>
-        {messages.length === 0 && <p className="text-sm text-slate-500">输入问题开始对话，系统将自动返回溯源片段。</p>}
-        {messages.map((m, idx) => (
-          <ChatMessage key={idx} item={m} />
+              {msg.sources && msg.sources.length > 0 && (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {msg.sources.map((s, i) => (
+                    <div key={i} className="neo-box-sm bg-yellow-400 text-[9px] font-black px-2 py-1 flex items-center gap-1">
+                      <FileText size={10} /> {s.title}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {renderExamAnalysis(msg.examAnalysis)}
+            </div>
+          </div>
         ))}
-      </div>
 
-      <div className="card p-4">
-        <h3 className="mb-2 text-sm font-semibold text-violet-600">✦ 上传题目文件自动解析并作答</h3>
-        <input
-          type="file"
-          className="input"
-          accept=".pdf,.doc,.docx,.txt,.md,.markdown"
-          onChange={(e) => setExamFile(e.target.files?.[0] || null)}
-        />
-        <div className="mt-2 flex items-center justify-between">
-          <p className="text-xs text-slate-500">
-            {examFile ? `已选择：${examFile.name}` : "上传题目文件后会自动走解析 + 作答流程"}
-          </p>
-          <button className="btn-primary" type="button" disabled={!examFile || examUploading} onClick={handleExamUpload}>
-            {examUploading ? "分析中..." : "上传并分析"}
-          </button>
-        </div>
-        {examUploading && (
-          <div className="mt-2">
-            <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
-              <span>题目文件上传</span>
-              <span>{examUploadProgress}%</span>
-            </div>
-            <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-              <div className="h-full bg-indigo-600 transition-all" style={{ width: `${examUploadProgress}%` }} />
+        {loading && (
+          <div className="flex justify-start">
+            <div className="neo-box bg-yellow-400 p-4 animate-pulse">
+              <p className="text-xs font-black uppercase">{queryStatus || "Thinking..."}</p>
             </div>
           </div>
         )}
-        {examError && <p className="mt-2 text-xs text-rose-600">{examError}</p>}
+      </div>
 
-        {latestExamAnalysis && (
-          <div className="mt-3 space-y-2 rounded-2xl bg-gradient-to-br from-white to-violet-50/70 p-3 ring-1 ring-violet-100">
-            <p className="text-xs text-slate-700">
-              题目数：{latestExamAnalysis.question_count} · 平均难度：{latestExamAnalysis.difficulty?.average_score ?? 0}
-            </p>
-            <p className="text-xs text-slate-700">
-              难度分布：易 {latestExamAnalysis.difficulty?.distribution?.easy ?? 0} / 中{" "}
-              {latestExamAnalysis.difficulty?.distribution?.medium ?? 0} / 难 {latestExamAnalysis.difficulty?.distribution?.hard ?? 0}
-            </p>
-            <div>
-              <p className="text-xs font-semibold text-slate-700">
-                AI 作答（共 {latestExamAnalysis.questions?.length ?? latestExamAnalysis.question_count} 题）
-              </p>
-              <ul className="mt-1 max-h-[min(60vh,520px)] space-y-2 overflow-y-auto pr-1 text-xs text-slate-700">
-                {(latestExamAnalysis.questions || []).map((q) => {
-                  const preview =
-                    q.text.length > 100 ? `${q.text.slice(0, 100).replace(/\s+/g, " ")}…` : q.text;
-                  return (
-                    <li key={`qa-${q.id}`} className="rounded-lg border border-slate-200 bg-white">
-                      <details className="group px-2 py-2">
-                        <summary className="cursor-pointer list-none font-medium marker:content-none [&::-webkit-details-marker]:hidden">
-                          <span className="text-indigo-700">{q.number_path ? `Q${q.number_path}` : `Q${q.id}`}</span>
-                          <span className="ml-1 text-slate-600">{preview}</span>
-                        </summary>
-                        <div className="mt-2 border-t border-slate-100 pt-2">
-                          <p className="whitespace-pre-wrap text-slate-800">{q.text}</p>
-                          <p className="mt-2 text-slate-600">{q.ai_answer || "暂无作答结果"}</p>
-                          {Array.isArray(q.brief_reasoning) && q.brief_reasoning.length > 0 && (
-                            <details className="mt-1 rounded-md bg-slate-50 px-2 py-1 text-[11px] text-slate-600">
-                              <summary className="cursor-pointer font-medium">简版思路</summary>
-                              <ul className="mt-1 list-disc pl-4">
-                                {q.brief_reasoning.slice(0, 3).map((line, idx) => (
-                                  <li key={`exam-brief-${q.id}-${idx}`}>{line}</li>
-                                ))}
-                              </ul>
-                            </details>
-                          )}
-                          {Array.isArray(q.evidence) && q.evidence.length > 0 && (
-                            <p className="mt-1 text-[11px] text-slate-500">
-                              依据：{q.evidence.map((e) => `${e.title}(${e.section_path})`).join("；")}
-                            </p>
-                          )}
-                          {q.answer_strategy && (
-                            <p className="mt-1 text-[11px] text-slate-500">
-                              干扰项设计：{q.answer_strategy.distractor_design || "暂无说明"}
-                            </p>
-                          )}
-                          <p className="mt-1 text-[11px] text-slate-500">
-                            层级：{q.level ?? 1} · 题型：{QUESTION_TYPE_LABELS[q.question_type || "standard"] || q.question_type}
-                            {q.section_title && ` · 所属：${q.section_title}`}
-                          </p>
-                          {q.options && q.options.length > 0 && (
-                            <div className="mt-1 space-y-0.5">
-                              {q.options.map((opt) => (
-                                <p key={opt.label} className="text-[11px] text-slate-600 pl-2">
-                                  <span className="font-semibold">{opt.label}.</span> {opt.text}
-                                </p>
-                              ))}
-                            </div>
-                          )}
-                          {q.material_text && (
-                            <details className="mt-1">
-                              <summary className="text-[11px] text-indigo-500 cursor-pointer">查看相关材料</summary>
-                              <p className="mt-0.5 text-[11px] text-slate-500 whitespace-pre-wrap pl-2">
-                                {q.material_text.slice(0, 600)}{q.material_text.length > 600 ? "..." : ""}
-                              </p>
-                            </details>
-                          )}
-                          {q.qa_gates && (
-                            <p className={`mt-1 text-[11px] ${q.qa_gates.passed ? "text-emerald-600" : "text-amber-600"}`}>
-                              门禁：一致性 {q.qa_gates.consistency ? "通过" : "未通过"} / 证据可追溯{" "}
-                              {q.qa_gates.evidence_traceable ? "通过" : "未通过"} / 思路可见性{" "}
-                              {q.qa_gates.reasoning_visibility ? "通过" : "未通过"}
-                            </p>
-                          )}
-                        </div>
-                      </details>
-                    </li>
-                  );
-                })}
-              </ul>
-            </div>
-            {latestExamAnalysis.qa_regression_gates && (
-              <p className="text-[11px] text-slate-600">
-                回归门禁通过率：一致性 {(latestExamAnalysis.qa_regression_gates.consistency_pass_rate * 100).toFixed(0)}% · 证据可追溯{" "}
-                {(latestExamAnalysis.qa_regression_gates.evidence_traceable_pass_rate * 100).toFixed(0)}% · 思路可见性{" "}
-                {(latestExamAnalysis.qa_regression_gates.reasoning_visibility_pass_rate * 100).toFixed(0)}%
-              </p>
-            )}
-            <div>
-              <p className="text-xs font-semibold text-slate-700">推荐资料</p>
-              <ul className="mt-1 space-y-1 text-xs text-slate-600">
-                {(latestExamAnalysis.recommendations || []).slice(0, 4).map((item) => (
-                  <li key={`${item.rank}-${item.title}`}>- {item.title || "未命名资料"} · {item.section_path || "N/A"}</li>
+      <div className="neo-box bg-slate-900 p-6">
+        <div className="flex justify-between items-center mb-4 gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
+            <button
+              onClick={handleClearChat}
+              className="text-white hover:text-pink-500 transition-colors"
+              title="Clear Chat"
+            >
+              <Trash2 size={20} />
+            </button>
+            <div className="h-6 w-1 bg-white/20" />
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-black uppercase text-white/40 tracking-widest">范围:</span>
+              <select
+                className="bg-transparent text-white font-black uppercase text-[10px] outline-none cursor-pointer hover:text-blue-400"
+                value={selectedDocId ?? ""}
+                onChange={(e) => setSelectedDocId(e.target.value ? Number(e.target.value) : null)}
+              >
+                <option value="" className="bg-slate-900">
+                  Knowledge Base
+                </option>
+                {documents.map((doc) => (
+                  <option key={doc.id} value={doc.id} className="bg-slate-900">
+                    {doc.filename || doc.title}
+                  </option>
                 ))}
-              </ul>
+              </select>
+              {selectedDocId ? (
+                <span className="text-[9px] text-green-400 font-bold ml-2 bg-green-400/10 px-1.5 py-0.5 border border-green-400/20">
+                  仅当前文档
+                </span>
+              ) : (
+                <span className="text-[9px] text-yellow-400 font-bold ml-2 bg-yellow-400/10 px-1.5 py-0.5 border border-yellow-400/20">
+                  全部文档
+                </span>
+              )}
+            </div>
+            <div className="h-6 w-1 bg-white/20" />
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-black uppercase text-white/40 tracking-widest">向量:</span>
+              <button
+                type="button"
+                onClick={() => setEmbeddingMode("local")}
+                className={`px-2 py-1 text-[10px] font-black uppercase border ${
+                  embeddingMode === "local"
+                    ? "bg-cyan-300 text-slate-900 border-cyan-300"
+                    : "text-white/70 border-white/20"
+                }`}
+              >
+                本地
+              </button>
+              <button
+                type="button"
+                onClick={() => setEmbeddingMode("api")}
+                className={`px-2 py-1 text-[10px] font-black uppercase border ${
+                  embeddingMode === "api"
+                    ? "bg-pink-400 text-white border-pink-400"
+                    : "text-white/70 border-white/20"
+                }`}
+              >
+                API
+              </button>
             </div>
           </div>
-        )}
-      </div>
 
-      <form className="card p-4" onSubmit={handleSubmit}>
-        <textarea
-          className="input min-h-[88px] resize-none"
-          placeholder="请输入查询内容，例如：从控制论视角比较深度学习与系统优化"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        {loading && queryStatus && <p className="mt-2 text-xs text-violet-600">{queryStatus}</p>}
-        <div className="mt-2 flex justify-end">
-          <button className="btn-primary" disabled={disabled} type="submit">
-            {loading ? "处理中..." : "查询"}
-          </button>
+          {lastExamFile ? (
+            <button
+              type="button"
+              onClick={() => runExamUpload(lastExamFile)}
+              disabled={examUploading}
+              className="text-[10px] font-black uppercase tracking-widest text-cyan-300 hover:text-cyan-100 disabled:opacity-40"
+            >
+              重试上次试卷
+            </button>
+          ) : null}
+
+          <label className="cursor-pointer group">
+            <input
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0] || null;
+                setExamFile(file);
+                if (file) setLastExamFile(file);
+              }}
+            />
+            <div className="flex items-center gap-2 text-white/60 group-hover:text-pink-400 transition-colors">
+              <Upload size={16} />
+              <span className="text-[10px] font-black uppercase tracking-widest">上传考试</span>
+            </div>
+          </label>
         </div>
-      </form>
-    </section>
+
+        {examFile && (
+          <div className="neo-box-sm bg-pink-500 text-white p-2 mb-4 flex justify-between items-center">
+            <span className="text-xs font-black truncate max-w-[200px]">{examFile.name}</span>
+            <button
+              onClick={() => runExamUpload(examFile)}
+              disabled={examUploading}
+              className="bg-white text-slate-900 px-3 py-1 text-[10px] font-black uppercase"
+            >
+              {examUploading ? "分析中..." : "开始分析"}
+            </button>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="relative flex gap-3">
+          <textarea
+            className="flex-1 neo-input min-h-[50px] max-h-[150px] py-2 pr-12 text-sm font-bold placeholder:opacity-50"
+            placeholder="询问关于文档的任何内容..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSubmit(e);
+              }
+            }}
+          />
+          <button
+            type="submit"
+            disabled={!query.trim() || loading}
+            className="neo-button bg-pink-500 text-white p-4 disabled:opacity-30 disabled:grayscale transition-all"
+          >
+            <Send size={20} />
+          </button>
+        </form>
+
+        <div className="mt-4 flex justify-center">
+          <div className="flex items-center gap-2 text-[9px] font-black text-white/30 uppercase tracking-[0.3em]">
+            <Sparkles size={10} />
+            AI Knowledge Engine
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

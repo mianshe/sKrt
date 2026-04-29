@@ -22,12 +22,13 @@ Validation already completed in this repo:
 - `npm run cap:sync`: passed
 - `gradlew assembleDebug`: currently blocked because Android SDK is not configured
 
-## Planned Local-First Work
+## Current Local-First Work
 
-- local original-file persistence on device
-- local process-file persistence on device
-- update reminder dialog with download jump
-- later native plugins only when truly needed
+- guest document copies are persisted to device-local app storage
+- logged-in user process backups are persisted to device-local app storage
+- the shared frontend uses a Capacitor filesystem bridge when available
+
+If the native bridge is unavailable for any reason, the app falls back to browser IndexedDB inside the WebView.
 
 ## Useful Commands
 

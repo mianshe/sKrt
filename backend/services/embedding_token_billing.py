@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from backend.services import knowledge_store
+from . import knowledge_store
 
 
 def get_token_balance(tenant_id: str, client_id: str) -> int:

@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS vectors (
     section_path TEXT NOT NULL,
     embedding TEXT NOT NULL,
     page_num INTEGER NOT NULL DEFAULT 0,
-    chunk_type TEXT NOT NULL DEFAULT 'knowledge'
+    chunk_type TEXT NOT NULL DEFAULT 'knowledge',
+    metadata TEXT DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS kg_relations (

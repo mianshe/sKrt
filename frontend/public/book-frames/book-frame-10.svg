@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="460" height="620" viewBox="0 0 460 620" xmlns="http://www.w3.org/2000/svg">
+  <!-- Book spine (center) -->
+  <rect x="230" y="0" width="8" height="620" fill="#3a3530"/>
+  
+  <!-- Left page (book interior) - slightly more visible than frame 09 -->
+  <rect x="0" y="0" width="230" height="620" rx="20" ry="20" fill="#dbe8ff" stroke="#999999" stroke-width="1"/>
+  
+  <!-- Left page content - enhanced details -->
+  <rect x="30" y="50" width="170" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.3)"/>
+  <rect x="30" y="80" width="150" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.3)"/>
+  <rect x="30" y="110" width="130" height="20" rx="4" ry="4" fill="rgba(57,52,45,0.2)"/>
+  <rect x="30" y="150" width="120" height="60" rx="8" ry="8" fill="#fff5b9" stroke="rgba(57,52,45,0.2)" stroke-width="1"/>
+  <text x="90" y="180" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#666666">解析笔记</text>
+  
+  <!-- Decorative lines on left page -->
+  <line x1="30" y1="220" x2="200" y2="220" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  <line x1="30" y1="240" x2="180" y2="240" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  <line x1="30" y1="260" x2="160" y2="260" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  
+  <!-- Right page (knowledge page - fully loaded) -->
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Knowledge page shadow -->
+  <rect x="248" y="10" width="222" height="620" rx="20" ry="20" fill="rgba(57,52,45,0.15)" stroke="none"/>
+  <rect x="238" y="0" width="222" height="620" rx="20" ry="20" fill="white" stroke="#39342d" stroke-width="2"/>
+  
+  <!-- Inner border -->
+  <rect x="250" y="12" width="198" height="596" rx="14" ry="14" fill="none" stroke="rgba(57,52,45,0.1)" stroke-width="1"/>
+  
+  <!-- Knowledge page title (bold and centered) -->
+  <text x="349" y="80" text-anchor="middle" font-family="Arial, sans-serif" font-size="32" font-weight="900" fill="#39342d" letter-spacing="0.12em">解析页</text>
+  <text x="349" y="120" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#666666">知识内容已准备就绪</text>
+  
+  <!-- Content area with proper shadow -->
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#f0f5ff" stroke="#cccccc" stroke-width="1"/>
+  <rect x="260" y="160" width="180" height="400" rx="16" ry="16" fill="rgba(57,52,45,0.05)" stroke="none"/>
+  <rect x="260" y="150" width="180" height="400" rx="16" ry="16" fill="#f0f5ff" stroke="#cccccc" stroke-width="1"/>
+  
+  <!-- Content heading -->
+  <rect x="270" y="170" width="160" height="30" rx="6" ry="6" fill="#90aee5" stroke="none"/>
+  <text x="350" y="190" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="white">文档解析结果</text>
+  
+  <!-- Content items with better styling -->
+  <rect x="270" y="220" width="160" height="40" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+  <text x="350" y="245" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#39342d">概念提取</text>
+  
+  <rect x="270" y="270" width="160" height="40" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+  <text x="350" y="295" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#39342d">关键词分析</text>
+  
+  <rect x="270" y="320" width="160" height="40" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+  <text x="350" y="345" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#39342d">知识关联</text>
+  
+  <rect x="270" y="370" width="160" height="40" rx="6" ry="6" fill="white" stroke="#ddd" stroke-width="1"/>
+  <text x="350" y="395" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#39342d">学习建议</text>
+</svg>

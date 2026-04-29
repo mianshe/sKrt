@@ -11,8 +11,8 @@ import logging
 import os
 from typing import Optional
 
-from backend.services import knowledge_store
-from backend.services.gpu_autostart_cloud import gpu_autostart_enabled, stop_gpu_instances
+from . import knowledge_store
+from .gpu_autostart_cloud import gpu_autostart_enabled, stop_gpu_instances
 
 logger = logging.getLogger(__name__)
 

@@ -604,5 +604,35 @@ BEGIN
     END IF;
 END $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_kg_nodes_job_role_key_discrim
+CREATE INDEX IF NOT EXISTS uq_kg_nodes_job_role_key_discrim
     ON kg_nodes (job_id, graph_role, external_key, segment_discrim);
+
+-- 事实暂存表：用于存储各批次提取的原始事实片段，供全局合成（Synthesis）阶段使用
+CREATE TABLE IF NOT EXISTS fact_staging (
+    id BIGSERIAL PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES pipeline_jobs (id) ON DELETE CASCADE,
+    batch_id BIGINT REFERENCES ingest_batches (id) ON DELETE CASCADE,
+    fact_text TEXT NOT NULL,
+    source_chunk_id TEXT,
+    section_path TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_staging_job ON fact_staging (job_id);
+
+ALTER TABLE fact_staging ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'fact_staging' AND policyname = 'p_fact_staging_tenant_rls') THEN
+        CREATE POLICY p_fact_staging_tenant_rls ON fact_staging
+        USING (
+            EXISTS (
+                SELECT 1 FROM pipeline_jobs pj
+                WHERE pj.id = fact_staging.job_id
+                  AND pj.tenant_id = current_setting('app.tenant_id', true)
+            )
+        );
+    END IF;
+END $$;

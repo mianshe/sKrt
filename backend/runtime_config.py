@@ -126,6 +126,22 @@ class AuthConfig:
 
 
 @dataclass(frozen=True)
+class ReverseProxyConfig:
+    enabled: bool
+    upstream_base_url: str
+    upstream_api_key: str
+    upstream_auth_header: str
+    upstream_auth_scheme: str
+    access_key: str
+    timeout_seconds: float
+    connect_timeout_seconds: float
+    max_requests_per_minute: int
+    allowed_path_prefixes: list[str]
+    forward_client_authorization: bool
+    send_identity_headers: bool
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     hybrid: HybridModelConfig
     llama_index: LlamaIndexConfig
@@ -137,10 +153,17 @@ class RuntimeConfig:
     tenant: TenantConfig
     capacity: CapacityConfig
     auth: AuthConfig
+    reverse_proxy: ReverseProxyConfig
 
     @staticmethod
     def from_env() -> "RuntimeConfig":
         _pg_url = (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip()
+        _proxy_prefixes_raw = (os.getenv("REVERSE_PROXY_ALLOWED_PATH_PREFIXES") or "").strip()
+        _proxy_prefixes = [
+            item.strip().strip("/")
+            for item in _proxy_prefixes_raw.split(",")
+            if item.strip().strip("/")
+        ]
         return RuntimeConfig(
             hybrid=HybridModelConfig(
                 # 0 = 远程 API 优先（GitHub/HF/智谱），本地 transformers 作备用（默认）
@@ -221,5 +244,33 @@ class RuntimeConfig:
                 permissions_claim_key=(os.getenv("AUTH_PERMISSIONS_CLAIM_KEY", "permissions") or "permissions").strip()
                 or "permissions",
             ),
+            reverse_proxy=ReverseProxyConfig(
+                enabled=_as_bool(os.getenv("REVERSE_PROXY_ENABLED", "0"), False),
+                upstream_base_url=(os.getenv("REVERSE_PROXY_UPSTREAM_BASE_URL", "") or "").strip().rstrip("/"),
+                upstream_api_key=(os.getenv("REVERSE_PROXY_UPSTREAM_API_KEY", "") or "").strip(),
+                upstream_auth_header=(os.getenv("REVERSE_PROXY_UPSTREAM_AUTH_HEADER", "Authorization") or "Authorization").strip()
+                or "Authorization",
+                upstream_auth_scheme=(os.getenv("REVERSE_PROXY_UPSTREAM_AUTH_SCHEME", "Bearer") or "Bearer").strip(),
+                access_key=(os.getenv("REVERSE_PROXY_ACCESS_KEY", "") or "").strip(),
+                timeout_seconds=_as_float(os.getenv("REVERSE_PROXY_TIMEOUT_SEC", "120"), 120.0, 1.0),
+                connect_timeout_seconds=_as_float(
+                    os.getenv("REVERSE_PROXY_CONNECT_TIMEOUT_SEC", "20"),
+                    20.0,
+                    0.1,
+                ),
+                max_requests_per_minute=_as_int(
+                    os.getenv("REVERSE_PROXY_MAX_REQUESTS_PER_MINUTE", "60"),
+                    60,
+                    1,
+                ),
+                allowed_path_prefixes=_proxy_prefixes,
+                forward_client_authorization=_as_bool(
+                    os.getenv("REVERSE_PROXY_FORWARD_CLIENT_AUTH", "0"),
+                    False,
+                ),
+                send_identity_headers=_as_bool(
+                    os.getenv("REVERSE_PROXY_SEND_IDENTITY_HEADERS", "1"),
+                    True,
+                ),
+            ),
         )
-

@@ -11,48 +11,30 @@ if str(ROOT) not in sys.path:
 
 from backend.main import app
 
-ORAL_FILLERS = ("就是说", "然后呢", "其实", "这个", "那个", "嗯", "啊")
-
 
 def _assert(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
 
 
-def _assert_summary_payload(label: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    required_keys = ("highlights", "conclusions", "actions", "citations")
-    for key in required_keys:
-        _assert(key in payload, f"{label}: missing key `{key}`")
-        _assert(isinstance(payload.get(key), list), f"{label}: `{key}` should be a list")
-        _assert(len(payload.get(key, [])) >= 1, f"{label}: `{key}` should not be empty")
+def _assert_report_payload(label: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _assert(isinstance(payload.get("report"), str), f"{label}: `report` should be string")
+    _assert(bool(str(payload.get("report", "")).strip()), f"{label}: `report` should not be blank")
+    _assert(isinstance(payload.get("sections"), list), f"{label}: `sections` should be a list")
+    _assert(len(payload.get("sections", [])) >= 1, f"{label}: `sections` should not be empty")
+    _assert(isinstance(payload.get("citations"), list), f"{label}: `citations` should be a list")
+    _assert(len(payload.get("citations", [])) >= 1, f"{label}: `citations` should not be empty")
 
-    for key in ("highlights", "conclusions", "actions"):
-        for idx, item in enumerate(payload.get(key, [])):
-            _assert(isinstance(item, str), f"{label}: `{key}[{idx}]` should be string")
-            text = item.strip()
-            _assert(bool(text), f"{label}: `{key}[{idx}]` should not be blank")
-            _assert("\n" not in text, f"{label}: `{key}[{idx}]` should be single line")
-            _assert("```" not in text, f"{label}: `{key}[{idx}]` should not contain markdown fences")
-            _assert(len(text) <= 140, f"{label}: `{key}[{idx}]` too long ({len(text)} chars)")
+    for idx, item in enumerate(payload.get("sections", [])):
+        _assert(isinstance(item, dict), f"{label}: `sections[{idx}]` should be object")
+        _assert(bool(str(item.get("title", "")).strip()), f"{label}: `sections[{idx}].title` should not be blank")
+        _assert(bool(str(item.get("content", "")).strip()), f"{label}: `sections[{idx}].content` should not be blank")
 
-    oral_filler_hits = 0
-    for key in ("highlights", "conclusions", "actions"):
-        for item in payload.get(key, []):
-            oral_filler_hits += sum(1 for filler in ORAL_FILLERS if filler in item)
-    _assert(oral_filler_hits <= 2, f"{label}: too many colloquial fillers ({oral_filler_hits})")
-
-    citations = payload.get("citations", [])
-    for idx, item in enumerate(citations):
+    for idx, item in enumerate(payload.get("citations", [])):
         _assert(isinstance(item, dict), f"{label}: `citations[{idx}]` should be object")
         _assert(bool(str(item.get("title", "")).strip()), f"{label}: `citations[{idx}].title` should not be blank")
-        _assert(
-            bool(str(item.get("discipline", "")).strip()),
-            f"{label}: `citations[{idx}].discipline` should not be blank",
-        )
-        _assert(
-            bool(str(item.get("section_path", "")).strip()),
-            f"{label}: `citations[{idx}].section_path` should not be blank",
-        )
+        _assert(bool(str(item.get("discipline", "")).strip()), f"{label}: `citations[{idx}].discipline` should not be blank")
+        _assert(bool(str(item.get("section_path", "")).strip()), f"{label}: `citations[{idx}].section_path` should not be blank")
     return payload
 
 
@@ -84,30 +66,37 @@ def main() -> None:
         _assert(isinstance(chat_data.get("sources"), list), "chat sources missing")
         report["steps"].append({"chat": "ok", "source_count": len(chat_data.get("sources", []))})
 
-        summary = client.post("/insights/summary", json={"query": "内部审计执行建议", "discipline": "all"})
-        _assert(summary.status_code == 200, f"summary failed: {summary.text}")
-        summary_data = _assert_summary_payload("summary-hit-1", summary.json())
-        _assert("fallback" in summary_data, "summary-hit-1: missing fallback flag")
-        _assert("provider" in summary_data and summary_data.get("provider"), "summary-hit-1: missing provider")
-        _assert(
-            any(c.get("title") != "基于当前检索未命中" for c in summary_data.get("citations", [])),
-            "summary-hit-1: should include matched citations",
+        deep_report = client.post(
+            "/insights/report",
+            json={"query": "请对该资料做深度分析", "discipline": "all", "document_id": uploaded_doc_id},
+        )
+        _assert(deep_report.status_code == 200, f"report failed: {deep_report.text}")
+        report_data = _assert_report_payload("report-hit-1", deep_report.json())
+        _assert("fallback" not in report_data or isinstance(report_data.get("fallback"), bool), "report-hit-1: invalid fallback field")
+        _assert("provider" in report_data and report_data.get("provider"), "report-hit-1: missing provider")
+        report["steps"].append(
+            {
+                "report_hit": "ok",
+                "section_count": len(report_data.get("sections", [])),
+                "citation_count": len(report_data.get("citations", [])),
+            }
         )
 
-        summary_repeat = client.post("/insights/summary", json={"query": "内部审计执行建议", "discipline": "all"})
-        _assert(summary_repeat.status_code == 200, f"summary repeat failed: {summary_repeat.text}")
-        summary_data_repeat = _assert_summary_payload("summary-hit-2", summary_repeat.json())
+        deep_report_repeat = client.post(
+            "/insights/report",
+            json={"query": "请对该资料做深度分析", "discipline": "all", "document_id": uploaded_doc_id},
+        )
+        _assert(deep_report_repeat.status_code == 200, f"report repeat failed: {deep_report_repeat.text}")
+        report_data_repeat = _assert_report_payload("report-hit-2", deep_report_repeat.json())
         _assert(
-            set(summary_data.keys()) == set(summary_data_repeat.keys()),
-            "summary hit payload keys are unstable between two calls",
+            set(report_data.keys()) == set(report_data_repeat.keys()),
+            "report hit payload keys are unstable between two calls",
         )
         report["steps"].append(
             {
-                "summary_hit": "ok",
-                "stability_check": "ok",
-                "fallback": bool(summary_data.get("fallback")),
-                "citation_count": len(summary_data.get("citations", [])),
-                "repeat_citation_count": len(summary_data_repeat.get("citations", [])),
+                "report_repeat": "ok",
+                "repeat_section_count": len(report_data_repeat.get("sections", [])),
+                "repeat_citation_count": len(report_data_repeat.get("citations", [])),
             }
         )
 
@@ -116,16 +105,6 @@ def main() -> None:
         graph_data = graph.json()
         _assert(isinstance(graph_data.get("insights"), list), "knowledge graph insights missing")
         report["steps"].append({"knowledge_graph": "ok", "insight_count": len(graph_data.get("insights", []))})
-
-        miss = client.post("/insights/summary", json={"query": "不存在检索命中的冷门话题", "discipline": "astronomy"})
-        _assert(miss.status_code == 200, f"summary fallback failed: {miss.text}")
-        miss_data = _assert_summary_payload("summary-miss", miss.json())
-        _assert(bool(miss_data.get("fallback")), "fallback should be true for miss case")
-        _assert(
-            any(c.get("title") == "基于当前检索未命中" for c in miss_data.get("citations", [])),
-            "summary-miss: should preserve miss fallback citation",
-        )
-        report["steps"].append({"summary_miss": "ok", "fallback_provider": miss_data.get("provider", "unknown")})
 
         if uploaded_doc_id is not None:
             cleanup = client.delete(f"/documents/{uploaded_doc_id}")

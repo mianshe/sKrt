@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 import jwt
 
-from backend.services.email_sender import send_plain_email
+from .email_sender import send_plain_email
 
 
 DEFAULT_LOCAL_ADMIN_EMAIL_DOMAIN = "sciomenihilscire.com"
@@ -199,6 +199,7 @@ def local_identity_claims(email: str) -> Dict[str, Any]:
             "tenant.upload.read",
             "tenant.documents.read",
             "tenant.documents.delete",
+            "tenant.metrics.read",
             "tenant.knowledge.read",
             "tenant.chat.write",
             "tenant.chat.clear",

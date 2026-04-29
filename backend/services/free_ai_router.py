@@ -1,12 +1,13 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from backend.runtime_config import HybridModelConfig, RuntimeConfig
+from runtime_config import HybridModelConfig, RuntimeConfig
 
 
 class FreeAIRouter:
@@ -25,6 +26,15 @@ class FreeAIRouter:
         self.hf_base = os.getenv("HF_INFERENCE_BASE_URL", "https://api-inference.huggingface.co/models").rstrip("/")
         self.hf_chat_model = os.getenv("HF_CHAT_MODEL", "microsoft/Phi-3.5-mini-instruct").strip()
         self.hf_embed_model = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2").strip()
+
+        # Gemini API配置
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_base = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+        self.gemini_chat_model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash-exp").strip() or "gemini-2.0-flash-exp"
+        self.gemini_embed_model = os.getenv("GEMINI_EMBED_MODEL", "models/embedding-001").strip() or "models/embedding-001"
+
+        # 日志记录器
+        self.logger = logging.getLogger(__name__)
 
         self._local_chat_runtime: Optional[Tuple[Any, Any]] = None
         self._local_embed_runtime: Optional[Tuple[Any, Any, Any]] = None
@@ -79,6 +89,17 @@ class FreeAIRouter:
             return detail
         return "本地模型运行时未初始化，请检查 transformers/torch、模型名和网络下载权限"
 
+    def get_local_embedding_runtime_status(self) -> Dict[str, Any]:
+        ready = self._local_embed_runtime is not None
+        error = str(self._local_embed_runtime_error or "").strip()
+        return {
+            "enabled": bool(self.hybrid_cfg.enable_local_embedding),
+            "model_id": self.hybrid_cfg.local_embedding_model_id,
+            "ready": ready,
+            "error": "" if ready else error,
+            "initialized": ready,
+        }
+
     def _local_embedding_response(self, embedding: List[float], dimensions: Optional[int], target_dim: int) -> Dict[str, Any]:
         local_dim = len(embedding)
         final_dim = dimensions or local_dim or target_dim
@@ -120,7 +141,10 @@ class FreeAIRouter:
             if prefer_free:
                 remotes = ["github-models", "huggingface", "zhipu"]
             else:
-                remotes = ["github-models", "zhipu", "huggingface"]
+                # 付费版本：Gemini优先（当有API密钥时）
+                if self.gemini_api_key:
+                    remotes = ["gemini"]
+                remotes.extend(["github-models", "zhipu", "huggingface"])
         local = "transformers-local"
         if self.hybrid_cfg.local_first:
             order: List[str] = []
@@ -146,6 +170,32 @@ class FreeAIRouter:
         return await self._chat_with_provider_order(
             messages=messages,
             provider_order=provider_order,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            task_type=task_type,
+        )
+
+    async def chat_with_provider_order_override(
+        self,
+        messages: List[Dict[str, str]],
+        provider_order: List[str],
+        task_type: str = "general",
+        model: str = "gpt-4o-mini",
+        max_tokens: int = 700,
+        temperature: float = 0.2,
+    ) -> Dict[str, Any]:
+        normalized_order: List[str] = []
+        seen = set()
+        for provider in provider_order:
+            name = str(provider or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            normalized_order.append(name)
+        return await self._chat_with_provider_order(
+            messages=messages,
+            provider_order=normalized_order,
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -184,6 +234,11 @@ class FreeAIRouter:
                 hf_resp = await self._hf_chat(messages, max_tokens, temperature)
                 if hf_resp is not None:
                     return {"provider": "huggingface", "content": hf_resp, "task_type": task_type}
+                continue
+            if provider == "gemini":
+                gemini_resp = await self._gemini_chat(messages, max_tokens, temperature)
+                if gemini_resp is not None:
+                    return {"provider": "gemini", "content": gemini_resp, "task_type": task_type}
                 continue
 
         if self.hybrid_cfg.enable_hash_fallback:
@@ -408,6 +463,70 @@ class FreeAIRouter:
         if isinstance(data, dict) and "generated_text" in data:
             return str(data["generated_text"])
         return None
+
+    async def _gemini_chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Optional[str]:
+        if not self.gemini_api_key:
+            return None
+        
+        # Gemini没有system角色，需要将system消息转换为user消息
+        transformed_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                # Gemini没有system角色，将system消息转换为user消息
+                role = "user"
+            transformed_messages.append({
+                "role": role,
+                "parts": [{"text": content}]
+            })
+        
+        url = f"{self.gemini_base}/models/{self.gemini_chat_model}:generateContent"
+        params = {"key": self.gemini_api_key}
+        
+        payload = {
+            "contents": transformed_messages,
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": temperature,
+                "topP": 0.95,
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, params=params, json=payload, headers=headers)
+                if response.status_code != 200:
+                    self.logger.error(f"Gemini API请求失败: {response.status_code} - {response.text}")
+                    return None
+                
+                data = response.json()
+                
+                # 解析Gemini响应
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    return None
+                
+                candidate = candidates[0]
+                content_parts = candidate.get("content", {}).get("parts", [])
+                if not content_parts:
+                    return None
+                
+                # 获取文本响应
+                text = content_parts[0].get("text", "")
+                return text.strip()
+                
+        except Exception as e:
+            self.logger.error(f"Gemini API调用异常: {e}")
+            return None
 
     async def _hf_embedding(self, text: str) -> Optional[List[float]]:
         if not self.hf_token:

@@ -46,6 +46,7 @@ type PendingPayOrder = {
 
 type GpuQuotaWidgetProps = {
   authSession?: number;
+  authReady?: boolean;
 };
 
 function readPendingPayOrder(): PendingPayOrder | null {
@@ -118,7 +119,7 @@ function productCreditText(product: PayProduct): string {
   return `${product.tokens ?? 0} token`;
 }
 
-export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps) {
+export default function GpuQuotaWidget({ authSession = 0, authReady = true }: GpuQuotaWidgetProps) {
   const [gpuQuota, setGpuQuota] = useState<GpuQuota>({ used: 0, limit: 20 });
   const [glmOcrQuota, setGlmOcrQuota] = useState<TokenQuota>({ paid_tokens: 0, special: false });
   const [embeddingQuota, setEmbeddingQuota] = useState<TokenQuota>({ paid_tokens: 0, special: false });
@@ -137,7 +138,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   const [installHintOpen, setInstallHintOpen] = useState(false);
   const [installHintText, setInstallHintText] = useState("");
   const [installMessage, setInstallMessage] = useState("");
-  const [primaryDownloadLabel, setPrimaryDownloadLabel] = useState("下载 exe / app");
+  const [primaryDownloadLabel, setPrimaryDownloadLabel] = useState("下载 APK / EXE");
   const [isInstalled, setIsInstalled] = useState(false);
 
   const [payOpen, setPayOpen] = useState(false);
@@ -202,13 +203,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       return {
         url: APK_DOWNLOAD_URL,
         label: "已开始下载 apk",
-        hint: "当前检测到 Android 设备，已直接开始下载 apk。若没有反应，可手动点下方“下载 Android apk”。",
+        hint: "云端保存过程文件容量有限。当前检测到 Android 设备，建议优先使用 APK 版本进行本地存储与管理；若没有反应，可手动点下方“下载 Android apk”。",
       };
     }
     return {
       url: EXE_DOWNLOAD_URL,
       label: "已开始下载 exe",
-      hint: "当前默认按桌面端处理，已直接开始下载 exe。若你要装到手机，请改用下方“下载 Android apk”。",
+      hint: "云端保存过程文件容量有限。桌面端建议优先使用 EXE 版本进行本地存储与管理；若你要装到手机，请改用下方“下载 Android apk”。",
     };
   }, [installEnv.isAndroid]);
 
@@ -388,7 +389,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   };
 
   useEffect(() => {
-    if (!loggedIn) {
+    if (!authReady || !loggedIn) {
       setGpuQuota({ used: 0, limit: 0, paid_balance: 0, special: false });
       setGlmOcrQuota({ paid_tokens: 0, special: false });
       setEmbeddingQuota({ paid_tokens: 0, special: false });
@@ -400,7 +401,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     void refreshGlmOcrQuota();
     void refreshEmbeddingQuota();
     void refreshPayConfig();
-  }, [authSession, loggedIn]);
+  }, [authReady, authSession, loggedIn]);
 
   useEffect(() => {
     redeemOpenRef.current = redeemOpen;
@@ -444,7 +445,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   }, [tapCount]);
 
   useEffect(() => {
-    if (!loggedIn) {
+    if (!authReady || !loggedIn) {
       setOrderNo("");
       setOrderQrImage("");
       setOrderPayPageUrl("");
@@ -470,7 +471,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
     setOrderRandomDiscountCny(typeof pending.randomDiscountCny === "number" ? pending.randomDiscountCny : null);
     setPayStatus("pending");
     setPayMessage("检测到未完成订单，正在自动查询到账状态");
-  }, [loggedIn, authSession]);
+  }, [authReady, loggedIn, authSession]);
 
   useEffect(() => {
     if (!orderNo || payStatus !== "pending") return;
@@ -494,7 +495,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
   }, [orderNo, payStatus, selectedProduct]);
 
   useEffect(() => {
-    if (!loggedIn) return;
+    if (!authReady || !loggedIn) return;
 
     const onQuotaRefresh = () => {
       void refreshQuota();
@@ -515,7 +516,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
       window.removeEventListener("focus", onWindowFocus);
       document.removeEventListener("visibilitychange", onWindowFocus);
     };
-  }, [loggedIn, selectedProduct, selectedProductKey, selectedProductType]);
+  }, [authReady, loggedIn, selectedProduct, selectedProductKey, selectedProductType]);
 
   useEffect(() => {
     if (payStatus !== "paid") return;
@@ -738,7 +739,7 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
           className="rounded-md bg-white/85 px-2 py-1 text-[11px] text-indigo-600 ring-1 ring-indigo-200 transition hover:bg-indigo-50"
           onClick={onInstallClick}
         >
-          下载 exe / app
+          下载 APK / EXE
         </button>
 
         <button
@@ -791,10 +792,13 @@ export default function GpuQuotaWidget({ authSession = 0 }: GpuQuotaWidgetProps)
         onClose={() => setInstallHintOpen(false)}
         panelClassName="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200"
       >
-        <p className="text-sm font-semibold text-slate-800">下载 exe / app</p>
+        <p className="text-sm font-semibold text-slate-800">下载 APK / EXE</p>
         <p className="mt-1 text-xs text-slate-500">
-          {installHintText || "桌面端请下载 exe，Android 请下载 apk / app。"}
+          {installHintText || "云端保存过程文件容量有限。桌面端请下载 EXE，Android 请下载 APK，以便优先使用本地存储与管理。"}
         </p>
+        <div className="mt-3 rounded-2xl bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800 ring-1 ring-amber-200">
+          网页端更适合轻量同步与在线分析；如果你需要长期保留更多文档和过程文件，建议优先使用本地客户端。
+        </div>
         <div className="mt-3 grid grid-cols-1 gap-2">
           <button
             type="button"

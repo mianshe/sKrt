@@ -57,6 +57,38 @@ class PayPalProvider(PaymentProvider):
             parsed = {"message": str(parsed)[:500]}
         return parsed
 
+    def _format_api_error(self, parsed: Dict[str, Any], *, fallback: str) -> str:
+        parts = []
+        message = str(
+            parsed.get("message")
+            or parsed.get("error_description")
+            or parsed.get("error")
+            or parsed.get("name")
+            or fallback
+        ).strip()
+        if message:
+            parts.append(message)
+
+        details = parsed.get("details")
+        if isinstance(details, list):
+            detail_chunks = []
+            for item in details[:3]:
+                if not isinstance(item, dict):
+                    continue
+                issue = str(item.get("issue") or "").strip()
+                description = str(item.get("description") or "").strip()
+                field = str(item.get("field") or "").strip()
+                chunk = " | ".join(part for part in [issue, description, field] if part)
+                if chunk:
+                    detail_chunks.append(chunk)
+            if detail_chunks:
+                parts.append("details=" + " || ".join(detail_chunks))
+
+        debug_id = str(parsed.get("debug_id") or parsed.get("debugId") or "").strip()
+        if debug_id:
+            parts.append(f"debug_id={debug_id}")
+        return "; ".join(parts) if parts else fallback
+
     def _access_token(self) -> str:
         self._ensure_enabled()
         cache_key = self._token_cache_key()
@@ -79,7 +111,7 @@ class PayPalProvider(PaymentProvider):
             self._clear_cached_token()
             parsed = self._parse_http_error(exc)
             error_code = str(parsed.get("error") or parsed.get("name") or "").strip()
-            description = str(parsed.get("error_description") or parsed.get("message") or "").strip()
+            description = self._format_api_error(parsed, fallback="oauth_failed")
             if exc.code == 401 or error_code in {"invalid_client", "invalid_token"}:
                 hint = "请检查 PAYPAL_MODE、PAYPAL_API_BASE、PAYPAL_CLIENT_ID、PAYPAL_CLIENT_SECRET 是否匹配同一套环境"
                 raise RuntimeError(f"PayPal 鉴权失败: {description or error_code or '401 Unauthorized'}；{hint}") from exc
@@ -125,13 +157,7 @@ class PayPalProvider(PaymentProvider):
                 break
             except HTTPError as exc:
                 parsed = self._parse_http_error(exc)
-                message = (
-                    parsed.get("message")
-                    or parsed.get("error_description")
-                    or parsed.get("error")
-                    or parsed.get("name")
-                    or f"http_{exc.code}"
-                )
+                message = self._format_api_error(parsed, fallback=f"http_{exc.code}")
                 if exc.code == 401 and attempt == 0:
                     logger.warning("paypal api got 401, clearing cached token and retrying path=%s", path)
                     self._clear_cached_token()

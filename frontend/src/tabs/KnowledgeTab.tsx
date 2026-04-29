@@ -1,558 +1,621 @@
-import { useEffect, useState } from "react";
-import { SummaryPayload } from "../components/SummaryCards";
-import {
-  downloadDocxBlob,
-  exportDocSummaryToDocxBlob,
-  exportGlobalSummaryToDocxBlob,
-  suggestedDocSummaryFilename,
-  suggestedGlobalSummaryFilename,
-} from "../lib/exportSummaryDocx";
+import { useEffect, useMemo, useState } from "react";
+import type { ChapterSummary, DocumentTreeNode, SummaryPayload } from "../components/SummaryCards";
 import { API_BASE } from "../config/apiBase";
-import { useAccessToken } from "../lib/auth";
-import { useEmbeddingModePreference } from "../lib/embeddingMode";
 import { withTenantHeaders } from "../hooks/useDocuments";
-
-const TENANT_KEY = "xm_tenant_id";
-
-type DocSummary = {
-  document_id: number;
-  summary: {
-    title: string;
-    filename: string;
-    document_type: string;
-    discipline: string;
-    page_count: number;
-    chunk_count: number;
-    section_count: number;
-    top_keywords: string[];
-    sections: Array<{
-      section_path: string;
-      chunk_count: number;
-      key_points: string[];
-      keywords: string[];
-      principles?: string[];
-      why?: string[];
-      how?: string[];
-    }>;
-    conclusions: string[];
-    principles?: string[];
-    why?: string[];
-    how?: string[];
-  } | null;
-};
+import type { DocumentItem } from "../hooks/useDocuments";
+import { useAccessToken } from "../lib/auth";
+import { formatApiFetchError } from "../lib/fetchErrors";
+import { FileText, Sparkles, ChevronRight, BookOpen, RefreshCw } from "lucide-react";
+import { downloadDocxBlob, exportGlobalSummaryToDocxBlob } from "../lib/exportSummaryDocx";
 
 type Props = {
   refreshKey: string;
+  documents: DocumentItem[];
 };
 
-function KnowledgeTab({ refreshKey }: Props) {
-  const summaryCompactLevel = 0;
-  const summaryMode: "full" = "full";
-  const [embeddingMode, setEmbeddingMode] = useEmbeddingModePreference();
+type ReportSection = { 
+  title: string; 
+  content: string;
+  metadata?: {
+    comprehensive_analysis?: string;
+    comprehensive_strategy?: string;
+  }
+};
+
+type ChapterNavNode = {
+  navKey: string;
+  title: string;
+  level: number;
+  page_start?: number;
+  page_end?: number;
+  matchedSummaries: ChapterSummary[];
+};
+
+function suggestedReportFilename(doc: DocumentItem | null): string {
+  const raw = (doc?.title || doc?.filename || "document").trim();
+  const safe = raw.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").slice(0, 80) || "document";
+  return `${safe}-deep-analysis.docx`;
+}
+
+function looksLikeInstitutionTitle(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return [
+    "university",
+    "college",
+    "faculty",
+    "department",
+    "school",
+    "学院",
+    "大学",
+    "学校",
+    "研究院",
+  ].some((term) => normalized.includes(term));
+}
+
+function deriveFilenameTitle(filename: string): string {
+  const stem = filename.replace(/\.[^.]+$/, "").trim();
+  const pieces = [stem, ...stem.split(/[_-]+/g)]
+    .map((part) => part.trim())
+    .filter(Boolean);
+  let best = stem || "document";
+  let bestScore = -999;
+  for (const piece of pieces) {
+    let score = 0;
+    if (/[\u4e00-\u9fff]/.test(piece)) score += 3;
+    if (/[A-Za-z]/.test(piece)) score += 1;
+    if (/[\u4e00-\u9fff]/.test(piece) && /[A-Za-z]/.test(piece)) score += 1;
+    if (piece.length >= 6 && piece.length <= 40) score += 4;
+    else if (piece.length > 40 && piece.length <= 80) score += 2;
+    if (/(研究|分析|设计|系统|模型|方法|实现|应用|优化|预测|影响|治理|识别|检测|基于)/.test(piece)) score += 4;
+    if (/(class|student|grade|学号|班|专业)/i.test(piece)) score -= 3;
+    if (looksLikeInstitutionTitle(piece)) score -= 6;
+    if (score > bestScore) {
+      best = piece;
+      bestScore = score;
+    }
+  }
+  return best || "document";
+}
+
+function deriveAnalysisSubject(doc: DocumentItem | null): string {
+  if (!doc) return "document";
+  const title = (doc.title || "").trim();
+  if (title && !looksLikeInstitutionTitle(title)) return title;
+  return deriveFilenameTitle(doc.filename || title || "document");
+}
+
+function normalizeFallbackReason(reason: unknown): SummaryPayload["fallback_reason"] {
+  return reason === "no_results" || reason === "parse_failed" || reason === "normalize_failed" || reason === "none"
+    ? reason
+    : "none";
+}
+
+function normalizeSourceQuality(quality: unknown): SummaryPayload["source_quality"] {
+  return quality === "high" || quality === "medium" || quality === "low" ? quality : "low";
+}
+
+function normalizeReportSections(sections: unknown): ReportSection[] {
+  if (!Array.isArray(sections)) return [];
+  return sections
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => {
+      const section: ReportSection = {
+        title: typeof item.title === "string" ? item.title : "Section",
+        content: typeof item.content === "string" ? item.content : "",
+      };
+      
+      const metadata = item.metadata;
+      if (metadata && typeof metadata === "object") {
+        const metadataObj = metadata as Record<string, unknown>;
+        section.metadata = {
+          comprehensive_analysis: typeof metadataObj.comprehensive_analysis === "string" 
+            ? metadataObj.comprehensive_analysis 
+            : undefined,
+          comprehensive_strategy: typeof metadataObj.comprehensive_strategy === "string" 
+            ? metadataObj.comprehensive_strategy 
+            : undefined,
+        };
+      }
+      
+      return section;
+    })
+    .filter((item) => item.title.trim() || item.content.trim());
+}
+
+function normalizeChapterSummaries(items: unknown): ChapterSummary[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => ({
+      chapter_key: typeof item.chapter_key === "string" ? item.chapter_key : undefined,
+      chapter_title: typeof item.chapter_title === "string" ? item.chapter_title : "Chapter",
+      page_start: typeof item.page_start === "number" ? item.page_start : undefined,
+      page_end: typeof item.page_end === "number" ? item.page_end : undefined,
+      content: typeof item.content === "string" ? item.content : "",
+      sections: normalizeReportSections(item.sections),
+    }))
+    .filter((item) => item.chapter_title.trim().length > 0);
+}
+
+function normalizeDocumentTree(items: unknown): DocumentTreeNode[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item) => ({
+      title: typeof item.title === "string" ? item.title : "Chapter",
+      page_start: typeof item.page_start === "number" ? item.page_start : undefined,
+      page_end: typeof item.page_end === "number" ? item.page_end : undefined,
+      level: typeof item.level === "number" ? item.level : 1,
+      source: typeof item.source === "string" ? item.source : undefined,
+    }))
+    .filter((item) => item.title.trim().length > 0);
+}
+
+function normalizeComparableTitle(value: string): string {
+  return value.toLowerCase().replace(/[\s\-_.:/()[\]【】（）·*★]+/g, "");
+}
+
+function chapterNumberPrefix(value: string): string {
+  return (value.trim().match(/^(\d+(?:\.\d+)*)/)?.[1] || "").trim();
+}
+
+function titlesMatchChapterNode(nodeTitle: string, summaryTitle: string): boolean {
+  const normalizedNode = normalizeComparableTitle(nodeTitle);
+  const normalizedSummary = normalizeComparableTitle(summaryTitle);
+  if (!normalizedNode || !normalizedSummary) return false;
+  if (normalizedNode === normalizedSummary) return true;
+
+  const nodePrefix = chapterNumberPrefix(nodeTitle);
+  const summaryPrefix = chapterNumberPrefix(summaryTitle);
+  if (nodePrefix && summaryPrefix) return nodePrefix === summaryPrefix;
+
+  return false;
+}
+
+function deriveTreeRanges(tree: DocumentTreeNode[]): DocumentTreeNode[] {
+  return tree.map((node, index) => {
+    const start = typeof node.page_start === "number" ? node.page_start : undefined;
+    const explicitEnd = typeof node.page_end === "number" ? node.page_end : undefined;
+    const nextStart = tree.slice(index + 1).find((item) => typeof item.page_start === "number")?.page_start;
+    let derivedEnd = explicitEnd;
+    if (typeof start === "number" && typeof nextStart === "number" && nextStart > start) {
+      const previousPage = nextStart - 1;
+      if (typeof derivedEnd !== "number" || derivedEnd < previousPage) {
+        derivedEnd = previousPage;
+      }
+    }
+    if (typeof start === "number" && typeof derivedEnd !== "number") {
+      derivedEnd = start;
+    }
+    return {
+      ...node,
+      page_start: start,
+      page_end: derivedEnd,
+    };
+  });
+}
+
+function rangesOverlap(
+  aStart?: number,
+  aEnd?: number,
+  bStart?: number,
+  bEnd?: number
+): boolean {
+  if (
+    typeof aStart !== "number" ||
+    typeof aEnd !== "number" ||
+    typeof bStart !== "number" ||
+    typeof bEnd !== "number"
+  ) {
+    return false;
+  }
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+function hasUsablePageRange(start?: number, end?: number): boolean {
+  return typeof start === "number" && typeof end === "number" && start > 0 && end >= start;
+}
+
+function uniqueChapterSummaries(items: ChapterSummary[]): ChapterSummary[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = [
+      item.chapter_key || "",
+      item.chapter_title || "",
+      item.page_start ?? "",
+      item.page_end ?? "",
+      item.content?.slice(0, 80) || "",
+    ].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function scoreChapterSummaryMatch(node: DocumentTreeNode, summary: ChapterSummary): number {
+  let score = 0;
+  const nodeTitle = node.title || "";
+  const summaryTitle = summary.chapter_title || "";
+  if (normalizeComparableTitle(nodeTitle) === normalizeComparableTitle(summaryTitle)) {
+    score += 1000;
+  }
+  const nodePrefix = chapterNumberPrefix(nodeTitle);
+  const summaryPrefix = chapterNumberPrefix(summaryTitle);
+  if (nodePrefix && summaryPrefix && nodePrefix === summaryPrefix) {
+    score += 900 + Math.min(nodePrefix.length, 20);
+  }
+  if (
+    hasUsablePageRange(node.page_start, node.page_end) &&
+    hasUsablePageRange(summary.page_start, summary.page_end) &&
+    rangesOverlap(node.page_start, node.page_end, summary.page_start, summary.page_end)
+  ) {
+    score += 100;
+    if (node.page_start === summary.page_start) score += 20;
+  }
+  return score;
+}
+
+function bestChapterSummaryMatches(node: DocumentTreeNode, chapterSummaries: ChapterSummary[]): ChapterSummary[] {
+  const scored = uniqueChapterSummaries(chapterSummaries)
+    .map((summary) => ({ summary, score: scoreChapterSummaryMatch(node, summary) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+  if (!scored.length) return [];
+  const top = scored[0];
+  return top ? [top.summary] : [];
+}
+
+function buildChapterNavigation(
+  documentTree: DocumentTreeNode[],
+  chapterSummaries: ChapterSummary[]
+): ChapterNavNode[] {
+  if (documentTree.length) {
+    return deriveTreeRanges(documentTree).map((node, index) => {
+      const matchedSummaries = bestChapterSummaryMatches(node, chapterSummaries);
+      return {
+        navKey: `tree-${index}-${node.title}`,
+        title: node.title,
+        level: typeof node.level === "number" ? node.level : 1,
+        page_start: node.page_start,
+        page_end: node.page_end,
+        matchedSummaries,
+      };
+    });
+  }
+
+  return chapterSummaries.map((summary, index) => ({
+    navKey: `summary-${index}-${summary.chapter_title}`,
+    title: summary.chapter_title,
+    level: 1,
+    page_start: summary.page_start,
+    page_end: summary.page_end,
+    matchedSummaries: [summary],
+  }));
+}
+
+function buildDisplayedSections(navNode: ChapterNavNode | null, report: SummaryPayload | null): ReportSection[] {
+  const matched = navNode?.matchedSummaries ?? [];
+  if (matched.length === 1) {
+    const chapterSummary = matched[0];
+    if (chapterSummary?.sections?.length) return chapterSummary.sections;
+    if (chapterSummary?.content?.trim()) {
+      return [{ title: chapterSummary.chapter_title, content: chapterSummary.content.trim() }];
+    }
+  }
+  if (matched.length > 1) {
+    const mergedSections = matched.flatMap((summary) => {
+      if (summary.sections?.length) {
+        return summary.sections.map((section) => ({
+          title: `${summary.chapter_title} · ${section.title}`,
+          content: section.content,
+        }));
+      }
+      if (summary.content?.trim()) {
+        return [{ title: summary.chapter_title, content: summary.content.trim() }];
+      }
+      return [];
+    });
+    if (mergedSections.length) {
+      return mergedSections;
+    }
+  }
+  if (navNode) {
+    return [{
+      title: navNode.title,
+      content: "这个章节节点暂时没有匹配到独立的章节摘要。请点击“重新生成”刷新深度分析；如果仍然为空，说明当前入库切块没有保留足够的章节边界。",
+    }];
+  }
+  return normalizeReportSections(report?.sections);
+}
+
+function KnowledgeTab({ refreshKey, documents }: Props) {
   const accessToken = useAccessToken();
   const loggedIn = Boolean(accessToken);
-  const [highlights, setHighlights] = useState<{ items: string[]; conclusions: string[]; actions: string[] } | null>(null);
-  const [highlightsLoading, setHighlightsLoading] = useState(false);
-  const [highlightsError, setHighlightsError] = useState("");
-  const [summary, setSummary] = useState<SummaryPayload | null>(null);
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const [summaryError, setSummaryError] = useState("");
-  const [docSummaries, setDocSummaries] = useState<DocSummary[]>([]);
-  const [docSummaryLoading, setDocSummaryLoading] = useState(false);
-  const [expandedDoc, setExpandedDoc] = useState<number | null>(null);
-  const [expandedSection, setExpandedSection] = useState<string | null>(null);
+  const reportCompactLevel = 0;
+  const showRedundantBlocks = false;
 
-  const normalizeFallbackReason = (reason: unknown): SummaryPayload["fallback_reason"] => {
-    return reason === "no_results" || reason === "parse_failed" || reason === "normalize_failed" || reason === "none"
-      ? reason
-      : "none";
-  };
-  const normalizeSourceQuality = (quality: unknown): SummaryPayload["source_quality"] => {
-    return quality === "high" || quality === "medium" || quality === "low" ? quality : "low";
-  };
-  const fallbackReasonLabel = (reason: SummaryPayload["fallback_reason"]) => {
-    switch (reason) {
-      case "no_results":
-        return "未命中检索结果";
-      case "parse_failed":
-        return "模型解析失败";
-      case "normalize_failed":
-        return "结果规范化失败";
-      case "none":
-      default:
-        return "无";
-    }
-  };
+  const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
+  const [activeTreeIndex, setActiveTreeIndex] = useState(0);
+  const [report, setReport] = useState<SummaryPayload | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [progress, setProgress] = useState("");
+  const [reloadToken, setReloadToken] = useState(0);
 
-  // ── 加载全局要点摘要（highlights/conclusions/actions）──────────
+  const selectedDoc = useMemo(
+    () => documents.find((doc) => doc.id === selectedDocId) ?? null,
+    [documents, selectedDocId]
+  );
+
+  const chapterSummaries = useMemo(() => normalizeChapterSummaries(report?.chapter_summaries), [report?.chapter_summaries]);
+  const documentTree = useMemo(() => normalizeDocumentTree(report?.document_tree), [report?.document_tree]);
+  const chapterNavigation = useMemo(
+    () => buildChapterNavigation(documentTree, chapterSummaries),
+    [documentTree, chapterSummaries]
+  );
+  const displayedSections = useMemo(
+    () => buildDisplayedSections(chapterNavigation[activeTreeIndex] ?? null, report),
+    [activeTreeIndex, chapterNavigation, report]
+  );
+  const emptyStateMessage = !documents.length
+      ? "请先上传并完成解析"
+      : "选择文档开始分析";
+
   useEffect(() => {
-    if (!loggedIn) {
-      setHighlights(null);
-      setHighlightsError("");
-      setHighlightsLoading(false);
+    if (!documents.length) {
+      setSelectedDocId(null);
       return;
     }
+    if (selectedDocId == null || !documents.some((doc) => doc.id === selectedDocId)) {
+      setSelectedDocId(documents[0].id);
+    }
+  }, [documents, selectedDocId]);
+
+  useEffect(() => {
+    setReport(null);
+    setError("");
+    setProgress("");
+    setActiveTreeIndex(0);
+  }, [selectedDocId]);
+
+  useEffect(() => {
+    if (!selectedDocId) return;
+
     const controller = new AbortController();
-    setHighlightsLoading(true);
-    setHighlightsError("");
-    fetch(`${API_BASE}/insights/summary`, {
-      method: "POST",
-      headers: withTenantHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ query: "全局提炼", discipline: "all", summary_compact_level: summaryCompactLevel, summary_mode: summaryMode, embedding_mode: embeddingMode }),
-      signal: controller.signal,
-    })
-      .then((r) => r.ok ? r.json() : r.json().catch(() => ({})).then((b: any) => Promise.reject(new Error(b?.detail || `要点摘要请求失败 (${r.status})`))))
-      .then((data) => {
-        setHighlights({
-          items: Array.isArray(data.highlights) ? data.highlights : [],
-          conclusions: Array.isArray(data.conclusions) ? data.conclusions : [],
-          actions: Array.isArray(data.actions) ? data.actions : [],
-        });
-      })
-      .catch((err) => {
-        if ((err as DOMException)?.name !== "AbortError") setHighlightsError(err instanceof Error ? err.message : "要点摘要请求失败");
-      })
-      .finally(() => { if (!controller.signal.aborted) setHighlightsLoading(false); });
-    return () => controller.abort();
-  }, [embeddingMode, refreshKey, loggedIn]);
-  useEffect(() => {
-    if (!loggedIn) {
-      setDocSummaries([]);
-      setDocSummaryLoading(false);
-      return;
-    }
-    const load = async () => {
-      setDocSummaryLoading(true);
+    const forceRefresh = reloadToken > 0;
+    const loadReport = async () => {
+      setLoading(true);
+      setError("");
+      setProgress(forceRefresh ? "正在重新生成深度分析..." : "");
       try {
-        const listResp = await fetch(`${API_BASE}/documents`, {
-          headers: withTenantHeaders(),
-        });
-        if (!listResp.ok) return;
-        const listData = await listResp.json();
-        const docs: Array<{ id: number; has_summary: boolean }> = listData.documents || [];
-        const withSummary = docs.filter((d) => d.has_summary);
-        const summaries: DocSummary[] = await Promise.all(
-          withSummary.map(async (d) => {
-            try {
-              const r = await fetch(`${API_BASE}/documents/${d.id}/summary`, {
-                headers: withTenantHeaders(),
-              });
-              if (!r.ok) return { document_id: d.id, summary: null };
-              return (await r.json()) as DocSummary;
-            } catch {
-              return { document_id: d.id, summary: null };
-            }
-          })
-        );
-        setDocSummaries(summaries.filter((s) => s.summary));
-      } catch {
-        /* ignore */
-      } finally {
-        setDocSummaryLoading(false);
-      }
-    };
-    load();
-  }, [refreshKey, loggedIn]);
-
-  useEffect(() => {
-    if (!loggedIn) {
-      setSummary(null);
-      setSummaryError("");
-      setSummaryLoading(false);
-      return;
-    }
-    const controller = new AbortController();
-    const loadSummary = async () => {
-      setSummaryLoading(true);
-      setSummaryError("");
-      try {
-        const resp = await fetch(`${API_BASE}/insights/report`, {
+        const docLabel = deriveAnalysisSubject(selectedDoc);
+        const resp = await fetch(`${API_BASE}/insights/report/stream`, {
           method: "POST",
-          headers: withTenantHeaders({ "Content-Type": "application/json" }),
+          headers: withTenantHeaders({
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          }),
+          credentials: "include",
           body: JSON.stringify({
-            query: "全局提炼",
-            discipline: "all",
-            summary_compact_level: summaryCompactLevel,
-            summary_mode: summaryMode,
-            embedding_mode: embeddingMode,
+            query: `Generate a deep analysis for this document using its actual content as the primary subject. Do not treat the institution on the cover page as the research subject unless the body text clearly says so. Title hint: ${docLabel}`,
+            document_id: selectedDocId,
+            summary_compact_level: reportCompactLevel,
+            force_refresh: forceRefresh,
           }),
           signal: controller.signal,
         });
-        if (!resp.ok) throw new Error("全局重点提炼请求失败");
-        const data = await resp.json();
-        setSummary({
-            output_mode: "report",
-            highlights: [],
-            conclusions: [],
-            actions: [],
-            report: typeof data.report === "string" ? data.report : "",
-            sections: Array.isArray(data.sections) ? data.sections : [],
-            citations: Array.isArray(data.citations) ? data.citations : [],
-            provider: data.provider,
-            fallback: Boolean(data.fallback),
-            parse_hits: typeof data.parse_hits === "number" ? data.parse_hits : 0,
-            context_len: typeof data.context_len === "number" ? data.context_len : 0,
-            summary_compact_level: typeof data.summary_compact_level === "number" ? data.summary_compact_level : summaryCompactLevel,
-            summary_mode: typeof data.summary_mode === "string" ? data.summary_mode : summaryMode,
-            raw_lengths: data.raw_lengths && typeof data.raw_lengths === "object" ? data.raw_lengths : {},
-            clipped_lengths: data.clipped_lengths && typeof data.clipped_lengths === "object" ? data.clipped_lengths : {},
-            effective_coverage: data.effective_coverage && typeof data.effective_coverage === "object" ? data.effective_coverage : {},
-            coverage_stats: data.coverage_stats && typeof data.coverage_stats === "object" ? data.coverage_stats : {},
-            fallback_reason: normalizeFallbackReason(data.fallback_reason),
-            source_quality: normalizeSourceQuality(data.source_quality),
-          });
+
+        if (!resp.ok) {
+          const details = await resp.text().catch(() => "");
+          throw new Error(details || `分析请求失败 (${resp.status})`);
+        }
+        const reader = resp.body?.getReader();
+        if (!reader) throw new Error("分析响应不可读");
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let receivedDone = false;
+        let streamError = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const event = JSON.parse(line.slice(6));
+            if (event.stage === "map" || event.stage === "reduce" || event.stage === "node") {
+              setProgress(event.message || event.node || event.stage);
+              continue;
+            }
+            if (event.stage === "error") {
+              streamError = typeof event.message === "string" && event.message.trim()
+                ? event.message.trim()
+                : "深度分析失败";
+              continue;
+            }
+            if (event.stage === "done" && event.result) {
+              receivedDone = true;
+              const data = event.result;
+              setReport({
+                output_mode: "report",
+                highlights: [], conclusions: [], actions: [],
+                report: typeof data.report === "string" ? data.report : "",
+                sections: normalizeReportSections(data.sections),
+                citations: [], provider: data.provider, fallback: Boolean(data.fallback),
+                parse_hits: 0, context_len: 0, summary_compact_level: reportCompactLevel,
+                raw_lengths: {}, clipped_lengths: {}, effective_coverage: {},
+                coverage_stats: data.coverage_stats ?? {}, fallback_reason: normalizeFallbackReason(data.fallback_reason), source_quality: "low",
+                report_profile: data.report_profile ?? {}, document_tree: Array.isArray(data.document_tree) ? data.document_tree : [],
+                chapter_summaries: Array.isArray(data.chapter_summaries) ? data.chapter_summaries : [],
+              });
+              continue;
+            }
+          }
+        }
+        if (streamError) throw new Error(streamError);
+        if (!receivedDone) throw new Error("深度分析已结束，但没有返回结果");
       } catch (err) {
         if ((err as DOMException)?.name !== "AbortError") {
-          setSummary(null);
-          setSummaryError(err instanceof Error ? err.message : "全局重点提炼请求失败，请稍后重试。");
+          setError(formatApiFetchError(err, "深度分析加载失败"));
         }
       } finally {
-        if (!controller.signal.aborted) {
-          setSummaryLoading(false);
-        }
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
-
-    void loadSummary();
+    void loadReport();
     return () => controller.abort();
-  }, [embeddingMode, refreshKey, loggedIn]);
+  }, [refreshKey, reloadToken, selectedDocId, selectedDoc]);
 
   return (
-    <section className="space-y-3">
-      <div className="card p-4">
-        <div className="mb-2 flex flex-wrap gap-2 text-xs">
-          <button
-            type="button"
-            className={`rounded-full px-3 py-1 ${embeddingMode === "auto" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-            onClick={() => setEmbeddingMode("auto")}
-          >
-            自动向量
-          </button>
-          <button
-            type="button"
-            className={`rounded-full px-3 py-1 ${embeddingMode === "local" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-            onClick={() => setEmbeddingMode("local")}
-          >
-            本地向量
-          </button>
-          <button
-            type="button"
-            className={`rounded-full px-3 py-1 ${embeddingMode === "api" ? "bg-violet-600 text-white" : "bg-slate-100 text-slate-700"}`}
-            onClick={() => setEmbeddingMode("api")}
-          >
-            API 向量
-          </button>
-        </div>
-        <p className="mb-2 text-xs text-amber-700">全局总结和报告会按当前向量模式检索；模式切换后旧索引可能不再命中。</p>
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          <h2 className="text-sm font-semibold text-violet-600">✦ 要点总结</h2>
-        </div>
-        {highlightsLoading && <p className="text-xs text-slate-500">全局要点提炼中...</p>}
-        {highlightsError && <p className="text-xs text-rose-600">{highlightsError}</p>}
-        {!highlightsLoading && !highlightsError && highlights && (
-          <div className="space-y-3">
-            {highlights.items.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-slate-700">要点</p>
-                <ul className="mt-1 space-y-1 text-sm text-slate-700">
-                  {highlights.items.map((item, idx) => <li key={`h-${idx}`}>- {item}</li>)}
-                </ul>
-              </div>
+    <div className="flex flex-col gap-8 h-full">
+      {/* Top Selector Box */}
+      <div className="neo-box bg-white p-6 rotate-1">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-xl font-black uppercase tracking-tighter flex items-center gap-2">
+            <BookOpen size={24} className="text-pink-500" />
+            分析视图
+          </h3>
+          <div className="flex items-center gap-2">
+            {selectedDocId && loggedIn && (
+              <button
+                className="neo-button-sm bg-yellow-400 text-slate-900 flex items-center gap-2 disabled:opacity-60"
+                disabled={loading}
+                onClick={() => setReloadToken((value) => value + 1)}
+              >
+                <RefreshCw size={16} className={loading ? "animate-spin" : ""} /> 重新生成
+              </button>
             )}
-            {highlights.conclusions.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-slate-700">结论</p>
-                <ul className="mt-1 space-y-1 text-sm text-slate-700">
-                  {highlights.conclusions.map((item, idx) => <li key={`c-${idx}`}>- {item}</li>)}
-                </ul>
-              </div>
-            )}
-            {highlights.actions.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-slate-700">行动建议</p>
-                <ul className="mt-1 space-y-1 text-sm text-slate-700">
-                  {highlights.actions.map((item, idx) => <li key={`a-${idx}`}>- {item}</li>)}
-                </ul>
-              </div>
-            )}
-            {highlights.items.length === 0 && highlights.conclusions.length === 0 && highlights.actions.length === 0 && (
-              <p className="text-xs text-slate-500">暂无要点，请先上传文档。</p>
+            {report && (
+              <button
+                className="neo-button-sm bg-blue-400 text-white flex items-center gap-2"
+                onClick={async () => {
+                  const blob = await exportGlobalSummaryToDocxBlob(report);
+                  downloadDocxBlob(blob, suggestedReportFilename(selectedDoc));
+                }}
+              >
+                <FileText size={16} /> 导出DOCX
+              </button>
             )}
           </div>
-        )}
-        {!highlightsLoading && !highlightsError && !highlights && (
-          <p className="text-xs text-slate-500">暂无要点，请先上传文档。</p>
-        )}
+        </div>
+
+        <select
+          className="neo-input w-full bg-slate-50 font-bold uppercase text-xs"
+          value={selectedDocId ?? ""}
+          onChange={(e) => setSelectedDocId(e.target.value ? Number(e.target.value) : null)}
+        >
+          {documents.map((doc) => (
+            <option key={doc.id} value={doc.id}>
+              {doc.filename || doc.title}
+            </option>
+          ))}
+        </select>
       </div>
 
-      <div className="card p-4">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold text-violet-600">✦ 重点提炼</h3>
-          {!summaryLoading && summary && (
-            <button
-              type="button"
-              className="rounded-lg border border-violet-200 bg-white px-2 py-1 text-[11px] font-medium text-violet-700 shadow-sm hover:bg-violet-50"
-              onClick={async () => {
-                try {
-                  const blob = await exportGlobalSummaryToDocxBlob(summary);
-                  downloadDocxBlob(blob, suggestedGlobalSummaryFilename());
-                } catch (e) {
-                  console.error(e);
-                }
-              }}
-            >
-              下载 Word
-            </button>
+      {loading && (
+        <div className="neo-box bg-yellow-400 p-12 flex flex-col items-center justify-center text-center">
+          <div className="w-20 h-20 border-8 border-slate-900 border-t-pink-500 rounded-full animate-spin mb-6" />
+          <p className="text-2xl font-black uppercase tracking-widest">{progress || "深度扫描中..."}</p>
+          <div className="neo-box-sm bg-white w-full max-w-md h-6 mt-8 overflow-hidden">
+            <div className="h-full bg-blue-400 animate-pulse w-2/3 border-r-4 border-slate-900" />
+          </div>
+        </div>
+      )}
+
+      {!loading && report && (
+        <div className="space-y-8 pb-10">
+          {/* Main Summary */}
+          <section className="neo-box bg-blue-400 p-8 rotate-[-0.5deg]">
+            <h4 className="text-2xl font-black uppercase mb-4 text-white drop-shadow-md flex items-center gap-2">
+              <Sparkles size={24} />
+              执行摘要
+            </h4>
+            <div className="neo-box-sm bg-white p-6 text-lg leading-relaxed font-bold">
+              {report.report || "No summary available."}
+            </div>
+          </section>
+
+          {/* Chapters / Sections Navigation */}
+          {chapterNavigation.length > 1 && (
+            <div className="flex flex-wrap gap-2">
+              {chapterNavigation.map((ch, idx) => (
+                <button
+                  key={ch.navKey}
+                  onClick={() => setActiveTreeIndex(idx)}
+                  className={`neo-button-sm ${activeTreeIndex === idx ? 'bg-pink-400 text-white' : 'bg-white'}`}
+                  style={{ marginLeft: `${Math.max(0, Math.min((ch.level - 1) * 12, 36))}px` }}
+                >
+                  {ch.title}
+                </button>
+              ))}
+            </div>
           )}
-        </div>
 
-        {summaryLoading && <p className="text-xs text-slate-500">全局重点提炼中...</p>}
-        {summaryError && <p className="text-xs text-rose-600">{summaryError}</p>}
-
-        {!summaryLoading && !summaryError && !summary && <p className="text-xs text-slate-500">当前暂无可展示的重点结果。</p>}
-
-        {!summaryLoading && !summaryError && summary && (
-          <div className="space-y-3">
-            <div>
-              <p className="text-xs font-semibold text-slate-700">报告正文</p>
-              <pre className="mt-1 max-h-[480px] overflow-auto whitespace-pre-wrap rounded-xl bg-violet-50/60 px-2 py-2 text-sm text-slate-700 ring-1 ring-violet-100">
-                {summary.report || "暂无报告正文"}
-              </pre>
-            </div>
-            <div>
-              <p className="text-xs font-semibold text-slate-700">报告分节</p>
-              <div className="mt-1 space-y-2">
-                {(summary.sections?.length ? summary.sections : [{ title: "分节", content: "暂无分节内容" }]).map((section, idx) => (
-                  <div key={`report-sec-${idx}`} className="rounded-xl bg-gradient-to-r from-white to-violet-50/70 px-2 py-2 text-xs text-slate-700 ring-1 ring-violet-100">
-                    <p className="font-semibold">{section.title}</p>
-                    <p className="mt-1 whitespace-pre-wrap">{section.content}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div>
-              <p className="text-xs font-semibold text-slate-700">引用来源</p>
-              <div className="mt-1 grid gap-1">
-                {(summary.citations.length
-                  ? summary.citations
-                  : [{ title: "基于当前检索未命中", discipline: "all", section_path: "N/A" }]
-                ).map((s, idx) => (
-                  <div key={`${s.title}-${idx}`} className="rounded-xl bg-violet-50/60 px-2 py-1 text-xs text-slate-600 ring-1 ring-violet-100">
-                    来源：{s.title} · {s.section_path} · {s.discipline}
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="rounded-xl border border-violet-100 bg-violet-50/45 px-2 py-2">
-              <p className="text-xs font-semibold text-slate-700">模型解析状态</p>
-              <p className="mt-1 text-[11px] text-slate-600">
-                命中数：{summary.parse_hits ?? 0} · 上下文规模：{summary.context_len ?? 0} 字符
-              </p>
-              <p className="text-[11px] text-slate-600">
-                兜底原因：{fallbackReasonLabel(summary.fallback_reason ?? "none")} · 来源质量：
-                {summary.source_quality ?? "unknown"}
-              </p>
-              <p className="text-[11px] text-slate-600">内容缩减量级别：{summary.summary_compact_level ?? summaryCompactLevel}</p>
-              <p className="text-[11px] text-slate-600">
-                {summary.output_mode === "report" ? "输出模式：report" : `摘要模式：${summary.summary_mode || summaryMode}`}
-              </p>
-            </div>
-            <div className="rounded-xl border border-violet-100 bg-white/70 px-2 py-2">
-              <p className="text-xs font-semibold text-slate-700">长度统计（原始 - 返回）</p>
-              <p className="mt-1 text-[11px] text-slate-600">
-                要点：{summary.raw_lengths?.highlights?.count ?? 0} 条 / {summary.raw_lengths?.highlights?.chars ?? 0} 字 -{" "}
-                {summary.clipped_lengths?.highlights?.count ?? 0} 条 / {summary.clipped_lengths?.highlights?.chars ?? 0} 字
-              </p>
-              <p className="text-[11px] text-slate-600">
-                结论：{summary.raw_lengths?.conclusions?.count ?? 0} 条 / {summary.raw_lengths?.conclusions?.chars ?? 0} 字 -{" "}
-                {summary.clipped_lengths?.conclusions?.count ?? 0} 条 / {summary.clipped_lengths?.conclusions?.chars ?? 0} 字
-              </p>
-              <p className="text-[11px] text-slate-600">
-                行动：{summary.raw_lengths?.actions?.count ?? 0} 条 / {summary.raw_lengths?.actions?.chars ?? 0} 字 -{" "}
-                {summary.clipped_lengths?.actions?.count ?? 0} 条 / {summary.clipped_lengths?.actions?.chars ?? 0} 字
-              </p>
-              <p className="text-[11px] text-slate-600">
-                map覆盖：{summary.effective_coverage?.candidate_rows ?? 0} / {summary.effective_coverage?.estimated_total ?? 0}
-                （{(((summary.effective_coverage?.coverage_ratio ?? 0) as number) * 100).toFixed(1)}%）
-              </p>
-              <p className="text-[11px] text-slate-600">
-                全局覆盖：{summary.coverage_stats?.candidate_rows ?? summary.coverage_stats?.processed_rows ?? 0} /{" "}
-                {summary.coverage_stats?.estimated_total ?? summary.coverage_stats?.total_rows ?? 0}
-                （{(((summary.coverage_stats?.coverage_ratio ?? 0) as number) * 100).toFixed(1)}%）
-              </p>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ── 文档级结构化知识摘要 ──────────────────────────────────── */}
-      <div className="card p-4">
-        <h3 className="mb-2 text-sm font-semibold text-violet-600">✦ 文档知识提取</h3>
-        {docSummaryLoading && <p className="text-xs text-slate-500">加载文档摘要中...</p>}
-        {!docSummaryLoading && docSummaries.length === 0 && (
-          <p className="text-xs text-slate-500">暂无已解析的文档摘要，请先上传文档。</p>
-        )}
-        <div className="space-y-3">
-          {docSummaries.map((ds) => {
-            const s = ds.summary!;
-            const isExpanded = expandedDoc === ds.document_id;
-            return (
-              <div key={ds.document_id} className="rounded-2xl bg-gradient-to-r from-white to-violet-50/70 ring-1 ring-violet-100">
-                <div className="flex items-start gap-2 px-3 py-2">
-                  <button
-                    type="button"
-                    className="min-w-0 flex-1 text-left"
-                    onClick={() => setExpandedDoc(isExpanded ? null : ds.document_id)}
-                  >
-                    <p className="text-sm font-medium text-slate-800 truncate">{s.title || s.filename}</p>
-                    <p className="text-[11px] text-slate-500">
-                      {s.document_type} · {s.discipline} · {s.page_count}页 · {s.chunk_count}块 · {s.section_count}节
-                    </p>
-                    {s.top_keywords.length > 0 && (
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {s.top_keywords.slice(0, 12).map((kw) => (
-                          <span key={kw} className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">{kw}</span>
-                        ))}
-                      </div>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    className="shrink-0 rounded-lg border border-violet-200 bg-white px-2 py-1 text-[10px] font-medium text-violet-700 shadow-sm hover:bg-violet-50"
-                    title="下载本文摘要为 Word"
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      try {
-                        const blob = await exportDocSummaryToDocxBlob(ds.document_id, s);
-                        downloadDocxBlob(blob, suggestedDocSummaryFilename(ds.document_id, s));
-                      } catch (err) {
-                        console.error(err);
-                      }
-                    }}
-                  >
-                    下载 Word
-                  </button>
+          {/* Detailed Sections */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {displayedSections.map((section, idx) => (
+              <article key={idx} className="neo-box bg-white p-6 hover:translate-x-1 hover:translate-y-1 transition-all">
+                <div className="inline-block bg-yellow-400 px-3 py-1 neo-box-sm text-[10px] font-black uppercase mb-4">
+                  章节 {idx + 1}
                 </div>
-                {isExpanded && (
-                  <div className="space-y-3 px-3 pb-3">
-                    {/* 结论 / 要点 */}
-                    {s.conclusions.length > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold text-slate-700">核心要点</p>
-                        <ul className="mt-1 space-y-0.5">
-                          {s.conclusions.map((c, i) => (
-                            <li key={i} className="text-xs text-slate-700">• {c}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {/* 原理 */}
-                    {(s.principles?.length ?? 0) > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold text-emerald-700">原理 / 定理 / 定义</p>
-                        <ul className="mt-1 space-y-0.5">
-                          {s.principles!.map((p, i) => (
-                            <li key={i} className="text-xs text-slate-700">• {p}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {/* 为什么 */}
-                    {(s.why?.length ?? 0) > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold text-amber-700">为什么 / 原因 / 意义</p>
-                        <ul className="mt-1 space-y-0.5">
-                          {s.why!.map((w, i) => (
-                            <li key={i} className="text-xs text-slate-700">• {w}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {/* 怎么做 */}
-                    {(s.how?.length ?? 0) > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold text-blue-700">怎么做 / 方法 / 步骤</p>
-                        <ul className="mt-1 space-y-0.5">
-                          {s.how!.map((h, i) => (
-                            <li key={i} className="text-xs text-slate-700">• {h}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {/* 按章节展开 */}
-                    {s.sections.length > 0 && (
-                      <div>
-                        <p className="text-xs font-semibold text-slate-700">按章节详情</p>
-                        <div className="mt-1 space-y-1">
-                          {s.sections.map((sec) => {
-                            const secKey = `${ds.document_id}:${sec.section_path}`;
-                            const secOpen = expandedSection === secKey;
-                            return (
-                              <div key={secKey} className="rounded-xl bg-white/80 ring-1 ring-violet-50">
-                                <button
-                                  className="w-full px-2 py-1 text-left text-[11px] text-slate-600"
-                                  onClick={() => setExpandedSection(secOpen ? null : secKey)}
-                                >
-                                  {sec.section_path} ({sec.chunk_count}块, {sec.key_points.length}要点)
-                                </button>
-                                {secOpen && (
-                                  <div className="space-y-1 px-2 pb-2">
-                                    {sec.key_points.length > 0 && (
-                                      <div>
-                                        <p className="text-[10px] font-semibold text-slate-600">知识点</p>
-                                        {sec.key_points.map((kp, i) => (
-                                          <p key={i} className="text-[11px] text-slate-600">• {kp}</p>
-                                        ))}
-                                      </div>
-                                    )}
-                                    {(sec.principles?.length ?? 0) > 0 && (
-                                      <div>
-                                        <p className="text-[10px] font-semibold text-emerald-600">原理</p>
-                                        {sec.principles!.map((p, i) => (
-                                          <p key={i} className="text-[11px] text-slate-600">• {p}</p>
-                                        ))}
-                                      </div>
-                                    )}
-                                    {(sec.why?.length ?? 0) > 0 && (
-                                      <div>
-                                        <p className="text-[10px] font-semibold text-amber-600">为什么</p>
-                                        {sec.why!.map((w, i) => (
-                                          <p key={i} className="text-[11px] text-slate-600">• {w}</p>
-                                        ))}
-                                      </div>
-                                    )}
-                                    {(sec.how?.length ?? 0) > 0 && (
-                                      <div>
-                                        <p className="text-[10px] font-semibold text-blue-600">怎么做</p>
-                                        {sec.how!.map((h, i) => (
-                                          <p key={i} className="text-[11px] text-slate-600">• {h}</p>
-                                        ))}
-                                      </div>
-                                    )}
-                                    {sec.keywords.length > 0 && (
-                                      <div className="flex flex-wrap gap-1">
-                                        {sec.keywords.map((kw) => (
-                                          <span key={kw} className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[9px] text-slate-600">{kw}</span>
-                                        ))}
-                                      </div>
-                                    )}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
+                <h5 className="text-xl font-black uppercase mb-3 border-b-2 border-slate-900 pb-2">{section.title}</h5>
+                <p className="text-sm leading-relaxed font-bold text-slate-700 whitespace-pre-wrap">
+                  {section.content}
+                </p>
+                {showRedundantBlocks && section.metadata?.comprehensive_analysis && (
+                  <div className="mt-4 neo-box-sm bg-green-400 p-3 text-[11px] font-black">
+                    策略: {section.metadata.comprehensive_analysis}
                   </div>
                 )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
+              </article>
+            ))}
+          </div>
 
-    </section>
+          {showRedundantBlocks && (
+            <section className="mt-12">
+              <h4 className="text-xl font-black uppercase mb-6 flex items-center gap-2">
+                <ChevronRight size={24} className="text-pink-500" />
+                快速概览
+              </h4>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                {displayedSections.slice(0, 4).map((s, i) => (
+                  <div
+                    key={i}
+                    className={`neo-box p-4 h-40 flex flex-col justify-between ${
+                      i % 2 === 0 ? "bg-yellow-400 rotate-1" : "bg-pink-400 text-white rotate-[-1deg]"
+                    }`}
+                  >
+                    <p className="text-xs font-black uppercase truncate border-b-2 border-current pb-1 mb-2">
+                      {s.title}
+                    </p>
+                    <p className="text-[10px] font-bold line-clamp-4 leading-tight">
+                      {s.content}
+                    </p>
+                    <div className="text-[9px] font-black uppercase opacity-60 mt-2">洞察 #{i + 1}</div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+        </div>
+      )}
+
+      {!loading && !report && !error && (
+        <div className="neo-box bg-slate-50 p-20 flex flex-col items-center justify-center text-center opacity-50">
+          <BookOpen size={64} className="mb-4 text-slate-300" />
+          <p className="text-xl font-black uppercase">{emptyStateMessage}</p>
+        </div>
+      )}
+
+      {error && (
+        <div className="neo-box bg-red-400 text-white p-6 font-black uppercase rotate-[-1deg]">
+          分析错误: {error}
+        </div>
+      )}
+    </div>
   );
 }
 
