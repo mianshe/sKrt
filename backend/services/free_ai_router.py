@@ -90,6 +90,8 @@ class FreeAIRouter:
         return "本地模型运行时未初始化，请检查 transformers/torch、模型名和网络下载权限"
 
     def get_local_embedding_runtime_status(self) -> Dict[str, Any]:
+        if self.hybrid_cfg.enable_local_embedding and self._local_embed_runtime is None:
+            self._load_local_embedding_runtime()
         ready = self._local_embed_runtime is not None
         error = str(self._local_embed_runtime_error or "").strip()
         return {

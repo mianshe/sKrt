@@ -31,6 +31,12 @@ pdf2image
 Pillow
 numpy
 
+# Local embedding / local chat runtime (optional but required when enabled)
+torch
+transformers
+sentencepiece
+accelerate
+
 # OCR (optional, install at least one for scanned PDFs/images)
 #
 # Option A: PaddleOCR (recommended for Chinese)
