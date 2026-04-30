@@ -63,8 +63,6 @@ from services.client_ip import normalized_signup_ip
 from services import local_auth_service
 from services import knowledge_store
 from services import gpu_ocr_billing
-from services.memory import MemoryHook
-from services.memory.pattern_separator import PatternSeparator
 from services import ocr_token_billing
 from services import embedding_token_billing
 from services.billing_mode import is_self_hosted_embedding_billing, is_self_hosted_ocr_billing
@@ -89,6 +87,14 @@ from services.upload_load_control import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from services.memory import MemoryHook
+    from services.memory.pattern_separator import PatternSeparator
+except Exception as exc:  # pragma: no cover - optional experimental module
+    MemoryHook = None  # type: ignore[assignment]
+    PatternSeparator = None  # type: ignore[assignment]
+    logger.warning("memory module disabled during startup: %s", exc)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -3740,9 +3746,13 @@ ai_router = FreeAIRouter(RUNTIME_CONFIG)
 ai_reverse_proxy = AIReverseProxyService(RUNTIME_CONFIG.reverse_proxy)
 parser = DocumentParser()
 chunker = DocumentChunker()
-    pattern_separator = PatternSeparator(dim=1536)
+pattern_separator = PatternSeparator(dim=1536) if PatternSeparator is not None else None
 rag_engine = RAGEngine(ai_router, pattern_separator=pattern_separator)
-memory_hook = MemoryHook(db_path=DB_PATH, rag_engine=rag_engine, pattern_separator=pattern_separator, auto_start_decay=True)
+memory_hook = (
+    MemoryHook(db_path=DB_PATH, rag_engine=rag_engine, pattern_separator=pattern_separator, auto_start_decay=True)
+    if MemoryHook is not None and pattern_separator is not None
+    else None
+)
 agent_chains = AgentChains(ai_router=ai_router, rag_engine=rag_engine, memory_hook=memory_hook)
 kg_builder = KGBuilder()
 exam_processor = ExamProcessor(rag_engine, ai_router, agent_chains=agent_chains)
@@ -3753,7 +3763,6 @@ upload_ingestion_service = UploadIngestionService(
     agent_chains=agent_chains,
     parser=parser,
     runtime_config=RUNTIME_CONFIG,
-        pattern_separator=pattern_separator,
 )
 deep_pipeline_service = DeepPipelineService(
     database_url=RUNTIME_CONFIG.postgres.database_url,
