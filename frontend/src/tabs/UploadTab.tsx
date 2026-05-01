@@ -1277,9 +1277,9 @@ function UploadTab({
           <div className="space-y-4">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-xs font-black uppercase tracking-[0.3em] text-slate-500">OCR Hint</p>
+                <p className="text-xs font-black uppercase tracking-[0.3em] text-slate-500">OCR 提示</p>
                 <h3 className="mt-2 text-2xl font-black uppercase text-slate-900">
-                  {ocrPrompt.kind === "large_scan" ? "Large PDF detected" : "Complex layout suspected"}
+                  {ocrPrompt.kind === "large_scan" ? "检测到大体积 PDF" : "疑似复杂版式 PDF"}
                 </h3>
               </div>
               <button
@@ -1287,31 +1287,30 @@ function UploadTab({
                 className="neo-button-xs bg-white"
                 onClick={() => finishOcrPrompt(null)}
               >
-                Cancel
+                取消
               </button>
             </div>
 
             <div className="neo-box-sm bg-white p-4 text-sm font-bold text-slate-700">
               {ocrPrompt.kind === "large_scan" ? (
                 <p>
-                  We heuristically detected a large PDF batch candidate. The largest flagged file is about{" "}
-                  {ocrPrompt.maxFileSizeMb.toFixed(1)} MB. The default path will stay local OCR. If you need paid OCR,
-                  choose Baidu OCR or GLM-OCR explicitly.
+                  系统检测到这批文件里可能包含大体积 PDF，当前命中的最大文件约{" "}
+                  {ocrPrompt.maxFileSizeMb.toFixed(1)} MB。默认仍会继续走本地 OCR；如果你希望用付费 OCR
+                  提高识别成功率，可以手动切换到百度 OCR 或 GLM-OCR。
                 </p>
               ) : (
                 <p>
-                  Filename hints suggest that this batch may contain complex layout PDFs. The default path will stay
-                  local OCR, but you can switch to GLM-OCR if you need better recovery for tables, forms, exam papers,
-                  and scan-like page structures.
+                  从文件名特征看，这批文件里可能包含复杂版式 PDF。默认会继续走本地 OCR；如果你更在意表格、
+                  表单、试卷、扫描件这类页面结构的还原效果，可以切换到 GLM-OCR。
                 </p>
               )}
             </div>
 
             <div className="neo-box-sm bg-slate-900 p-4 text-white">
-              <p className="text-xs font-black uppercase tracking-wider text-slate-300">Affected Files</p>
+              <p className="text-xs font-black uppercase tracking-wider text-slate-300">涉及文件</p>
               <p className="mt-2 text-sm font-bold break-words">{formatPromptFileNames(ocrPrompt.filenames)}</p>
               <p className="mt-2 text-[11px] font-bold text-slate-300">
-                This reminder covers {ocrPrompt.totalPdfCount} PDF file{ocrPrompt.totalPdfCount > 1 ? "s" : ""} in the current batch.
+                本次提醒覆盖当前批次中的 {ocrPrompt.totalPdfCount} 个 PDF 文件。
               </p>
             </div>
 
@@ -1321,7 +1320,7 @@ function UploadTab({
                 className="neo-button bg-white"
                 onClick={() => finishOcrPrompt("local")}
               >
-                Continue Local
+                继续本地解析
               </button>
               {ocrPrompt.kind === "large_scan" && (
                 <button
@@ -1329,7 +1328,7 @@ function UploadTab({
                   className="neo-button bg-blue-400 text-white"
                   onClick={() => finishOcrPrompt("baidu")}
                 >
-                  Use Baidu OCR
+                  使用百度 OCR
                 </button>
               )}
               <button
@@ -1337,7 +1336,7 @@ function UploadTab({
                 className="neo-button bg-pink-400 text-white"
                 onClick={() => finishOcrPrompt("glm-ocr")}
               >
-                Use GLM-OCR
+                使用 GLM-OCR
               </button>
             </div>
           </div>
