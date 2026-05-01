@@ -14,9 +14,11 @@ export type LocalAuthProfile = {
   ok: boolean;
   user_id: string;
   tenant_id: string;
+  email?: string;
   roles: string[];
   permissions: string[];
   is_admin: boolean;
+  is_showcase?: boolean;
   provider_billing_mode?: "default" | "internal" | "self_hosted";
   effective_provider_billing_mode?: "internal" | "self_hosted";
 };

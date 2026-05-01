@@ -3,7 +3,14 @@ import AuthPanel from "./components/AuthPanel";
 import GpuQuotaWidget from "./components/GpuQuotaWidget";
 import NoticeDrawer from "./components/NoticeDrawer";
 import { API_BASE } from "./config/apiBase";
-import { ensureAuthReady, setAccessToken, useAccessToken, useAuthBootstrapStatus, verifyLocalAuthSession } from "./lib/auth";
+import {
+  ensureAuthReady,
+  fetchLocalAuthProfile,
+  setAccessToken,
+  useAccessToken,
+  useAuthBootstrapStatus,
+  verifyLocalAuthSession,
+} from "./lib/auth";
 import ChatTab from "./tabs/ChatTab";
 import KnowledgeTab from "./tabs/KnowledgeTab";
 import UploadTab from "./tabs/UploadTab";
@@ -21,6 +28,7 @@ function App() {
   const [noticeOpen, setNoticeOpen] = useState(false);
   const [authLocalEnabled, setAuthLocalEnabled] = useState(true);
   const [authSession, setAuthSession] = useState(0);
+  const [viewerMode, setViewerMode] = useState<"guest" | "personal" | "showcase_public">("guest");
   const knowledgeRefreshKey = `${authSession}:${documents
     .map((doc) => String(doc.id))
     .sort()
@@ -56,6 +64,23 @@ function App() {
   useEffect(() => {
     void ensureAuthReady();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadViewerMode = async () => {
+      if (!accessToken) {
+        if (!cancelled) setViewerMode("guest");
+        return;
+      }
+      const profile = await fetchLocalAuthProfile(accessToken);
+      if (cancelled) return;
+      setViewerMode(profile?.is_showcase ? "showcase_public" : "personal");
+    };
+    void loadViewerMode();
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -113,6 +138,18 @@ function App() {
       {!accessToken && authLocalEnabled && (
         <div className="mb-6 neo-box-sm bg-cyan-300 p-4 text-xs font-black uppercase rotate-[-1deg]">
           当前为演示资料库。登录后将自动切换到你的个人资料库。
+        </div>
+      )}
+
+      {accessToken && viewerMode === "showcase_public" && (
+        <div className="mb-6 neo-box-sm bg-yellow-300 p-4 text-xs font-black uppercase rotate-[1deg]">
+          当前为展示号视角：上传后的展示资料会进入公共展示库，游客与展示页都会看到。
+        </div>
+      )}
+
+      {accessToken && viewerMode === "personal" && (
+        <div className="mb-6 neo-box-sm bg-emerald-300 p-4 text-xs font-black uppercase rotate-[-1deg]">
+          当前为个人资料库视角：你的上传、解析和问答默认只属于你自己的账号。
         </div>
       )}
 

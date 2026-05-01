@@ -107,6 +107,10 @@ def local_admin_emails() -> list[str]:
     return _split_csv_env(os.getenv("AUTH_LOCAL_ADMIN_EMAILS") or "")
 
 
+def local_showcase_emails() -> list[str]:
+    return _split_csv_env(os.getenv("AUTH_LOCAL_SHOWCASE_EMAILS") or "")
+
+
 def issue_local_access_token(*, user_id: str, email: str) -> str:
     """tenant_id = user_id，保证知识库按账号隔离。"""
     secret = local_jwt_secret()
@@ -124,6 +128,7 @@ def issue_local_access_token(*, user_id: str, email: str) -> str:
         "roles": list(identity.get("roles") or []),
         "permissions": list(identity.get("permissions") or []),
         "is_admin": bool(identity.get("is_admin")),
+        "is_showcase": bool(identity.get("is_showcase")),
         "iat": now,
         "exp": now + ttl,
     }
@@ -184,13 +189,22 @@ def is_local_admin_email(email: str) -> bool:
     return domain in set(local_admin_email_domains())
 
 
+def is_local_showcase_email(email: str) -> bool:
+    normalized = normalize_email(email)
+    if not normalized or "@" not in normalized:
+        return False
+    return normalized in set(local_showcase_emails())
+
+
 def local_identity_claims(email: str) -> Dict[str, Any]:
     normalized = normalize_email(email)
+    showcase = is_local_showcase_email(normalized)
     if is_local_admin_email(normalized):
         return {
             "roles": ["tenant_admin"],
             "permissions": ["tenant.*"],
             "is_admin": True,
+            "is_showcase": showcase,
         }
     return {
         "roles": ["tenant_user"],
@@ -210,6 +224,7 @@ def local_identity_claims(email: str) -> Dict[str, Any]:
             "tenant.generate.write",
         ],
         "is_admin": False,
+        "is_showcase": showcase,
     }
 
 

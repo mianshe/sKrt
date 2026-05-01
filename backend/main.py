@@ -296,9 +296,12 @@ class RunpodIngestionCallbackRequest(BaseModel):
 class RequestIdentity(TypedDict, total=False):
     tenant_id: str
     user_id: str
+    email: str
     roles: List[str]
     permissions: List[str]
     auth_source: str
+    is_admin: bool
+    is_showcase: bool
 
 
 def _normalize_tenant_id(value: str) -> str:
@@ -407,6 +410,7 @@ def _get_request_identity(request: Request) -> RequestIdentity:
         return request.state.identity
     tenant_id = ""
     user_id = ""
+    email = ""
     roles: List[str] = []
     permissions: List[str] = []
     auth_source = "header"
@@ -417,6 +421,7 @@ def _get_request_identity(request: Request) -> RequestIdentity:
             claims = local_auth_service.decode_local_access_token(token)
             tenant_id = _normalize_tenant_id(str(claims.get("tenant_id") or claims.get("sub") or ""))
             user_id = _normalize_user_id(str(claims.get("sub") or ""))
+            email = local_auth_service.normalize_email(str(claims.get("email") or ""))
             roles_raw = claims.get("roles", [])
             perms_raw = claims.get("permissions", [])
             if isinstance(roles_raw, str):
@@ -439,9 +444,12 @@ def _get_request_identity(request: Request) -> RequestIdentity:
             out_l: RequestIdentity = {
                 "tenant_id": tenant_id,
                 "user_id": user_id,
+                "email": email,
                 "roles": roles,
                 "permissions": permissions,
                 "auth_source": auth_source,
+                "is_admin": bool(claims.get("is_admin")) or local_auth_service.is_local_admin_email(email),
+                "is_showcase": bool(claims.get("is_showcase")) or local_auth_service.is_local_showcase_email(email),
             }
             request.state.identity = out_l
             return out_l
@@ -606,6 +614,52 @@ def _embedding_billing_exempt(request: Request) -> bool:
 def _request_client_managed_original(request: Request) -> bool:
     raw = (request.headers.get("X-Client-Storage-Mode") or "").strip().lower()
     return raw in {"device-local", "client-device", "native-local"}
+
+
+def _is_local_admin_identity(identity: RequestIdentity) -> bool:
+    if str(identity.get("auth_source") or "") != "local_jwt":
+        return False
+    roles = {str(item).strip() for item in identity.get("roles", []) if str(item).strip()}
+    permissions = {str(item).strip() for item in identity.get("permissions", []) if str(item).strip()}
+    return bool(
+        "tenant_admin" in roles
+        or "*" in permissions
+        or "tenant.*" in permissions
+        or identity.get("is_admin")
+    )
+
+
+def _is_local_showcase_identity(identity: RequestIdentity) -> bool:
+    if str(identity.get("auth_source") or "") != "local_jwt":
+        return False
+    if bool(identity.get("is_showcase")):
+        return True
+    return local_auth_service.is_local_showcase_email(str(identity.get("email") or ""))
+
+
+def _effective_library_tenant_id(request: Request, identity: Optional[RequestIdentity] = None) -> str:
+    identity = identity or _get_request_identity(request)
+    auth_source = str(identity.get("auth_source") or "")
+    personal_tenant_id = _normalize_tenant_id(
+        str(identity.get("tenant_id") or identity.get("user_id") or "public")
+    ) or "public"
+    if auth_source != "local_jwt":
+        return "public"
+    if not _is_local_showcase_identity(identity):
+        return personal_tenant_id
+
+    header_key = (RUNTIME_CONFIG.tenant.header_name or "X-Tenant-Id").strip()
+    requested_tenant_id = _normalize_tenant_id(request.headers.get(header_key, ""))
+    requested_scope = (request.headers.get("X-Library-Scope") or "").strip().lower()
+    if requested_scope in {"personal", "private", "tenant"}:
+        return personal_tenant_id
+    if requested_scope in {"public", "showcase", "global", "shared"}:
+        return "public"
+    if requested_tenant_id == personal_tenant_id:
+        return personal_tenant_id
+    if requested_tenant_id == "public":
+        return "public"
+    return "public"
 
 
 def _has_role(identity: RequestIdentity, role: str) -> bool:
@@ -923,8 +977,8 @@ def _tenant_used_storage_bytes(tenant_id: str) -> int:
     return total
 
 
-def _tenant_quota_snapshot(identity: RequestIdentity) -> Dict[str, Any]:
-    tenant_id = str(identity.get("tenant_id", "public"))
+def _tenant_quota_snapshot(identity: RequestIdentity, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+    tenant_id = _normalize_tenant_id(str(tenant_id or identity.get("tenant_id") or "public")) or "public"
     quotas = {
         "max_documents": int(os.getenv("TENANT_DEFAULT_MAX_DOCUMENTS", "1000") or 1000),
         "max_vectors": int(os.getenv("TENANT_DEFAULT_MAX_VECTORS", "1000000") or 1000000),
@@ -970,8 +1024,12 @@ def _tenant_quota_snapshot(identity: RequestIdentity) -> Dict[str, Any]:
     }
 
 
-def _enforce_tenant_quota(identity: RequestIdentity, additional_bytes: int = 0) -> None:
-    quota = _tenant_quota_snapshot(identity)
+def _enforce_tenant_quota(
+    identity: RequestIdentity,
+    additional_bytes: int = 0,
+    tenant_id: Optional[str] = None,
+) -> None:
+    quota = _tenant_quota_snapshot(identity, tenant_id=tenant_id)
     if quota["doc_count"] >= quota["max_documents"]:
         raise HTTPException(status_code=429, detail="租户文档配额已满，请联系管理员扩容。")
     if quota["vector_count"] >= quota["max_vectors"]:
@@ -3098,13 +3156,17 @@ async def auth_me(request: Request) -> Dict[str, Any]:
     if identity.get("auth_source") != "local_jwt":
         raise HTTPException(status_code=401, detail="需要登录")
     provider_billing_mode = _get_request_provider_billing_mode(request)
+    is_admin = _is_local_admin_identity(identity)
+    is_showcase = _is_local_showcase_identity(identity)
     return {
         "ok": True,
         "user_id": str(identity.get("user_id") or ""),
         "tenant_id": str(identity.get("tenant_id") or ""),
+        "email": str(identity.get("email") or ""),
         "roles": list(identity.get("roles", [])),
         "permissions": list(identity.get("permissions", [])),
-        "is_admin": bool("tenant_admin" in set(identity.get("roles", []))),
+        "is_admin": is_admin,
+        "is_showcase": is_showcase,
         "provider_billing_mode": provider_billing_mode,
         "effective_provider_billing_mode": "internal"
         if _request_ocr_internal_billing_enabled(request) and _request_embedding_internal_billing_enabled(request)
@@ -4132,7 +4194,7 @@ async def tenant_quota_status(request: Request) -> Dict[str, Any]:
         pass
     else:
         _require_permission(identity, "tenant.metrics.read")
-    return _tenant_quota_snapshot(identity)
+    return _tenant_quota_snapshot(identity, tenant_id=_effective_library_tenant_id(request, identity))
 
 
 @app.get("/security/baseline")
@@ -4179,8 +4241,12 @@ async def init_chunk_upload(req: ChunkInitRequest, request: Request) -> Dict[str
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     client_managed_original = bool(req.client_managed_original) and _request_client_managed_original(request)
-    _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else int(req.total_size))
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
+    _enforce_tenant_quota(
+        identity,
+        additional_bytes=0 if client_managed_original else int(req.total_size),
+        tenant_id=tenant_id,
+    )
     filename = _safe_filename(req.filename)
     suffix = Path(filename).suffix.lower()
     if suffix not in {".pdf", ".docx", ".txt", ".md", ".markdown"}:
@@ -4246,7 +4312,7 @@ async def complete_chunk_upload(
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     if str(meta.get("tenant_id", "")) != tenant_id:
         raise HTTPException(status_code=403, detail="租户不匹配，禁止跨租户完成上传。")
 
@@ -4415,7 +4481,7 @@ async def upload_documents(
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
 
@@ -4433,7 +4499,7 @@ async def upload_documents(
         await _save_upload_file_stream(f, target)
 
         sz = int(target.stat().st_size) if target.exists() else 0
-        _enforce_tenant_quota(identity, additional_bytes=sz)
+        _enforce_tenant_quota(identity, additional_bytes=sz, tenant_id=tenant_id)
 
         dtype = document_type or _guess_doc_type(f.filename)
         parsed = parser.parse(str(target), dtype)
@@ -4508,7 +4574,7 @@ async def create_upload_tasks(
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     client_managed_original = _request_client_managed_original(request)
     if not files:
         raise HTTPException(status_code=400, detail="请至少上传一个文件")
@@ -4566,7 +4632,11 @@ async def create_upload_tasks(
         await _save_upload_file_stream(f, target)
 
         sz = target.stat().st_size if target.exists() else 0
-        _enforce_tenant_quota(identity, additional_bytes=0 if client_managed_original else int(sz))
+        _enforce_tenant_quota(
+            identity,
+            additional_bytes=0 if client_managed_original else int(sz),
+            tenant_id=tenant_id,
+        )
 
         dtype = document_type or _guess_doc_type(f.filename)
         task = upload_ingestion_service.create_task(
@@ -4666,8 +4736,8 @@ async def upload_tasks_presign_init(request: Request, body: UploadPresignInitReq
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
     client_managed_original = bool(body.client_managed_original) and _request_client_managed_original(request)
-    _enforce_tenant_quota(identity)
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
+    _enforce_tenant_quota(identity, tenant_id=tenant_id)
     r2_cfg = R2StorageConfig.from_env()
     if not r2_cfg:
         raise HTTPException(status_code=503, detail="未配置 R2（R2_ENDPOINT 等），无法使用预签名直传")
@@ -4764,7 +4834,7 @@ async def upload_tasks_presign_complete(
     _ensure_capacity_for_write()
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     client_managed_original = bool(body.client_managed_original) and _request_client_managed_original(request)
     r2_cfg = R2StorageConfig.from_env()
     if not r2_cfg:
@@ -4838,7 +4908,7 @@ async def list_upload_tasks(request: Request, limit: int = 50) -> Dict[str, Any]
     _require_permission(identity, "tenant.upload.read")
     if local_auth_service.is_anonymous_local_guest(identity):
         return {"tasks": []}
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     rows = upload_ingestion_service.list_tasks(limit=min(max(limit, 1), 200), tenant_id=tenant_id)
     return {"tasks": [_normalize_task(t) for t in rows]}
 
@@ -4850,7 +4920,10 @@ async def get_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
         _require_permission(identity, "tenant.upload.read")
         if local_auth_service.is_anonymous_local_guest(identity):
             raise HTTPException(status_code=404, detail="上传任务不存在")
-        task = upload_ingestion_service.get_task(task_id, tenant_id=str(identity.get("tenant_id", "public")))
+        task = upload_ingestion_service.get_task(
+            task_id,
+            tenant_id=_effective_library_tenant_id(request, identity),
+        )
     except ValueError:
         raise HTTPException(status_code=404, detail="上传任务不存在")
     return _normalize_task(task)
@@ -4860,7 +4933,7 @@ async def get_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
 async def delete_upload_task(task_id: int, request: Request) -> Dict[str, Any]:
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     result = await _delete_upload_task_with_artifacts(
         task_id,
         tenant_id=tenant_id,
@@ -4921,7 +4994,7 @@ async def get_upload_queue_metrics_endpoint(request: Request) -> Dict[str, Any]:
 async def list_documents(request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.documents.read")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     conn = _conn()
     try:
         rows = conn.execute(
@@ -4963,7 +5036,7 @@ async def download_document_original(doc_id: int, request: Request) -> Any:
     _require_permission(identity, "tenant.documents.read")
     if local_auth_service.is_anonymous_local_guest(identity):
         raise HTTPException(status_code=404, detail="文档不存在")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     conn = _conn()
     try:
         row = conn.execute(
@@ -5034,7 +5107,7 @@ async def get_document_summary(doc_id: int, request: Request) -> Dict[str, Any]:
     _require_permission(identity, "tenant.documents.read")
     if local_auth_service.is_anonymous_local_guest(identity):
         raise HTTPException(status_code=404, detail="文档不存在")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     conn = _conn()
     try:
         row = conn.execute("SELECT id FROM documents WHERE id = ? AND tenant_id = ?", (doc_id, tenant_id)).fetchone()
@@ -5427,7 +5500,7 @@ def _try_remove_upload_file(path_str: str) -> None:
 async def delete_document(doc_id: int, request: Request) -> Dict[str, Any]:
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.documents.delete")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     result = await _delete_document_with_artifacts(
         doc_id,
         tenant_id=tenant_id,
@@ -5501,7 +5574,7 @@ async def knowledge_graph(request: Request) -> Dict[str, Any]:
     _require_permission(identity, "tenant.knowledge.read")
     if local_auth_service.is_anonymous_local_guest(identity):
         return {"nodes": [], "links": [], "insights": []}
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     docs = _load_documents_with_meta(tenant_id=tenant_id)
     chunks = _load_chunks_by_doc(tenant_id=tenant_id)
     graph = kg_builder.build_graph(docs, chunks)
@@ -5513,7 +5586,7 @@ async def knowledge_graph(request: Request) -> Dict[str, Any]:
 async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.chat.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     user_id = str(identity.get("user_id", "anonymous"))
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     session_id = _normalize_tenant_id(req.session_id or "") or "default"
@@ -5590,7 +5663,7 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
 async def clear_chat_memory(req: ChatMemoryClearRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.chat.clear")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     user_id = str(identity.get("user_id", "anonymous"))
     session_id = _normalize_tenant_id(req.session_id)
     if not session_id:
@@ -5639,7 +5712,7 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     _require_permission(identity, "tenant.insights.read")
     if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
         raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
@@ -5723,7 +5796,7 @@ async def insights_report_stream(req: ReportRequest, request: Request):
     _require_permission(identity, "tenant.insights.read")
     if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
         raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
@@ -5811,7 +5884,7 @@ def _spawn_deep_pipeline(job_id: str, tenant_id: str, user_id: str, roles: List[
 async def pipeline_deep_report_start(req: DeepReportStartRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.pipeline.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     if not RUNTIME_CONFIG.postgres.enabled:
         raise HTTPException(status_code=503, detail="PostgreSQL 未配置：请设置环境变量 DATABASE_URL")
     try:
@@ -5838,7 +5911,7 @@ async def pipeline_deep_report_start(req: DeepReportStartRequest, request: Reque
 async def pipeline_deep_report_status(job_id: str, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.pipeline.read")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     if not RUNTIME_CONFIG.postgres.enabled:
         raise HTTPException(status_code=503, detail="PostgreSQL 未配置：请设置环境变量 DATABASE_URL")
     row = deep_pipeline_service.get_job(
@@ -5867,7 +5940,7 @@ async def pipeline_deep_report_status(job_id: str, request: Request) -> Dict[str
 async def get_presentation_tree(doc_id: int, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.pipeline.read")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     if not RUNTIME_CONFIG.postgres.enabled:
         raise HTTPException(status_code=503, detail="PostgreSQL 未配置：请设置环境变量 DATABASE_URL")
     bundle = deep_pipeline_service.get_presentation_bundle(
@@ -5900,7 +5973,7 @@ async def get_presentation_tree(doc_id: int, request: Request) -> Dict[str, Any]
 async def exam(req: ExamRequest, request: Request) -> Dict[str, Any]:
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.exam.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     return await exam_processor.analyze_exam(req.exam_text, req.discipline, tenant_id=tenant_id)
 
 
@@ -5914,7 +5987,7 @@ async def exam_upload(
     _ensure_capacity_for_write()
     identity = _get_request_identity(request)
     _require_permission(identity, "tenant.exam.write")
-    tenant_id = str(identity.get("tenant_id", "public"))
+    tenant_id = _effective_library_tenant_id(request, identity)
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
     if not file.filename:
