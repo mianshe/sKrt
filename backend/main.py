@@ -367,6 +367,53 @@ def _ensure_embedding_mode_available(embedding_mode: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _load_document_embedding_metadata(tenant_id: str, document_id: Optional[int]) -> Dict[str, Any]:
+    doc_id = int(document_id or 0)
+    if doc_id <= 0:
+        return {}
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM documents WHERE id = ? AND tenant_id = ?",
+            (doc_id, tenant_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    return FreeAIRouter.safe_json_loads(row["metadata"], {})
+
+
+def _infer_embedding_mode_from_document_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    meta = metadata if isinstance(metadata, dict) else {}
+    stored_mode = _normalize_embedding_mode(meta.get("embedding_mode"))
+    if stored_mode in {"local", "api"}:
+        return stored_mode
+    stored_model = str(meta.get("embedding_model") or "").strip()
+    if not stored_model:
+        return None
+    local_model_id = str(ai_router.get_active_embedding_model_id("local") or "").strip()
+    if local_model_id and stored_model == local_model_id:
+        return "local"
+    return "api"
+
+
+def _resolve_document_scoped_embedding_mode(
+    *,
+    tenant_id: str,
+    document_id: Optional[int],
+    requested_mode: Optional[str],
+) -> str:
+    normalized_requested_mode = _normalize_embedding_mode(requested_mode)
+    if normalized_requested_mode != "auto":
+        return _ensure_embedding_mode_available(normalized_requested_mode)
+    metadata = _load_document_embedding_metadata(tenant_id, document_id)
+    inferred_mode = _infer_embedding_mode_from_document_metadata(metadata)
+    if inferred_mode in {"local", "api"}:
+        return _ensure_embedding_mode_available(inferred_mode)
+    return _ensure_embedding_mode_available(normalized_requested_mode)
+
+
 _jwt_validator: Optional[JwtValidator] = None
 if RUNTIME_CONFIG.auth.enabled:
     try:
@@ -5588,7 +5635,13 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
     _require_permission(identity, "tenant.chat.write")
     tenant_id = _effective_library_tenant_id(request, identity)
     user_id = str(identity.get("user_id", "anonymous"))
-    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
+    scope = str(req.scope or "auto").strip().lower() or "auto"
+    effective_document_id = req.document_id if scope == "document" else (req.document_id if scope == "auto" else None)
+    embedding_mode = _resolve_document_scoped_embedding_mode(
+        tenant_id=tenant_id,
+        document_id=effective_document_id,
+        requested_mode=req.embedding_mode,
+    )
     session_id = _normalize_tenant_id(req.session_id or "") or "default"
     memory_rows = _load_chat_memory_context(tenant_id=tenant_id, user_id=user_id, session_id=session_id)
     memory_context_lines: List[str] = []
@@ -5602,8 +5655,6 @@ async def chat(req: ChatRequest, request: Request) -> Dict[str, Any]:
         enriched_query = f"{req.query}\n\n[历史工作记忆]\n" + "\n\n".join(memory_context_lines[-_chat_memory_recent_limit():])
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
-    scope = str(req.scope or "auto").strip().lower() or "auto"
-    effective_document_id = req.document_id if scope == "document" else (req.document_id if scope == "auto" else None)
     try:
         graph_result = await agent_chains.run_chat_graph(
             query=enriched_query,
@@ -5713,7 +5764,11 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
         raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
     tenant_id = _effective_library_tenant_id(request, identity)
-    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
+    embedding_mode = _resolve_document_scoped_embedding_mode(
+        tenant_id=tenant_id,
+        document_id=req.document_id,
+        requested_mode=req.embedding_mode,
+    )
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
     default_summary_compact_level = _resolve_summary_compact_level(os.getenv("SUMMARY_COMPACT_LEVEL"), default=1)
@@ -5797,7 +5852,11 @@ async def insights_report_stream(req: ReportRequest, request: Request):
     if local_auth_service.is_anonymous_local_guest(identity) and not _is_demo_guest_identity(identity):
         raise HTTPException(status_code=401, detail="请先登录后查看重点提炼")
     tenant_id = _effective_library_tenant_id(request, identity)
-    embedding_mode = _ensure_embedding_mode_available(req.embedding_mode)
+    embedding_mode = _resolve_document_scoped_embedding_mode(
+        tenant_id=tenant_id,
+        document_id=req.document_id,
+        requested_mode=req.embedding_mode,
+    )
     _, billing_client_id = _billing_tenant_client(request)
     billing_exempt = _embedding_billing_exempt(request)
     summary_compact_level = _resolve_summary_compact_level(req.summary_compact_level, default=1)
