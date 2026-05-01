@@ -4290,7 +4290,7 @@ async def put_chunk(upload_id: str, chunk_index: int, request: Request, chunk: U
         raise HTTPException(status_code=404, detail="upload_id 不存在或已过期")
     identity = _ingest_identity_or_raise(request)
     _require_permission(identity, "tenant.upload.write")
-    if str(meta.get("tenant_id", "")) != str(identity.get("tenant_id", "public")):
+    if str(meta.get("tenant_id", "")) != _effective_library_tenant_id(request, identity):
         raise HTTPException(status_code=403, detail="租户不匹配，禁止跨租户上传分片。")
     if chunk_index < 0 or chunk_index >= int(meta["total_chunks"]):
         raise HTTPException(status_code=400, detail="chunk_index 超出范围")
