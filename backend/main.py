@@ -5249,12 +5249,21 @@ def _build_demo_deep_report_cache_key(
 
 def _build_request_deep_report_cache_key(
     *,
+    tenant_id: str,
     identity: RequestIdentity,
     query: str,
     discipline: str,
     embedding_mode: str,
     summary_compact_level: int,
 ) -> str:
+    normalized_tenant_id = _normalize_tenant_id(str(tenant_id or "")) or "public"
+    if normalized_tenant_id == "public":
+        return _build_deep_report_cache_key(
+            query=query,
+            discipline=discipline,
+            embedding_mode=embedding_mode,
+            summary_compact_level=summary_compact_level,
+        )
     if _is_demo_guest_identity(identity):
         return _build_demo_deep_report_cache_key(summary_compact_level=summary_compact_level)
     return _build_deep_report_cache_key(
@@ -5776,6 +5785,7 @@ async def insights_report(req: ReportRequest, request: Request) -> Dict[str, Any
     cache_key: Optional[str] = None
     if isinstance(req.document_id, int) and req.document_id > 0:
         cache_key = _build_request_deep_report_cache_key(
+            tenant_id=tenant_id,
             identity=identity,
             query=req.query,
             discipline=req.discipline,
@@ -5863,6 +5873,7 @@ async def insights_report_stream(req: ReportRequest, request: Request):
     cache_key: Optional[str] = None
     if isinstance(req.document_id, int) and req.document_id > 0:
         cache_key = _build_request_deep_report_cache_key(
+            tenant_id=tenant_id,
             identity=identity,
             query=req.query,
             discipline=req.discipline,
