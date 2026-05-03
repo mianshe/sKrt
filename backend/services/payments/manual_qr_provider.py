@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,6 +11,18 @@ from .base import PaymentCreateResult, PaymentNotifyResult, PaymentProvider, Pay
 
 
 class ManualQrProvider(PaymentProvider):
+    def _resolve_image_path(self, raw: str) -> Path:
+        value = str(raw or "").strip()
+        path = Path(value).expanduser()
+        root = Path(__file__).resolve().parents[3]
+        if path.is_absolute():
+            return path
+        # Linux containers may receive a Windows absolute path via env vars.
+        # In that case, fall back to the repo-local pay/ filename.
+        if re.match(r"^[A-Za-z]:[\\/]", value):
+            return root / "pay" / Path(value.replace("\\", "/")).name
+        return root / path
+
     def _env_for_channel(self, channel: str) -> tuple[str, str]:
         if channel == "wechat_native":
             return (
@@ -36,10 +49,7 @@ class ManualQrProvider(PaymentProvider):
         if value.startswith(("http://", "https://", "data:image/")):
             return value
 
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            root = Path(__file__).resolve().parents[3]
-            path = root / path
+        path = self._resolve_image_path(value)
         if not path.exists() or not path.is_file():
             raise RuntimeError(f"manual_qr_image_not_found:{path}")
 

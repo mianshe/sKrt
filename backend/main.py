@@ -71,6 +71,7 @@ from services.upload_ingestion_service import UploadIngestionService
 from services.ai_reverse_proxy import AIReverseProxyService
 from services.payments.base import PaymentProvider
 from services.payments.factory import get_payment_provider
+from services.payments.manual_qr_provider import ManualQrProvider
 from services.runpod_client import runpod_enabled, submit_ingestion_job
 from services.gpu_autostart_cloud import (
     gpu_autostart_enabled,
@@ -3537,9 +3538,7 @@ async def xpay_wechat_qr_image() -> Response:
     provider = _get_payment_provider("xpay")
     if getattr(provider, "local_mock_enabled", False):
         raw = str(os.getenv("MANUAL_PAY_WECHAT_QR_IMAGE") or (ROOT_DIR / "pay" / "wechat.png")).strip()
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = ROOT_DIR / path
+        path = ManualQrProvider()._resolve_image_path(raw)
         if not path.exists() or not path.is_file():
             raise HTTPException(status_code=404, detail=f"本地微信收款码不存在: {path}")
         content_type = mimetypes.guess_type(str(path))[0] or "image/png"
