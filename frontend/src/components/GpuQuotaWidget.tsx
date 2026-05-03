@@ -151,6 +151,7 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
   const [payProvider, setPayProvider] = useState("easypay");
   const [availableProviders, setAvailableProviders] = useState<string[]>(["easypay"]);
   const [providerChannels, setProviderChannels] = useState<Record<string, PayChannel[]>>({ easypay: ["wechat_native", "alipay_qr"] });
+  const [providerHealth, setProviderHealth] = useState<Record<string, { available?: boolean; auto_confirm?: boolean; reason?: string }>>({});
   const [supportedChannels, setSupportedChannels] = useState<PayChannel[]>(["wechat_native", "alipay_qr"]);
   const [selectedProductType, setSelectedProductType] = useState<PayProductType>("ocr_calls");
   const [selectedProductKey, setSelectedProductKey] = useState("A");
@@ -177,6 +178,19 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
     const isSafari = /safari/.test(ua) && !/crios|fxios|edgios/.test(ua);
     return isIos && isSafari;
   }, []);
+
+  const pickPreferredProvider = (
+    providers: string[],
+    health: Record<string, { available?: boolean; auto_confirm?: boolean; reason?: string }>
+  ) => {
+    const autoProvider = providers.find((provider) => {
+      const meta = health[provider];
+      return meta?.available !== false && meta?.auto_confirm === true;
+    });
+    if (autoProvider) return autoProvider;
+    const availableProvider = providers.find((provider) => health[provider]?.available !== false);
+    return availableProvider || providers[0] || "xpay";
+  };
 
   const installEnv = useMemo(() => {
     const ua = window.navigator.userAgent.toLowerCase();
@@ -288,7 +302,12 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
       const providers = Array.isArray(data?.providers)
         ? data.providers.filter((item: unknown): item is string => typeof item === "string" && item.length > 0)
         : [];
-      const provider = typeof data?.provider === "string" ? data.provider : providers[0] || "easypay";
+      const healthMap =
+        data?.provider_health && typeof data.provider_health === "object"
+          ? (data.provider_health as Record<string, { available?: boolean; auto_confirm?: boolean; reason?: string }>)
+          : {};
+      const backendProvider = typeof data?.provider === "string" ? data.provider : providers[0] || "easypay";
+      const provider = pickPreferredProvider(providers.length > 0 ? providers : [backendProvider], healthMap);
       const channelMap: Record<string, PayChannel[]> =
         data?.provider_channels && typeof data.provider_channels === "object" ? data.provider_channels : {};
       const channels = Array.isArray(data?.supported_channels)
@@ -299,6 +318,7 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
         : [];
       setAvailableProviders(providers.length > 0 ? providers : [provider]);
       setProviderChannels(channelMap);
+      setProviderHealth(healthMap);
       setPayProvider(provider);
       if (channels.length > 0) {
         setSupportedChannels(channels);
@@ -678,6 +698,7 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
       }
 
       const nextOrderNo = typeof data?.order_no === "string" ? data.order_no : "";
+      const actualProvider = typeof data?.provider === "string" ? data.provider : payProvider;
       const nextQrImage = typeof data?.qr_image_url === "string" ? normalizePaymentUrl(data.qr_image_url) : "";
       const nextPayPageUrl = typeof data?.pay_page_url === "string" ? normalizePaymentUrl(data.pay_page_url) : "";
       const nextAmountCny = typeof data?.amount_cny === "number" ? data.amount_cny : null;
@@ -690,6 +711,7 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
       setOrderAmountCny(nextAmountCny);
       setOrderOriginalAmountCny(nextOriginalAmountCny);
       setOrderRandomDiscountCny(nextRandomDiscountCny);
+      setPayProvider(actualProvider);
       setPayStatus("pending");
       setPayMessage(payHint || (payChannel === "paypal" ? "请在新页面完成 PayPal 支付" : `请使用${formatPayChannel(payChannel)}完成支付`));
       if (nextPayPageUrl) {
@@ -700,7 +722,7 @@ export default function GpuQuotaWidget({ authSession = 0, authReady = true }: Gp
           orderNo: nextOrderNo,
           qrImageUrl: nextQrImage,
           payPageUrl: nextPayPageUrl,
-          provider: payProvider,
+          provider: actualProvider,
           productType: selectedProduct.type,
           productKey: selectedProduct.key,
           channel: payChannel,
